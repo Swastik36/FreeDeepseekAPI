@@ -16,3 +16,7 @@ data/accounts/*.json
 *.pdf
 # Live session map (chat ids, restored on restart) — never commit.
 .sessions.json
+# Live DeepSeek auth tokens/cookies (0600) — never commit. Keep the dir.
+accounts/*.json
+# Live browser profile (cookies, session state) — never commit.
+.chrome-profile-second/
