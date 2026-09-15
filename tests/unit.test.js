@@ -6,6 +6,13 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
+// Redirect the session store BEFORE loading the server: several unit tests
+// exercise reset/persist paths, and without this they would overwrite the
+// LIVE service's .sessions.json (wiping restored chats on next restart).
+process.env.DEEPSEEK_SESSION_STORE = path.join(
+  fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-sessions-')),
+  'sessions.json'
+);
 const serverInternals = require('../server.js').__test;
 
 function tmpdir() {
@@ -590,7 +597,7 @@ test('remote reset preserves local history and sticky account while returning fa
   assert.equal(session.history.length, 1);
 });
 
-test('account rotation clears a foreign remote session and preserves local recovery history', (t) => {
+test('live chat keeps account affinity: sticky cooldown fails fast with 429, chat preserved', (t) => {
   const originalAccounts = serverInternals.accounts.splice(0);
   t.after(() => {
     serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
@@ -611,10 +618,49 @@ test('account rotation clears a foreign remote session and preserves local recov
     },
   );
   const session = serverInternals.createSession();
-  session.id = 'foreign-session';
-  session.parentMessageId = 'foreign-parent';
+  session.id = 'live-session';
+  session.parentMessageId = 'live-parent';
   session.accountId = 'cooling';
   session.messageCount = 7;
+  session.history.push({ user: 'old task', assistant: 'old answer' });
+
+  // Same opencode conversation must NOT hop to another chat+account on rate
+  // limit — the client backs off and retries on the same chat instead.
+  assert.throws(() => serverInternals.selectAccountForSession(session), (err) => {
+    assert.equal(err.status, 429);
+    assert.equal(err.type, 'rate_limit');
+    assert.ok(Number(err.retryAfter) >= 1);
+    return true;
+  });
+  assert.equal(session.id, 'live-session');
+  assert.equal(session.parentMessageId, 'live-parent');
+  assert.equal(session.accountId, 'cooling');
+  assert.equal(session.messageCount, 7);
+  assert.equal(session.history.length, 1);
+});
+
+test('chat-less session still rotates away from a cooling sticky account', (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+  });
+
+  serverInternals.accounts.push(
+    {
+      id: 'cooling',
+      config: { token: 'one', cookie: 'one' },
+      cooldownUntil: Date.now() + 60_000,
+      headers: {},
+    },
+    {
+      id: 'ready',
+      config: { token: 'two', cookie: 'two' },
+      cooldownUntil: 0,
+      headers: {},
+    },
+  );
+  const session = serverInternals.createSession();
+  session.accountId = 'cooling';
   session.history.push({ user: 'old task', assistant: 'old answer' });
 
   const selected = serverInternals.selectAccountForSession(session);
@@ -624,6 +670,119 @@ test('account rotation clears a foreign remote session and preserves local recov
   assert.equal(session.parentMessageId, null);
   assert.equal(session.messageCount, 0);
   assert.equal(session.history.length, 1);
+});
+
+test('detectClientCompaction fires only on history collapse, not resends', () => {
+  const session = serverInternals.createSession();
+  session.id = 'live-session';
+  const longHistory = [
+    { role: 'user', content: 'q1' },
+    { role: 'assistant', content: 'a1' },
+    { role: 'user', content: 'q2' },
+    { role: 'assistant', content: 'a2' },
+    { role: 'user', content: 'q3' },
+    { role: 'assistant', content: 'a3' },
+    { role: 'user', content: 'q4' },
+    { role: 'assistant', content: 'a4' },
+  ];
+  serverInternals.commitDeltaState(session, longHistory);
+  assert.equal(serverInternals.detectClientCompaction(longHistory, session), false);
+
+  // Opencode compaction: 8 turns collapsed into a summary + follow-up.
+  const compacted = [
+    { role: 'user', content: 'Summary of our work so far: built X, fixed Y. Continue with Z.' },
+    { role: 'user', content: 'Continue with Z.' },
+  ];
+  assert.equal(serverInternals.detectClientCompaction(compacted, session), true);
+
+  // Tiny sessions and cold chats never count as compaction.
+  const fresh = serverInternals.createSession();
+  assert.equal(serverInternals.detectClientCompaction(compacted, fresh), false);
+  const small = serverInternals.createSession();
+  small.id = 's';
+  serverInternals.commitDeltaState(small, [{ role: 'user', content: 'hi' }]);
+  assert.equal(serverInternals.detectClientCompaction([{ role: 'user', content: 'other' }], small), false);
+
+  // Shrinking by a single message is a resend/trim, not a compaction.
+  const almostSame = longHistory.slice(0, 7);
+  assert.equal(serverInternals.detectClientCompaction(almostSame, session), false);
+});
+
+test('fingerprint stays stable as turns append but diverges on opener differences', () => {
+  const sys = [{ role: 'system', content: 'You are a coding agent.' }];
+  const turn1 = [...sys, { role: 'user', content: 'Hello' }];
+  const turn3 = [...turn1,
+    { role: 'assistant', content: 'Hi, how can I help?' },
+    { role: 'user', content: 'Read /etc/hostname.' },
+  ];
+  const turn5 = [...turn3,
+    { role: 'assistant', content: 'Will do.' },
+    { role: 'user', content: 'Now /etc/hosts.' },
+  ];
+  // Once three opener messages exist the id is frozen: appending turns keeps it.
+  assert.equal(serverInternals.fingerprintConversation(turn3), serverInternals.fingerprintConversation(turn5));
+
+  // Same opener, different second message: distinct chats (no cross-talk).
+  const other = [...sys,
+    { role: 'user', content: 'Hello' },
+    { role: 'assistant', content: 'Hi, how can I help?' },
+    { role: 'user', content: 'Tell me a joke.' },
+  ];
+  assert.notEqual(serverInternals.fingerprintConversation(turn3), serverInternals.fingerprintConversation(other));
+
+  // Messages past the third do not affect the id.
+  const laterDiffers = [...turn3, { role: 'user', content: 'Something completely different.' }];
+  assert.equal(serverInternals.fingerprintConversation(turn3), serverInternals.fingerprintConversation(laterDiffers));
+});
+
+test('fresh chats prefer the account already hosting sessions (home stickiness)', (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+
+  serverInternals.accounts.push(
+    { id: 'home', config: { token: 'h', cookie: 'h' }, cooldownUntil: 0, headers: {} },
+    { id: 'spare', config: { token: 's', cookie: 's' }, cooldownUntil: 0, headers: {} },
+  );
+  // Two live chats on 'spare', none on 'home'.
+  for (const key of ['agent:aaa', 'agent:bbb']) {
+    const s = serverInternals.createSession();
+    s.id = `remote-${key}`;
+    s.accountId = 'spare';
+    serverInternals.sessions.set(key, s);
+  }
+
+  const fresh = serverInternals.createSession();
+  const selected = serverInternals.selectAccountForSession(fresh);
+  assert.equal(selected.id, 'spare');
+  assert.equal(fresh.accountId, 'spare');
+});
+
+test('fresh-chat tie at zero picks a ready account (round-robin fallback)', (t) => {
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+
+  serverInternals.accounts.push(
+    { id: 'A', config: { token: 'a', cookie: 'a' }, cooldownUntil: 0, headers: {} },
+    { id: 'B', config: { token: 'b', cookie: 'b' }, cooldownUntil: 0, headers: {} },
+  );
+  const first = serverInternals.selectAccountForSession(serverInternals.createSession());
+  const second = serverInternals.selectAccountForSession(serverInternals.createSession());
+  // Parity-independent: both picks valid, and the tie-break alternates.
+  assert.ok(['A', 'B'].includes(first.id));
+  assert.ok(['A', 'B'].includes(second.id));
+  assert.notEqual(first.id, second.id);
 });
 
 test('cross-account continuation is accepted only with a fresh recovery prompt', () => {
@@ -709,6 +868,18 @@ test('context-compaction header is marked and exposed to browser clients', () =>
   assert.equal(headers.get(serverInternals.CONTEXT_COMPACTED_HEADER), 'true');
 });
 
+test('markContextCompacted never throws after stream headers are sent', () => {
+  let calls = 0;
+  const sentRes = { headersSent: true, setHeader: () => { calls++; } };
+  serverInternals.markContextCompacted(sentRes);
+  assert.equal(calls, 0);
+  const endedRes = { headersSent: false, writableEnded: true, setHeader: () => { calls++; } };
+  serverInternals.markContextCompacted(endedRes);
+  assert.equal(calls, 0);
+  const throwingRes = { headersSent: false, setHeader: () => { throw new Error('Cannot set headers after they are sent to the client'); } };
+  serverInternals.markContextCompacted(throwingRes);
+});
+
 test('stream helpers preserve the request-level exact CORS origin', () => {
   const response = {
     id: 'ds-test',
@@ -733,3 +904,733 @@ test('stream helpers preserve the request-level exact CORS origin', () => {
     assert.equal(Object.hasOwn(writeHeadHeaders, 'Access-Control-Allow-Origin'), false);
   }
 });
+
+test('delta mode is off unless DEEPSEEK_DELTA_PROMPT is explicitly enabled', () => {
+  const prev = process.env.DEEPSEEK_DELTA_PROMPT;
+  try {
+    delete process.env.DEEPSEEK_DELTA_PROMPT;
+    assert.equal(serverInternals.isDeltaPromptMode(), false);
+    for (const on of ['1', 'true', 'YES', ' on ']) {
+      process.env.DEEPSEEK_DELTA_PROMPT = on;
+      assert.equal(serverInternals.isDeltaPromptMode(), true, on);
+    }
+    for (const off of ['0', 'false', 'no', '']) {
+      process.env.DEEPSEEK_DELTA_PROMPT = off;
+      assert.equal(serverInternals.isDeltaPromptMode(), false, JSON.stringify(off));
+    }
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_DELTA_PROMPT;
+    else process.env.DEEPSEEK_DELTA_PROMPT = prev;
+  }
+});
+
+test('fingerprintConversation is stable per opener and distinct per session', () => {
+  const a = [
+    { role: 'system', content: 'You are a coding agent.' },
+    { role: 'user', content: 'Use a tool to read /etc/hostname.' },
+  ];
+  const b = [
+    { role: 'system', content: 'You are a coding agent.' },
+    { role: 'user', content: 'Use a tool to read /etc/hostname.' },
+  ];
+  const c = [
+    { role: 'system', content: 'You are a coding agent.' },
+    { role: 'user', content: 'Tell me a joke.' },
+  ];
+  assert.equal(serverInternals.fingerprintConversation(a), serverInternals.fingerprintConversation(b));
+  assert.notEqual(serverInternals.fingerprintConversation(a), serverInternals.fingerprintConversation(c));
+  assert.match(serverInternals.fingerprintConversation(a), /^[0-9a-f]{12}$/);
+});
+
+test('splitClientMessages forwards only the new suffix after commit', () => {
+  const session = serverInternals.createSession();
+  const turn1 = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: 'first question' },
+  ];
+  // Cold chat: full resend.
+  let split = serverInternals.splitClientMessages(turn1, session);
+  assert.equal(split.isDelta, false);
+  assert.equal(split.effective.length, 1);
+
+  serverInternals.commitDeltaState(session, turn1);
+  const turn2 = [...turn1, { role: 'assistant', content: 'answer' }, { role: 'user', content: 'follow-up' }];
+  split = serverInternals.splitClientMessages(turn2, session);
+  assert.equal(split.isDelta, true);
+  assert.deepEqual(split.effective, [
+    { role: 'assistant', content: 'answer' },
+    { role: 'user', content: 'follow-up' },
+  ]);
+
+  // Duplicate request (nothing new): fall back to full resend, never empty.
+  split = serverInternals.splitClientMessages(turn1, session);
+  assert.equal(split.isDelta, false);
+  assert.equal(split.effective.length, 1);
+
+  // Rewritten history (client-side compaction): boundary mismatch → full.
+  const rewritten = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: '[summary of earlier]' },
+    { role: 'user', content: 'follow-up' },
+  ];
+  split = serverInternals.splitClientMessages(rewritten, session);
+  assert.equal(split.isDelta, false);
+  assert.equal(split.effective.length, 2);
+});
+
+test('resetRemoteSession clears delta continuity state', () => {
+  const session = serverInternals.createSession();
+  assert.equal(session.deltaMsgCount, 0);
+  assert.equal(session.deltaBoundary, null);
+  serverInternals.commitDeltaState(session, [{ role: 'user', content: 'hi' }]);
+  assert.equal(session.deltaMsgCount, 1);
+  session.id = 'remote-1';
+  session.messageCount = 3;
+  serverInternals.resetRemoteSession(session);
+  assert.equal(session.id, null);
+  assert.equal(session.deltaMsgCount, 0);
+  assert.equal(session.deltaBoundary, null);
+});
+
+test('session persist/restore round-trips the chat map', () => {
+  const dir = tmpdir();
+  const store = path.join(dir, 'sessions.json');
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  try {
+    serverInternals.sessions.clear();
+    const s = serverInternals.createSession();
+    s.id = 'remote-abc';
+    s.parentMessageId = 'parent-1';
+    s.createdAt = 123456789;
+    s.messageCount = 6;
+    s.accountId = 'account_1';
+    s.history.push({ user: 'u', assistant: 'a' });
+    s.deltaMsgCount = 9;
+    s.deltaBoundary = 'boundary-hash';
+    serverInternals.sessions.set('dev-agent:testfp', s);
+    serverInternals.persistSessions(store);
+    assert.ok(fs.existsSync(store));
+    assert.equal(fs.existsSync(store + '.tmp'), false);
+    serverInternals.sessions.clear();
+    const restored = serverInternals.restoreSessions(Date.now(), store);
+    assert.equal(restored, 1);
+    const back = serverInternals.sessions.get('dev-agent:testfp');
+    assert.equal(back.id, 'remote-abc');
+    assert.equal(back.parentMessageId, 'parent-1');
+    assert.equal(back.messageCount, 6);
+    assert.equal(back.accountId, 'account_1');
+    assert.equal(back.deltaMsgCount, 9);
+    assert.equal(back.deltaBoundary, 'boundary-hash');
+    assert.equal(back.history.length, 1);
+  } finally {
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  }
+});
+
+test('restoreSessions drops stale entries and tolerates missing/corrupt stores', () => {
+  const dir = tmpdir();
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  try {
+    serverInternals.sessions.clear();
+    assert.equal(serverInternals.restoreSessions(Date.now(), path.join(dir, 'missing.json')), 0);
+    const bad = path.join(dir, 'bad.json');
+    fs.writeFileSync(bad, 'not json{{{');
+    assert.equal(serverInternals.restoreSessions(Date.now(), bad), 0);
+    const stale = path.join(dir, 'stale.json');
+    const old = Date.now() - 1000 * 60 * 60 * 24; // 24h ago, past 2x TTL
+    fs.writeFileSync(stale, JSON.stringify({ v: 1, savedAt: old, sessions: [
+      ['old-agent', { id: 'old-chat', parentMessageId: null, createdAt: old, messageCount: 3, accountId: 'a1', history: [], lastActivityAt: old, deltaMsgCount: 0, deltaBoundary: null }],
+      ['fresh-agent', { id: 'live-chat', parentMessageId: null, createdAt: Date.now(), messageCount: 1, accountId: 'a1', history: [], lastActivityAt: Date.now(), deltaMsgCount: 0, deltaBoundary: null }],
+    ] }));
+    assert.equal(serverInternals.restoreSessions(Date.now(), stale), 1);
+    assert.equal(serverInternals.sessions.has('old-agent'), false);
+    assert.equal(serverInternals.sessions.get('fresh-agent').id, 'live-chat');
+  } finally {
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  }
+});
+
+test('repair guard: first attempt new, verbatim retry repeats, third caps', () => {
+  const s = serverInternals.createSession();
+  const now = Date.now();
+  let r = serverInternals.classifyRepairAttempt(s, 'hash-a', now);
+  assert.equal(r.repeat, false);
+  assert.equal(r.capped, false);
+  serverInternals.recordRepairAttempt(s, 'hash-a', now);
+  r = serverInternals.classifyRepairAttempt(s, 'hash-a', now + 1000);
+  assert.equal(r.repeat, true);
+  assert.equal(r.capped, false);
+  // Different turn, different prompt: not a repeat.
+  r = serverInternals.classifyRepairAttempt(s, 'hash-b', now + 1000);
+  assert.equal(r.repeat, false);
+  serverInternals.recordRepairAttempt(s, 'hash-a', now + 1000);
+  r = serverInternals.classifyRepairAttempt(s, 'hash-a', now + 2000);
+  assert.equal(r.repeat, true);
+  assert.equal(r.capped, true);
+  // Stale marker (past window): treated as new.
+  r = serverInternals.classifyRepairAttempt(s, 'hash-a', now + 11 * 60 * 1000);
+  assert.equal(r.repeat, false);
+  // Success clears the guard.
+  serverInternals.clearRepairGuard(s);
+  r = serverInternals.classifyRepairAttempt(s, 'hash-a', now + 3000);
+  assert.equal(r.repeat, false);
+  assert.equal(s.repairCount, 0);
+});
+
+test('clearRepairGuard is turn-scoped: foreign hash preserved, matching/omitted clears', () => {
+  const s = serverInternals.createSession();
+  serverInternals.recordRepairAttempt(s, 'hash-a');
+  serverInternals.clearRepairGuard(s, 'hash-b');
+  assert.equal(s.repairHash, 'hash-a');
+  assert.equal(s.repairCount, 1);
+  serverInternals.clearRepairGuard(s, 'hash-a');
+  assert.equal(s.repairHash, null);
+  assert.equal(s.repairCount, 0);
+  serverInternals.recordRepairAttempt(s, 'hash-a');
+  serverInternals.clearRepairGuard(s);
+  assert.equal(s.repairHash, null);
+  assert.equal(s.repairCount, 0);
+});
+
+test('repair guard survives resetRemoteSession (client-turn scoped, not chat scoped)', () => {
+  const s = serverInternals.createSession();
+  s.id = 'live-chat';
+  serverInternals.recordRepairAttempt(s, 'hash-a');
+  serverInternals.resetRemoteSession(s);
+  assert.equal(s.id, null);
+  const r = serverInternals.classifyRepairAttempt(s, 'hash-a');
+  assert.equal(r.repeat, true);
+});
+
+test('repair guard persists across restart, stale guard still expires', () => {
+  const dir = tmpdir();
+  const store = path.join(dir, 'sessions.json');
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  const now = Date.now();
+  try {
+    serverInternals.sessions.clear();
+    const s = serverInternals.createSession();
+    s.id = 'remote-x';
+    serverInternals.recordRepairAttempt(s, 'hash-a', now);
+    serverInternals.sessions.set('agent-x', s);
+    const stale = serverInternals.createSession();
+    stale.id = 'remote-y';
+    serverInternals.recordRepairAttempt(stale, 'hash-old', now - 11 * 60 * 1000);
+    serverInternals.sessions.set('agent-y', stale);
+    serverInternals.persistSessions(store);
+    const raw = JSON.parse(fs.readFileSync(store, 'utf8'));
+    const persisted = Object.fromEntries(raw.sessions.map(([k, v]) => [k, v]));
+    assert.equal(persisted['agent-x'].repairHash, 'hash-a');
+    assert.equal(persisted['agent-x'].repairCount, 1);
+    serverInternals.sessions.clear();
+    serverInternals.restoreSessions(now, store);
+    const back = serverInternals.sessions.get('agent-x');
+    // Post-restart verbatim retry is recognized as a repeat (B3).
+    assert.equal(back.repairHash, 'hash-a');
+    assert.equal(serverInternals.classifyRepairAttempt(back, 'hash-a', now).repeat, true);
+    // But a guard older than the window reads as fresh.
+    const backStale = serverInternals.sessions.get('agent-y');
+    assert.equal(serverInternals.classifyRepairAttempt(backStale, 'hash-old', now).repeat, false);
+  } finally {
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  }
+});
+
+test('lean repair prompt keeps instruction intact and carries tools + latest turn', () => {
+  const tools = [{ type: 'function', function: { name: 'read', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } }];
+  const messages = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: 'first question' },
+    { role: 'assistant', content: 'an answer' },
+    { role: 'user', content: 'read /etc/hostname now' },
+  ];
+  const prev = process.env.DEEPSEEK_LOCAL_SHELL;
+  try {
+    delete process.env.DEEPSEEK_LOCAL_SHELL;
+    const lean = serverInternals.buildLeanRepairPrompt(tools, messages);
+    assert.ok(lean.startsWith('[STRICT INSTRUCTION — DeepSeek Web backend, repair attempt]'));
+    assert.match(lean, /read: Read a file/);
+    assert.match(lean, /read \/etc\/hostname now/);
+    assert.doesNotMatch(lean, /first question/);
+    // Huge latest turn gets bounded, instruction never truncated.
+    const big = [...messages.slice(0, 3), { role: 'user', content: 'x'.repeat(100000) }];
+    const leanBig = serverInternals.buildLeanRepairPrompt(tools, big);
+    assert.ok(leanBig.startsWith('[STRICT INSTRUCTION — DeepSeek Web backend, repair attempt]'));
+    assert.ok(leanBig.length < 80000);
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_LOCAL_SHELL;
+    else process.env.DEEPSEEK_LOCAL_SHELL = prev;
+  }
+});
+
+test('lean repair prompt carries SHELL + tool preference so same-chat repairs stay fish-compatible', () => {
+  const prev = process.env.DEEPSEEK_LOCAL_SHELL;
+  const tools = [
+    { type: 'function', function: { name: 'bash', description: 'run a command', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+    { type: 'function', function: { name: 'read', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
+  ];
+  const messages = [
+    { role: 'user', content: 'check the distinctive-earlier-question status' },
+    { role: 'assistant', content: 'an answer' },
+    { role: 'user', content: 'run the distinctive-latest-request now' },
+  ];
+  try {
+    delete process.env.DEEPSEEK_LOCAL_SHELL;
+    const lean = serverInternals.buildLeanRepairPrompt(tools, messages);
+    // First-attempt repair shape: nudge + tools, no history resend.
+    assert.ok(lean.startsWith('[STRICT INSTRUCTION — DeepSeek Web backend, repair attempt]'));
+    assert.match(lean, /SHELL: operator console shell is fish/);
+    assert.match(lean, /prefer read\/edit\/grep tools over shell/);
+    assert.match(lean, /distinctive-latest-request/);
+    assert.doesNotMatch(lean, /distinctive-earlier-question/);
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_LOCAL_SHELL;
+    else process.env.DEEPSEEK_LOCAL_SHELL = prev;
+  }
+});
+
+test('shell reminder line tracks DEEPSEEK_LOCAL_SHELL and omits on empty', () => {
+  const prev = process.env.DEEPSEEK_LOCAL_SHELL;
+  try {
+    delete process.env.DEEPSEEK_LOCAL_SHELL;
+    assert.equal(serverInternals.localShellName(), 'fish');
+    assert.match(serverInternals.shellReminderLine(), /console uses fish/);
+    process.env.DEEPSEEK_LOCAL_SHELL = '  Bash  ';
+    assert.equal(serverInternals.localShellName(), 'bash');
+    assert.match(serverInternals.shellReminderLine(), /console uses bash/);
+    process.env.DEEPSEEK_LOCAL_SHELL = '';
+    assert.equal(serverInternals.localShellName(), '');
+    assert.equal(serverInternals.shellReminderLine(), '');
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_LOCAL_SHELL;
+    else process.env.DEEPSEEK_LOCAL_SHELL = prev;
+  }
+});
+
+test('tool prompt declares the operator fish shell by default, overridable via env', () => {
+  const prev = process.env.DEEPSEEK_LOCAL_SHELL;
+  const tools = [{ type: 'function', function: { name: 'bash', description: 'run a command', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }];
+  try {
+    delete process.env.DEEPSEEK_LOCAL_SHELL;
+    assert.match(serverInternals.formatToolDefinitions(tools), /operator console shell is fish/);
+    process.env.DEEPSEEK_LOCAL_SHELL = 'bash';
+    assert.match(serverInternals.formatToolDefinitions(tools), /operator console shell is bash/);
+    process.env.DEEPSEEK_LOCAL_SHELL = '';
+    assert.doesNotMatch(serverInternals.formatToolDefinitions(tools), /operator console shell is/);
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_LOCAL_SHELL;
+    else process.env.DEEPSEEK_LOCAL_SHELL = prev;
+  }
+});
+
+test('numEnv falls back on garbage, honors bounds', () => {
+  assert.equal(serverInternals.numEnv('FDSAPI_TEST_NUM_MISSING_XYZ', 42), 42);
+  process.env.FDSAPI_TEST_NUM_X = 'abc';
+  assert.equal(serverInternals.numEnv('FDSAPI_TEST_NUM_X', 42), 42);
+  process.env.FDSAPI_TEST_NUM_X = '';
+  assert.equal(serverInternals.numEnv('FDSAPI_TEST_NUM_X', 42), 42);
+  process.env.FDSAPI_TEST_NUM_X = '5';
+  assert.equal(serverInternals.numEnv('FDSAPI_TEST_NUM_X', 42, 1, 10), 5);
+  process.env.FDSAPI_TEST_NUM_X = '0';
+  assert.equal(serverInternals.numEnv('FDSAPI_TEST_NUM_X', 42, 1, 10), 42);
+  process.env.FDSAPI_TEST_NUM_X = '999';
+  assert.equal(serverInternals.numEnv('FDSAPI_TEST_NUM_X', 42, 1, 10), 42);
+  delete process.env.FDSAPI_TEST_NUM_X;
+});
+
+test('sanitizeContent keeps valid emoji, strips lone surrogates', () => {
+  assert.equal(serverInternals.sanitizeContent('A😀B'), 'A😀B');
+  assert.equal(serverInternals.sanitizeContent('a' + String.fromCharCode(0xd800) + 'b'), 'ab');
+  assert.equal(serverInternals.sanitizeContent('x' + String.fromCharCode(0xdcff) + 'y'), 'xy');
+  assert.equal(serverInternals.sanitizeContent(null), '');
+});
+
+test('toolNamesKeyFor sorts and filters tool names', () => {
+  const tools = [
+    { type: 'function', function: { name: 'read' } },
+    { type: 'function', function: { name: 'bash' } },
+    { type: 'function', function: {} },
+    { type: 'other' },
+  ];
+  assert.equal(serverInternals.toolNamesKeyFor(tools), 'bash,read');
+  assert.equal(serverInternals.toolNamesKeyFor([]), '');
+  assert.equal(serverInternals.toolNamesKeyFor(null), '');
+});
+
+test('stripShellReminder removes only the exact trailing reminder', () => {
+  const reminder = '[SHELL: operator console uses fish (Linux)]';
+  assert.equal(
+    serverInternals.stripShellReminder('do the thing\n\n' + reminder, reminder),
+    'do the thing'
+  );
+  assert.equal(serverInternals.stripShellReminder('plain prompt', reminder), 'plain prompt');
+  assert.equal(serverInternals.stripShellReminder('prompt', ''), 'prompt');
+});
+
+test('split falls back to full resend on edited prefix, delta on pure growth', () => {
+  const U = (c) => ({ role: 'user', content: c });
+  const s = serverInternals.createSession();
+  s.id = 'x';
+  serverInternals.commitDeltaState(s, [U('a'), U('b')]);
+  assert.ok(s.deltaPrefixHash);
+  const grown = serverInternals.splitClientMessages([U('a'), U('b'), U('c')], s);
+  assert.equal(grown.isDelta, true);
+  assert.deepEqual(grown.effective.map((m) => m.content), ['c']);
+  const edited = serverInternals.splitClientMessages([U('A-EDITED'), U('b'), U('c')], s);
+  assert.equal(edited.isDelta, false);
+  assert.equal(edited.effective.length, 3);
+});
+
+test('detectClientCompaction: trim with boundary present is not compaction', () => {
+  const U = (c) => ({ role: 'user', content: c });
+  const mk = (sent, msgs) => {
+    const s = serverInternals.createSession();
+    s.id = 'y';
+    serverInternals.commitDeltaState(s, msgs.slice(0, sent).map(U));
+    return s;
+  };
+  // Benign trim: drop 2 old, boundary message still present.
+  const s1 = mk(10, Array.from({ length: 10 }, (_, i) => `m${i}`));
+  const trim = [U('m2'), U('m3'), U('m4'), U('m5'), U('m6'), U('m7'), U('m8'), U('m9')];
+  assert.equal(serverInternals.detectClientCompaction(trim, s1), false);
+  // True compaction: summary replaces everything, boundary gone.
+  assert.equal(serverInternals.detectClientCompaction([U('summary of all'), U('next?')], s1), true);
+});
+
+test('looksLikeToolCallMarkup refuses oversized content instead of flagging', () => {
+  const big = `TOOL_CALL: bash ${'x'.repeat(300 * 1024)}`;
+  assert.equal(serverInternals.looksLikeToolCallMarkup(big), false);
+  assert.equal(serverInternals.parseToolCall(big), null);
+  assert.equal(serverInternals.looksLikeToolCallMarkup('{"tool_call":{"name":"bash","arguments":{}}}'), true);
+});
+
+test('parseRetryAfterMs handles seconds, dates, garbage', () => {
+  assert.equal(serverInternals.parseRetryAfterMs('120'), 120000);
+  assert.equal(serverInternals.parseRetryAfterMs('soon'), null);
+  assert.equal(serverInternals.parseRetryAfterMs(''), null);
+  assert.ok(serverInternals.parseRetryAfterMs(new Date(Date.now() + 60000).toUTCString()) > 1000);
+});
+
+test('classifyRecoveryFailure sanitizes arbitrary upstream types', () => {
+  assert.equal(serverInternals.classifyRecoveryFailure({ type: 'weird\nthing' }).type, 'empty_response');
+  assert.equal(serverInternals.classifyRecoveryFailure({ type: 'custom_ok' }).type, 'custom_ok');
+  assert.equal(serverInternals.classifyRecoveryFailure(null).type, 'empty_response');
+  assert.equal(serverInternals.classifyRecoveryFailure({ type: 'x'.repeat(100) }).type, 'empty_response');
+});
+
+test('repairTurnHash is stable for a verbatim retry, distinct per turn', () => {
+  const tools = [{ type: 'function', function: { name: 'bash' } }];
+  const turn = [{ role: 'user', content: 'list files' }];
+  // Same turn before/after a 502-reset (history prefix differs, hash must not).
+  assert.equal(serverInternals.repairTurnHash(turn, tools), serverInternals.repairTurnHash(turn, tools));
+  // A genuinely new turn (append-only growth) gets a different identity.
+  const grown = [...turn, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'now delete' }];
+  assert.notEqual(serverInternals.repairTurnHash(turn, tools), serverInternals.repairTurnHash(grown, tools));
+  // Tool-set change is a different turn identity too.
+  assert.notEqual(
+    serverInternals.repairTurnHash(turn, tools),
+    serverInternals.repairTurnHash(turn, [...tools, { type: 'function', function: { name: 'read' } }])
+  );
+});
+
+test('formatMessages renders prior tool calls as strict JSON, never TOOL_CALL:', () => {
+  const out = serverInternals.formatMessages(
+    [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: null, tool_calls: [{ function: { name: 'bash', arguments: '{"command":"ls"}' } }] },
+    ],
+    []
+  );
+  assert.doesNotMatch(out.prompt, /TOOL_CALL:/);
+  const m = out.prompt.match(/\{"tool_call":\{"name":"bash","arguments":\{"command":"ls"\}\}\}/);
+  assert.ok(m, `strict envelope missing in: ${out.prompt}`);
+  const parsed = JSON.parse(m[0]);
+  assert.equal(parsed.tool_call.name, 'bash');
+});
+
+test('normalizeResponsesInput keeps function_call items as assistant tool turns', () => {
+  const msgs = serverInternals.normalizeResponsesInput([
+    { type: 'message', role: 'user', content: 'run it' },
+    { type: 'function_call', call_id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' },
+    { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+  ]);
+  assert.equal(msgs.length, 3);
+  assert.equal(msgs[1].role, 'assistant');
+  assert.equal(msgs[1].tool_calls[0].function.name, 'bash');
+  assert.equal(msgs[1].tool_calls[0].id, 'call_1');
+  assert.equal(msgs[2].role, 'tool');
+});
+
+test('serializeSession coerces corrupt history entries to strings', () => {
+  const s = serverInternals.createSession();
+  s.history.push({ user: 12345, assistant: null });
+  const snap = serverInternals.serializeSession(s);
+  assert.equal(snap.history[0].user, '12345');
+  assert.equal(snap.history[0].assistant, '');
+  // Restored corrupt entries no longer crash the reset-session preview line.
+  assert.doesNotThrow(() => snap.history.map((e) => e.user.substring(0, 40)).join(' | '));
+});
+
+test('extractScreenshotPaths sees array-content text parts', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-media-'));
+  const shot = path.join(dir, 'shot.png');
+  fs.writeFileSync(shot, 'x');
+  try {
+    const paths = serverInternals.extractScreenshotPaths([
+      { role: 'user', content: [{ type: 'text', text: `see ${shot} please` }] },
+    ]);
+    assert.ok(paths.includes(`MEDIA:${shot}`), `expected MEDIA tag, got ${JSON.stringify(paths)}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('two-phase OpenAI streaming: start emits role chunk, finish completes without re-writing headers', () => {
+  const chunks = [];
+  let status = null;
+  let headers = null;
+  const res = {
+    writeHead: (s, h) => { status = s; headers = h; },
+    write: (data) => { chunks.push(data); },
+    end: () => {},
+  };
+  serverInternals.startOpenAIStream(res, { id: 'ds-test-1', created: 123456, model: 'deepseek-chat' });
+  assert.equal(status, 200);
+  assert.equal(headers['Content-Type'], 'text/event-stream');
+  assert.equal(chunks.length, 1);
+  const first = JSON.parse(chunks[0].replace(/^data: /, '').trim());
+  assert.equal(first.choices[0].delta.role, 'assistant');
+
+  // Finish Phase: tool-call response
+  const openaiResp = {
+    id: 'ds-test-1',
+    created: 123456,
+    model: 'deepseek-chat',
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  };
+  serverInternals.finishOpenAIStream(res, openaiResp);
+  assert.ok(chunks.some(c => c.includes('"tool_calls"')));
+  assert.ok(chunks.some(c => c.includes('[DONE]')));
+});
+
+test('two-phase Anthropic streaming: start emits message_start, finish emits content', () => {
+  const events = [];
+  let status = null;
+  const res = {
+    writeHead: (s) => { status = s; },
+    write: (data) => { events.push(data); },
+    end: () => {},
+  };
+  serverInternals.startAnthropicStream(res, { id: 'msg_test_1', model: 'deepseek-chat', inputTokens: 42 });
+  assert.equal(status, 200);
+  assert.ok(events.some(e => e.includes('event: message_start')));
+  assert.ok(events.some(e => e.includes('"input_tokens":42')));
+
+  const openaiResp = {
+    id: 'ds-test-2',
+    created: 123456,
+    model: 'deepseek-chat',
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: 'Hello world' },
+      finish_reason: 'stop',
+    }],
+    usage: { prompt_tokens: 42, completion_tokens: 5, total_tokens: 47 },
+  };
+  serverInternals.finishAnthropicStream(res, openaiResp);
+  assert.ok(events.some(e => e.includes('event: content_block_start')));
+  assert.ok(events.some(e => e.includes('Hello world')));
+  assert.ok(events.some(e => e.includes('event: message_stop')));
+});
+
+test('sendStreamError formats protocol-accurate in-stream error events', () => {
+  // Anthropic
+  let anthropicOut = '';
+  const anthropicRes = { write: (d) => { anthropicOut += d; }, end: () => {} };
+  serverInternals.sendStreamError(anthropicRes, 'anthropic', { message: 'upstream died', type: 'malformed_tool_call' });
+  assert.ok(anthropicOut.includes('event: error\n'));
+  assert.ok(anthropicOut.includes('"type":"malformed_tool_call"'));
+
+  // Responses
+  let responsesOut = '';
+  const responsesRes = { write: (d) => { responsesOut += d; }, end: () => {} };
+  serverInternals.sendStreamError(responsesRes, 'responses', { message: 'upstream died', type: 'malformed_tool_call' });
+  assert.ok(responsesOut.includes('event: response.failed\n'));
+  assert.ok(responsesOut.includes('"status":"failed"'));
+
+  // OpenAI
+  let openaiOut = '';
+  const openaiRes = { write: (d) => { openaiOut += d; }, end: () => {} };
+  serverInternals.sendStreamError(openaiRes, 'openai', { message: 'upstream died', type: 'malformed_tool_call' });
+  assert.ok(openaiOut.includes('"type":"malformed_tool_call"'));
+  assert.ok(openaiOut.includes('[DONE]'));
+});
+
+test('selectFreshAccount honors DEEPSEEK_PREFERRED_ACCOUNT when ready', () => {
+  const prev = process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  try {
+    const ready = [{ id: 'account_1' }, { id: 'account_2' }];
+    process.env.DEEPSEEK_PREFERRED_ACCOUNT = 'account_2';
+    assert.equal(serverInternals.selectFreshAccount(ready).id, 'account_2');
+    // Unknown or unset preference falls back to existing home/round-robin logic.
+    process.env.DEEPSEEK_PREFERRED_ACCOUNT = 'account_9';
+    assert.ok(['account_1', 'account_2'].includes(serverInternals.selectFreshAccount(ready).id));
+    delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+    assert.ok(['account_1', 'account_2'].includes(serverInternals.selectFreshAccount(ready).id));
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+    else process.env.DEEPSEEK_PREFERRED_ACCOUNT = prev;
+  }
+});
+
+test('SSE keep-alive ping: startKeepAlive writes : ping and clearKeepAlive cancels timer', async () => {
+  const pings = [];
+  const res = {
+    write: (d) => { pings.push(d); },
+    writableEnded: false,
+    destroyed: false,
+  };
+  serverInternals.startKeepAlive(res, 10);
+  assert.ok(res._keepAliveTimer);
+  await new Promise(r => setTimeout(r, 50));
+  assert.ok(pings.length >= 1);
+  assert.ok(pings.every(p => p === ': ping\n\n'));
+
+  serverInternals.clearKeepAlive(res);
+  assert.equal(res._keepAliveTimer, null);
+  const countAfterClear = pings.length;
+  await new Promise(r => setTimeout(r, 40));
+  assert.equal(pings.length, countAfterClear);
+});
+
+test('sendStreamError OpenAI dual-shape: includes error object and choices[0].delta error content', () => {
+  let output = '';
+  const res = { write: (d) => { output += d; }, end: () => {}, writableEnded: false };
+  serverInternals.sendStreamError(res, 'openai', { message: 'upstream timeout', type: 'timeout_error' });
+  assert.ok(output.includes('data: {"error":{"message":"upstream timeout","type":"timeout_error"},"choices":[{"index":0,"delta":{"content":"\\n\\n[Error: upstream timeout]"},"finish_reason":"error"}]}\n\n'));
+  assert.ok(output.includes('data: [DONE]\n\n'));
+});
+
+test('three-phase streaming: emitReasoningPhase flushes thinking and finishOpenAIStream skips re-emission', () => {
+  const chunks = [];
+  const res = {
+    headersSent: true,
+    write: (d) => { chunks.push(d); },
+    end: () => {},
+  };
+  res._reasoningEmitted = true;
+  serverInternals.emitReasoningPhase(res, 'openai', {
+    id: 'ds-test-r1',
+    created: 123456,
+    model: 'deepseek-reasoner',
+    reasoningContent: 'Step 1: Calculate 2 + 2 = 4.',
+  });
+
+  assert.ok(chunks.some(c => c.includes('"reasoning_content":"Step 1: Calculate 2 + 2 = 4."')));
+
+  const openaiResp = {
+    id: 'ds-test-r1',
+    created: 123456,
+    model: 'deepseek-reasoner',
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: 'The answer is 4.', reasoning_content: 'Step 1: Calculate 2 + 2 = 4.' },
+      finish_reason: 'stop',
+    }],
+  };
+  const chunkCountBefore = chunks.length;
+  serverInternals.finishOpenAIStream(res, openaiResp, { skipReasoning: true });
+  // Should NOT re-emit reasoning_content
+  const newChunks = chunks.slice(chunkCountBefore);
+  assert.ok(!newChunks.some(c => c.includes('"reasoning_content"')));
+  assert.ok(newChunks.some(c => c.includes('"content":"The answer is 4."')));
+  assert.ok(newChunks.some(c => c.includes('[DONE]')));
+});
+
+test('streaming tool turns strictly suppress reasoning bytes', () => {
+  const chunks = [];
+  const res = {
+    headersSent: true,
+    write: (d) => { chunks.push(d); },
+    end: () => {},
+  };
+  const openaiResp = {
+    id: 'ds-test-tool',
+    created: 123456,
+    model: 'deepseek-reasoner',
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: null,
+        reasoning_content: 'Let me look up the file with read_file.',
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/etc/hosts"}' } }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  };
+  serverInternals.finishOpenAIStream(res, openaiResp, { skipReasoning: true });
+  assert.ok(!chunks.some(c => c.includes('reasoning_content')));
+  assert.ok(chunks.some(c => c.includes('"tool_calls"')));
+  assert.ok(chunks.some(c => c.includes('[DONE]')));
+});
+
+test('consumeDeepSeekStream flushes reasoning at think->response transition and aborts on clientGone', async () => {
+  const { Readable } = require('stream');
+  let flushedReasoning = null;
+
+  // Stream simulating think fragments followed by a response fragment
+  const sseChunks = [
+    'data: {"v":{"response":{"fragments":[{"type":"THINK","content":"Thinking deep thoughts..."}]}}}\n\n',
+    'data: {"p":"response/fragments","v":[{"type":"RESPONSE","content":"Here is the result."}]}\n\n',
+    'data: {"finish_reason":"stop"}\n\n',
+  ];
+
+  const stream = Readable.from(sseChunks.map(c => Buffer.from(c)));
+  const result = await serverInternals.consumeDeepSeekStream(stream, {
+    onReasoningDone: (reasoning) => {
+      flushedReasoning = reasoning;
+    },
+    isClientGone: () => false,
+  });
+
+  assert.equal(flushedReasoning, 'Thinking deep thoughts...');
+  assert.equal(result.content, 'Here is the result.');
+  assert.equal(result.reasoningContent, 'Thinking deep thoughts...');
+  assert.equal(result.finishReason, 'stop');
+  assert.equal(result.abandoned, false);
+
+  // Dead socket abort test
+  let destroyed = false;
+  const slowStream = new Readable({
+    read() {
+      this.push(Buffer.from('data: {"v":{"response":{"fragments":[{"type":"THINK","content":"Thinking..."}]}}}\n\n'));
+    },
+    destroy(err, cb) {
+      destroyed = true;
+      cb(err);
+    },
+  });
+
+  let clientGoneFlag = false;
+  const abortResultPromise = serverInternals.consumeDeepSeekStream(slowStream, {
+    isClientGone: () => clientGoneFlag,
+  });
+  clientGoneFlag = true;
+  slowStream.push(Buffer.from('data: {"v":{"response":{"content":"more content"}}}\n\n'));
+  const abortResult = await abortResultPromise;
+  assert.equal(abortResult.abandoned, true);
+  assert.equal(destroyed, true);
+});
+
+

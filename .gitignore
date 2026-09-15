@@ -14,3 +14,5 @@ data/accounts/*.json
 /tmp/deepseek_response_*
 .DS_Store
 *.pdf
+# Live session map (chat ids, restored on restart) — never commit.
+.sessions.json
