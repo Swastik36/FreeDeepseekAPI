@@ -511,42 +511,33 @@ The parser traverses character by character tracking brace depth:
 
 ## 6. Session Lifecycle & Auto-Recovery
 
-### 6.1 Auto-Reset Triggers
+### 6.1 Session Invariant & Reset Triggers (No New Browser Chats)
+
+**Operator Invariant**: One proxy session maps to at most one upstream browser chat for its entire lifetime. No failure, retry, timeout, expiry, or rotation path may mint a replacement chat. The **sole exception** is client-side compaction (`compactionReset` in delta mode). Manual `/new` remains the deliberate operator escape hatch.
 
 | Condition | Action |
 |---|---|
-| Message count >= 100 | Auto-reset DeepSeek session, keep history buffer |
-| Session age > 2 hours | Auto-reset (DeepSeek web session TTL) |
-| HTTP 400/404/500 response | Reset and retry once |
-| Empty content response | Compact context, reset session, retry up to `DEEPSEEK_MAX_RETRIES` (default 2) |
-| Context/content too long | Pre-compact to `DEEPSEEK_MAX_PROMPT_CHARS`, then retry with a smaller budget |
+| Client Compaction (`detectClientCompaction`) | Clears session and starts fresh chat with full tools + summary (sole sanctioned auto-reset) |
+| Manual `/new` command | Explicit operator escape hatch: resets session and history on demand |
+| Message count >= 100 | Preemptive rollover retired; preserved in same chat |
+| Session age > 2 hours | Preemptive rollover retired; preserved in same chat |
+| Empty content response | Retries in-place up to `MAX_EMPTY_RETRIES` (default 2); exhausts with `tool_call_failed` without burning chat |
+| Malformed tool markup | Retries in-place up to 2 attempts with strict reminder prompt; exhausts with `tool_call_failed` (502) without resetting |
+| HTTP 400/404/500 response | Throws `chat_expired` directing operator to `/new`; preserves session |
+| Upstream timeout (504) | Account cooled after consecutive timeouts; preserves chat |
+| Context/content too long | Pre-compacts to fit budget; retries in-place in same chat |
 
 ### 6.2 History Buffer
 
-When a session is reset, the proxy preserves the **last 15 exchanges** (capped at 10,000 chars). It injects this recovery context only when the client did not already send multi-turn history:
+When a session is explicitly reset (via compaction or `/new`), the proxy preserves the **last 15 exchanges** (capped at 10,000 chars). It injects this recovery context only when the client did not already send multi-turn history.
 
-```
-[Previous conversation]
-User: what is my IP?
-Assistant: Your IP is 161.97.175.214
+### 6.3 Upstream Expiration & Operator Escape Hatch
 
-User: check openvpn accounts
-Assistant: TOOL_CALL: terminal
-arguments: {"command": "cat /etc/openvpn/server.conf"}
-
-[Continue from here]
-
-<new user prompt>
-```
-
-### 6.3 Session Recovery
-
-If DeepSeek's web session expires (HTTP 400/404/500):
-1. Current session ID is cleared
-2. New session is created via `/api/v0/chat_session/create`
-3. Same PoW challenge is reused (to avoid re-solving)
-4. Request is retried with `parent_message_id: null`
-5. History buffer is injected as context
+If DeepSeek's web chat expires or is invalidated upstream (HTTP 400/404/500):
+1. The proxy does **NOT** auto-mint a replacement chat.
+2. The error is surfaced immediately with type `chat_expired`.
+3. Error message instructs operator: `Type /new to start a fresh chat.`
+4. The deliberate human escape hatch (`/new`) allows resetting when desired, avoiding silent session drift and abandoned browser tabs.
 
 ---
 
@@ -647,11 +638,11 @@ Error response format:
 
 | Issue | Cause | Impact |
 |---|---|---|
-| Empty responses at msg 17-34 | DeepSeek web session instability | Conversation interrupted, retry needed |
-| No native tool calling | DeepSeek Web API doesn't support it | LLM may generate malformed tool calls |
+| Empty responses | DeepSeek web session instability | Retries in-place up to 2x; exhausts with `tool_call_failed` without burning chat |
+| No native tool calling | DeepSeek Web API doesn't support it | LLM may generate malformed tool calls (handled by in-place repair) |
 | Response time 3-17s | PoW + network to DeepSeek | Slower than official API |
-| Session TTL ~2h | DeepSeek web browser timeout | Periodic session resets |
-| Credentials expire | Browser tokens/cookies change | Proxy needs re-auth |
+| Session TTL / Expiry | DeepSeek web browser timeout | Surfaced as `chat_expired`; operator issues `/new` escape hatch |
+| Credentials expire | Browser tokens/cookies change | Proxy needs re-auth (`npm run auth`) |
 | Same DeepSeek account | All agents share one web login | Rate limiting across all sessions |
 
 ---

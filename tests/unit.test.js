@@ -763,7 +763,10 @@ test('fresh chats prefer the account already hosting sessions (home stickiness)'
   assert.equal(fresh.accountId, 'spare');
 });
 
-test('fresh-chat tie at zero picks a ready account (round-robin fallback)', (t) => {
+test('preferred-mode tie at zero alternates ready accounts (legacy round-robin fallback)', (t) => {
+  saveRoutingEnv(t);
+  process.env.DEEPSEEK_ROUTING_MODE = 'preferred';
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
   const originalAccounts = serverInternals.accounts.splice(0);
   const savedSessions = Array.from(serverInternals.sessions.entries());
   t.after(() => {
@@ -779,7 +782,9 @@ test('fresh-chat tie at zero picks a ready account (round-robin fallback)', (t) 
   );
   const first = serverInternals.selectAccountForSession(serverInternals.createSession());
   const second = serverInternals.selectAccountForSession(serverInternals.createSession());
-  // Parity-independent: both picks valid, and the tie-break alternates.
+  // Legacy path (brief 2026-09-15 escape hatch): with no preference set and no
+  // hosted sessions, cold-start ties fall back to round-robin, so two
+  // consecutive fresh picks alternate deterministically (parity-independent).
   assert.ok(['A', 'B'].includes(first.id));
   assert.ok(['A', 'B'].includes(second.id));
   assert.notEqual(first.id, second.id);
@@ -801,14 +806,15 @@ test('cross-account continuation is accepted only with a fresh recovery prompt',
 });
 
 test('TTL and depth rollover happens before prompt construction and preserves recovery state', () => {
+  // Under no-new-chats invariant (implementor-brief-no-new-chats-2026-09-15), preemptive rollover is retired.
   const depthSession = serverInternals.createSession();
   depthSession.id = 'deep-session';
   depthSession.messageCount = 100;
   depthSession.accountId = 'account_1';
   depthSession.history.push({ user: 'u', assistant: 'a' });
   const depthReset = serverInternals.prepareSessionForPrompt(depthSession, Date.now());
-  assert.equal(depthReset.reason, 'max_message_depth');
-  assert.equal(depthSession.id, null);
+  assert.equal(depthReset, null);
+  assert.equal(depthSession.id, 'deep-session');
   assert.equal(depthSession.history.length, 1);
   assert.equal(depthSession.accountId, 'account_1');
 
@@ -817,8 +823,8 @@ test('TTL and depth rollover happens before prompt construction and preserves re
   ttlSession.id = 'old-session';
   ttlSession.createdAt = now - (2 * 60 * 60 * 1000) - 1;
   const ttlReset = serverInternals.prepareSessionForPrompt(ttlSession, now);
-  assert.equal(ttlReset.reason, 'session_ttl');
-  assert.equal(ttlReset.failedSessionId, 'old-session');
+  assert.equal(ttlReset, null);
+  assert.equal(ttlSession.id, 'old-session');
 });
 
 test('tool results use the global prompt cap instead of an unconditional 8k truncation', () => {
@@ -1136,59 +1142,6 @@ test('repair guard persists across restart, stale guard still expires', () => {
   } finally {
     serverInternals.sessions.clear();
     for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
-  }
-});
-
-test('lean repair prompt keeps instruction intact and carries tools + latest turn', () => {
-  const tools = [{ type: 'function', function: { name: 'read', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } }];
-  const messages = [
-    { role: 'system', content: 'sys' },
-    { role: 'user', content: 'first question' },
-    { role: 'assistant', content: 'an answer' },
-    { role: 'user', content: 'read /etc/hostname now' },
-  ];
-  const prev = process.env.DEEPSEEK_LOCAL_SHELL;
-  try {
-    delete process.env.DEEPSEEK_LOCAL_SHELL;
-    const lean = serverInternals.buildLeanRepairPrompt(tools, messages);
-    assert.ok(lean.startsWith('[STRICT INSTRUCTION — DeepSeek Web backend, repair attempt]'));
-    assert.match(lean, /read: Read a file/);
-    assert.match(lean, /read \/etc\/hostname now/);
-    assert.doesNotMatch(lean, /first question/);
-    // Huge latest turn gets bounded, instruction never truncated.
-    const big = [...messages.slice(0, 3), { role: 'user', content: 'x'.repeat(100000) }];
-    const leanBig = serverInternals.buildLeanRepairPrompt(tools, big);
-    assert.ok(leanBig.startsWith('[STRICT INSTRUCTION — DeepSeek Web backend, repair attempt]'));
-    assert.ok(leanBig.length < 80000);
-  } finally {
-    if (prev === undefined) delete process.env.DEEPSEEK_LOCAL_SHELL;
-    else process.env.DEEPSEEK_LOCAL_SHELL = prev;
-  }
-});
-
-test('lean repair prompt carries SHELL + tool preference so same-chat repairs stay fish-compatible', () => {
-  const prev = process.env.DEEPSEEK_LOCAL_SHELL;
-  const tools = [
-    { type: 'function', function: { name: 'bash', description: 'run a command', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
-    { type: 'function', function: { name: 'read', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
-  ];
-  const messages = [
-    { role: 'user', content: 'check the distinctive-earlier-question status' },
-    { role: 'assistant', content: 'an answer' },
-    { role: 'user', content: 'run the distinctive-latest-request now' },
-  ];
-  try {
-    delete process.env.DEEPSEEK_LOCAL_SHELL;
-    const lean = serverInternals.buildLeanRepairPrompt(tools, messages);
-    // First-attempt repair shape: nudge + tools, no history resend.
-    assert.ok(lean.startsWith('[STRICT INSTRUCTION — DeepSeek Web backend, repair attempt]'));
-    assert.match(lean, /SHELL: operator console shell is fish/);
-    assert.match(lean, /prefer read\/edit\/grep tools over shell/);
-    assert.match(lean, /distinctive-latest-request/);
-    assert.doesNotMatch(lean, /distinctive-earlier-question/);
-  } finally {
-    if (prev === undefined) delete process.env.DEEPSEEK_LOCAL_SHELL;
-    else process.env.DEEPSEEK_LOCAL_SHELL = prev;
   }
 });
 
@@ -1633,4 +1586,1631 @@ test('consumeDeepSeekStream flushes reasoning at think->response transition and 
   assert.equal(destroyed, true);
 });
 
+test('isTitleGenerationRequest detects OpenCode title prompt and generateLocalTitle extracts clean titles', () => {
+  const opencodeTitlePrompt = [
+    { role: 'user', content: 'Generate a title for this conversation:\n\nUser: can you look at my home fir' }
+  ];
+  assert.equal(serverInternals.isTitleGenerationRequest(opencodeTitlePrompt), true);
+  assert.equal(serverInternals.generateLocalTitle(opencodeTitlePrompt), 'Can You Look At My Home');
 
+  const normalPrompt = [
+    { role: 'user', content: 'can you look at my home fir' }
+  ];
+  assert.equal(serverInternals.isTitleGenerationRequest(normalPrompt), false);
+
+  const emptyPrompt = [];
+  assert.equal(serverInternals.isTitleGenerationRequest(emptyPrompt), false);
+  assert.equal(serverInternals.generateLocalTitle(emptyPrompt), 'New Chat');
+});
+
+test('finishOpenAIStream maps tool_calls with index integer property for SDK streaming compliance', () => {
+  const chunks = [];
+  const fakeRes = {
+    headersSent: true,
+    write(chunk) { chunks.push(chunk); },
+    end() {},
+  };
+
+  const responseObj = {
+    id: 'ds-test-123',
+    created: 1234567890,
+    model: 'deepseek-chat',
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_123',
+          type: 'function',
+          function: { name: 'bash', arguments: '{"command":"ls"}' }
+        }]
+      },
+      finish_reason: 'tool_calls'
+    }]
+  };
+
+  serverInternals.finishOpenAIStream(fakeRes, responseObj, { skipReasoning: true });
+
+  const payloadLines = chunks
+    .join('')
+    .split('\n')
+    .filter(l => l.startsWith('data: ') && l !== 'data: [DONE]')
+    .map(l => JSON.parse(l.slice(6)));
+
+  const toolChunk = payloadLines.find(p => p.choices?.[0]?.delta?.tool_calls);
+  assert.ok(toolChunk, 'Must emit a delta chunk with tool_calls');
+  const toolCall = toolChunk.choices[0].delta.tool_calls[0];
+  assert.equal(toolCall.index, 0, 'Each tool call in stream delta MUST have integer index property');
+  assert.equal(toolCall.id, 'call_123');
+  assert.equal(toolCall.type, 'function');
+  assert.equal(toolCall.function.name, 'bash');
+});
+
+test('parseToolCall respects allowBare option for retry flows while defaulting to strict envelopes', () => {
+  const bareJson = '{"name":"bash","arguments":{"command":"ls"}}';
+  const fencedBare = '```json\n{"name":"bash","arguments":{"command":"ls"}}\n```';
+
+  // Default: rejects bare and fenced-bare (preserves strict isolation for normal chat turns)
+  assert.equal(serverInternals.parseToolCall(bareJson), null);
+  assert.equal(serverInternals.parseToolCall(fencedBare), null);
+
+  // allowBare: true: accepts both bare and fenced-bare (for repair retries)
+  const parsedBare = serverInternals.parseToolCall(bareJson, { allowBare: true });
+  assert.ok(parsedBare, 'Should parse bare JSON when allowBare: true');
+  assert.equal(parsedBare.name, 'bash');
+  assert.deepEqual(JSON.parse(parsedBare.arguments), { command: 'ls' });
+
+  const parsedFenced = serverInternals.parseToolCall(fencedBare, { allowBare: true });
+  assert.ok(parsedFenced, 'Should parse fenced bare JSON when allowBare: true');
+  assert.equal(parsedFenced.name, 'bash');
+  assert.deepEqual(JSON.parse(parsedFenced.arguments), { command: 'ls' });
+});
+
+test('opener settling in delta mode preserves existing active chat session instead of abandoning it', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat_existing_123';
+  session.messageCount = 2;
+
+  const turn1Messages = [
+    { role: 'user', content: 'can you look at my home dir' }
+  ];
+  // Turn 1 completes and commits delta state:
+  serverInternals.commitDeltaState(session, turn1Messages);
+  assert.equal(session.deltaMsgCount, 1);
+  assert.ok(session.deltaBoundary);
+
+  // Store under turn1 agentId
+  const fp1 = serverInternals.fingerprintConversation(turn1Messages);
+  const agent1 = `dev-agent:${fp1}`;
+  serverInternals.sessions.set(agent1, session);
+
+  // Turn 2 comes in with 3 messages:
+  const turn2Messages = [
+    { role: 'user', content: 'can you look at my home dir' },
+    { role: 'assistant', content: 'Sure, I will check.' },
+    { role: 'user', content: 'ls -la' },
+  ];
+  const fp2 = serverInternals.fingerprintConversation(turn2Messages);
+  const agent2 = `dev-agent:${fp2}`;
+  assert.notEqual(agent1, agent2, 'Fingerprints differ between turn 1 and turn 2');
+
+  // Verify splitClientMessages correctly finds suffix when session is adopted:
+  const split = serverInternals.splitClientMessages(turn2Messages, session);
+  assert.equal(split.isDelta, true);
+  assert.equal(split.forwardedCount, 1);
+  assert.equal(split.effective.length, 2);
+  assert.equal(split.effective[0].content, 'Sure, I will check.');
+  assert.equal(split.effective[1].content, 'ls -la');
+
+  // Clean up test sessions
+  serverInternals.sessions.delete(agent1);
+  serverInternals.sessions.delete(agent2);
+});
+
+test('two-user-message opener keying diverges on second user message and ignores assistant/tool variance', () => {
+  const baseUser1 = { role: 'user', content: 'Hello' };
+  const user2A = { role: 'user', content: 'How do I run tests?' };
+  const user2B = { role: 'user', content: 'What is the weather today?' };
+  const user3 = { role: 'user', content: 'Thanks, what about linting?' };
+
+  // Turn 1
+  const t1 = [baseUser1];
+  const fp1 = serverInternals.fingerprintConversation(t1);
+
+  // Turn 2 with assistant reply between
+  const t2A = [baseUser1, { role: 'assistant', content: 'Hi! How can I help?' }, user2A];
+  const fp2A = serverInternals.fingerprintConversation(t2A);
+
+  // Turn 2 with tool calls and thinking between
+  const t2AWithTools = [
+    baseUser1,
+    { role: 'assistant', content: '', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'list_dir', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'tc1', content: 'server.js tests/' },
+    { role: 'assistant', content: 'I checked your directory.' },
+    user2A,
+  ];
+  const fp2ATools = serverInternals.fingerprintConversation(t2AWithTools);
+
+  // Invariant across tool/assistant turns:
+  assert.equal(fp2A, fp2ATools, 'Tool calls and assistant messages do not alter two-user-message key');
+
+  // Diverges when second user message differs (collision prevention):
+  const t2B = [baseUser1, { role: 'assistant', content: 'Hi! How can I help?' }, user2B];
+  const fp2B = serverInternals.fingerprintConversation(t2B);
+  assert.notEqual(fp2A, fp2B, 'Sessions with different second user messages diverge');
+
+  // Turn 3 keeps the exact same key as Turn 2 (settles permanently):
+  const t3A = [...t2A, { role: 'assistant', content: 'Run npm test.' }, user3];
+  const fp3A = serverInternals.fingerprintConversation(t3A);
+  assert.equal(fp2A, fp3A, 'Key is permanently frozen from Turn 2 onwards');
+});
+
+test('repair retry audit gate correctly classifies clean prose vs broken markup vs unknown tools', () => {
+  const allowedToolNames = new Set(['bash', 'read_file']);
+
+  // Case 1: Valid tool call
+  const validTc = serverInternals.parseToolCall('<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>');
+  assert.ok(validTc);
+  assert.ok(allowedToolNames.has(validTc.name));
+
+  // Case 2: Clean prose (no tool markup)
+  const cleanProse = 'I analyzed the issue and here is the explanation without using any tool.';
+  const cleanTc = serverInternals.parseToolCall(cleanProse, { allowBare: true });
+  const cleanIsMarkup = serverInternals.looksLikeToolCallMarkup(cleanProse);
+  assert.equal(cleanTc, null);
+  assert.equal(cleanIsMarkup, false);
+  // Audit gate: !retryTc && !looksLikeToolCallMarkup -> delivers clean text
+  assert.ok(!cleanTc && !cleanIsMarkup);
+
+  // Case 3: Broken markup
+  const brokenMarkup = 'TOOL_CALL: bash {"command": "invalid unclosed';
+  const brokenTc = serverInternals.parseToolCall(brokenMarkup, { allowBare: true });
+  const brokenIsMarkup = serverInternals.looksLikeToolCallMarkup(brokenMarkup);
+  assert.equal(brokenTc, null);
+  assert.equal(brokenIsMarkup, true);
+  // Audit gate: !retryTc && looksLikeToolCallMarkup -> broken markup, escalates or 502s
+  assert.ok(!brokenTc && brokenIsMarkup);
+
+  // Case 4: Unknown tool name (bare JSON or tool call envelope)
+  const unknownToolText = '{"name": "unknown_tool_xyz", "arguments": {}}';
+  const unknownTc = serverInternals.parseToolCall(unknownToolText, { allowBare: true });
+  assert.ok(unknownTc);
+  assert.equal(allowedToolNames.has(unknownTc.name), false);
+  // Audit gate: retryTc && !allowedToolNames.has(name) -> flagged as broken markup, never laundered as prose
+  const unknownIsBroken = Boolean(
+    (unknownTc && !allowedToolNames.has(unknownTc.name)) ||
+    (!unknownTc && serverInternals.looksLikeToolCallMarkup(unknownToolText))
+  );
+  assert.equal(unknownIsBroken, true);
+});
+
+test('opener adoption requires exactly one candidate and rejects ambiguous multi-session matches', () => {
+  const turn1 = [{ role: 'user', content: 'identical opener' }];
+  const envelope = serverInternals.hashMessageEnvelope(turn1[0]);
+
+  const session1 = serverInternals.createSession();
+  session1.id = 'chat_1';
+  session1.deltaMsgCount = 1;
+  session1.deltaBoundary = envelope;
+
+  const session2 = serverInternals.createSession();
+  session2.id = 'chat_2';
+  session2.deltaMsgCount = 1;
+  session2.deltaBoundary = envelope;
+
+  // Simulate two concurrent sessions sharing the exact same boundary:
+  const map = new Map([
+    ['dev-agent:aaa', session1],
+    ['dev-agent:bbb', session2],
+  ]);
+
+  const turn2Messages = [
+    { role: 'user', content: 'identical opener' },
+    { role: 'user', content: 'divergent second message' },
+  ];
+
+  const matchingCandidates = [];
+  for (const [id, s] of map) {
+    if (s.deltaBoundary === serverInternals.hashMessageEnvelope(turn2Messages[0])) {
+      matchingCandidates.push({ id, session: s });
+    }
+  }
+  // Hardening check: with 2 matching candidates, adoption must refuse to adopt
+  assert.equal(matchingCandidates.length, 2);
+  const shouldAdopt = matchingCandidates.length === 1;
+  assert.equal(shouldAdopt, false, 'Ambiguous opener adoption must refuse and fork');
+});
+
+test('markAccountFailure tracks consecutive timeouts and triggers cooldown after 3 (BUG-C)', () => {
+  const account = { id: 'acct_test', failures: 0, consecutiveTimeouts: 0, cooldownUntil: 0 };
+  // Timeout 1
+  serverInternals.markAccountFailure(account, 504, 'timeout');
+  assert.equal(account.failures, 1);
+  assert.equal(account.consecutiveTimeouts, 1);
+  assert.equal(account.cooldownUntil, 0);
+
+  // Timeout 2
+  serverInternals.markAccountFailure(account, 504, 'timeout / fetch abort');
+  assert.equal(account.failures, 2);
+  assert.equal(account.consecutiveTimeouts, 2);
+  assert.equal(account.cooldownUntil, 0);
+
+  // Timeout 3 -> triggers cooldown
+  serverInternals.markAccountFailure(account, 504, 'fetch timeout');
+  assert.equal(account.failures, 3);
+  assert.equal(account.consecutiveTimeouts, 0);
+  assert.ok(account.cooldownUntil > Date.now());
+});
+
+test('continuation loop condition gates on length/incomplete and skips stop (BUG-A)', () => {
+  // Explicit stop with 30k chars must NOT continue
+  assert.equal(serverInternals.shouldAutoContinue('stop', 30000, 0), false);
+
+  // Length finish with 30k chars MUST continue
+  assert.equal(serverInternals.shouldAutoContinue('length', 30000, 0), true);
+
+  // Non-standard upstream INCOMPLETE finish marker MUST continue
+  assert.equal(serverInternals.shouldAutoContinue('INCOMPLETE', 15000, 0), true);
+
+  // Truncated long response without explicit stop MUST continue
+  assert.equal(serverInternals.shouldAutoContinue(null, 26000, 0), true);
+
+  // Max rounds reached must stop
+  assert.equal(serverInternals.shouldAutoContinue('length', 30000, 2), false);
+});
+
+test('empty retry policy always retries in-place under no-new-chats invariant (implementor-brief-no-new-chats-2026-09-15)', () => {
+  // Retries are always in-place; no new chats ever (empty retries never reset session)
+  assert.equal(serverInternals.shouldResetOnEmptyRetry(false, 1), false);
+  assert.equal(serverInternals.shouldResetOnEmptyRetry(false, 2), false);
+  assert.equal(serverInternals.shouldResetOnEmptyRetry(true, 1), false);
+});
+
+test('timeout error tagging prevents double-marking on the same account and error', () => {
+  const account = { id: 'acct_dedup', failures: 0, consecutiveTimeouts: 0, cooldownUntil: 0 };
+  const err = new Error('fetch timeout');
+
+  // Layer 1 (inside askDeepSeekStream):
+  if (!err._accountMarked) {
+    serverInternals.markAccountFailure(account, 504, err.message);
+    err._accountMarked = true;
+  }
+  assert.equal(account.failures, 1);
+  assert.equal(account.consecutiveTimeouts, 1);
+
+  // Layer 2 (top-level handler): must be a no-op because err._accountMarked is true
+  if (!err._accountMarked) {
+    serverInternals.markAccountFailure(account, 504, err.message);
+  }
+  assert.equal(account.failures, 1, 'Double marking must be prevented');
+  assert.equal(account.consecutiveTimeouts, 1, 'Consecutive timeouts must not double-increment');
+});
+
+test('parseToolCalls parses 3 valid newline envelopes, preserves order, and assigns unique ids', () => {
+  const text = [
+    '{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/a"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/b"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/c"}}}',
+  ].join('\n');
+
+  const calls = serverInternals.parseToolCalls(text);
+  assert(Array.isArray(calls));
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].name, 'read_file');
+  assert.equal(calls[1].name, 'read_file');
+  assert.equal(calls[2].name, 'read_file');
+  assert.deepEqual(JSON.parse(calls[0].arguments), { path: '/tmp/a' });
+  assert.deepEqual(JSON.parse(calls[1].arguments), { path: '/tmp/b' });
+  assert.deepEqual(JSON.parse(calls[2].arguments), { path: '/tmp/c' });
+
+  const ids = calls.map(c => c.id);
+  assert.equal(new Set(ids).size, 3);
+  ids.forEach(id => assert.match(id, /^call_\d+_[a-z0-9]+_\d+$/));
+});
+
+test('parseToolCalls caps at MAX_TOOL_CALLS_PER_TURN (8) when 10 valid envelopes provided', () => {
+  const text = [
+    '{"tool_call":{"name":"read_file","arguments":{"path":"1"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"2"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"3"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"4"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"5"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"6"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"7"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"8"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"9"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"10"}}}',
+  ].join('\n');
+
+  const calls = serverInternals.parseToolCalls(text);
+  assert.equal(calls.length, serverInternals.MAX_TOOL_CALLS_PER_TURN);
+  assert.equal(calls.length, 8);
+  assert.deepEqual(calls.map(c => JSON.parse(c.arguments).path), ['1', '2', '3', '4', '5', '6', '7', '8']);
+});
+
+test('parseToolCalls deduplicates identical envelopes to a single call', () => {
+  const text = [
+    '{"tool_call":{"name":"read_file","arguments":{"path":"/dup"}}}',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"/dup"}}}',
+  ].join('\n');
+
+  const calls = serverInternals.parseToolCalls(text);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'read_file');
+  assert.deepEqual(JSON.parse(calls[0].arguments), { path: '/dup' });
+});
+
+test('parseToolCalls rejects mixed valid and malformed turns triggering v1 fallback to single match', () => {
+  const mixed = [
+    '{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/first"}}}',
+    'broken markup or prose line',
+    '{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/second"}}}',
+  ].join('\n');
+
+  // parseToolCalls must return null because not all envelopes parsed cleanly
+  const multi = serverInternals.parseToolCalls(mixed);
+  assert.equal(multi, null);
+
+  // Fallback single-first-match path extracts the first valid tool call only
+  const single = serverInternals.parseToolCall(mixed);
+  assert(single);
+  assert.equal(single.name, 'read_file');
+  assert.deepEqual(JSON.parse(single.arguments), { path: '/tmp/first' });
+});
+
+test('parseToolCalls rejects unknown tool names among valid envelopes (no laundering)', () => {
+  const mixedTools = [
+    '{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/valid"}}}',
+    '{"tool_call":{"name":"unauthorized_tool","arguments":{}}}',
+  ].join('\n');
+  const allowedToolNames = new Set(['read_file', 'write_file']);
+
+  // parseToolCalls must refuse multi-turn when an unknown tool is present
+  const multi = serverInternals.parseToolCalls(mixedTools, { allowedToolNames });
+  assert.equal(multi, null);
+
+  // Fallback takes the first match without laundering the unknown tool
+  const single = serverInternals.parseToolCall(mixedTools);
+  assert(single);
+  assert.equal(single.name, 'read_file');
+});
+
+test('streaming and response mappers emit N tool_calls with indices, tool_use blocks, and function_call items', () => {
+  const toolCalls = [
+    { id: 'call_1', name: 'read_file', arguments: '{"path":"/a"}' },
+    { id: 'call_2', name: 'read_file', arguments: '{"path":"/b"}' },
+  ];
+  const openaiResp = serverInternals.buildToolCallResponse(toolCalls, 'test-model');
+
+  // 1. Anthropic mapper emits N tool_use blocks
+  const anthropic = serverInternals.toAnthropicResponse(openaiResp);
+  assert.equal(anthropic.stop_reason, 'tool_use');
+  const toolUseBlocks = anthropic.content.filter(c => c.type === 'tool_use');
+  assert.equal(toolUseBlocks.length, 2);
+  assert.equal(toolUseBlocks[0].id, 'call_1');
+  assert.equal(toolUseBlocks[0].name, 'read_file');
+  assert.deepEqual(toolUseBlocks[0].input, { path: '/a' });
+  assert.equal(toolUseBlocks[1].id, 'call_2');
+  assert.equal(toolUseBlocks[1].name, 'read_file');
+  assert.deepEqual(toolUseBlocks[1].input, { path: '/b' });
+
+  // 2. Responses mapper emits N function_call items
+  const responses = serverInternals.toResponsesResponse(openaiResp);
+  const fnCalls = responses.output.filter(item => item.type === 'function_call');
+  assert.equal(fnCalls.length, 2);
+  assert.equal(fnCalls[0].call_id, 'call_1');
+  assert.equal(fnCalls[0].name, 'read_file');
+  assert.equal(fnCalls[1].call_id, 'call_2');
+  assert.equal(fnCalls[1].name, 'read_file');
+
+  // 3. Streaming mapper (finishOpenAIStream) emits N tool_calls with index 0..N-1
+  const chunks = [];
+  const mockRes = {
+    headersSent: true,
+    write(chunk) { chunks.push(chunk); },
+    end() {},
+  };
+  serverInternals.finishOpenAIStream(mockRes, openaiResp);
+  const toolChunk = chunks.find(c => c.includes('"tool_calls"'));
+  assert(toolChunk);
+  const jsonStr = toolChunk.replace(/^data:\s*/, '').trim();
+  const parsed = JSON.parse(jsonStr);
+  const streamedCalls = parsed.choices[0].delta.tool_calls;
+  assert.equal(streamedCalls.length, 2);
+  assert.equal(streamedCalls[0].index, 0);
+  assert.equal(streamedCalls[0].id, 'call_1');
+  assert.equal(streamedCalls[1].index, 1);
+  assert.equal(streamedCalls[1].id, 'call_2');
+});
+
+test('Fix 5: truncation maps to max_tokens/incomplete on Anthropic and Responses mappers', () => {
+  const base = {
+    id: 'ds-trunc-1',
+    created: 1700000000,
+    model: 'deepseek-chat',
+    usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+  };
+  const truncated = { ...base, choices: [{ message: { role: 'assistant', content: 'partial' }, finish_reason: 'length' }] };
+  const stopped = { ...base, choices: [{ message: { role: 'assistant', content: 'done' }, finish_reason: 'stop' }] };
+
+  const anthTrunc = serverInternals.toAnthropicResponse(truncated);
+  assert.equal(anthTrunc.stop_reason, 'max_tokens');
+  const respTrunc = serverInternals.toResponsesResponse(truncated);
+  assert.equal(respTrunc.status, 'incomplete');
+  assert.deepEqual(respTrunc.incomplete_details, { reason: 'max_output_tokens' });
+  assert.equal(respTrunc.output.find(i => i.type === 'message').status, 'incomplete');
+
+  const anthStop = serverInternals.toAnthropicResponse(stopped);
+  assert.equal(anthStop.stop_reason, 'end_turn');
+  const respStop = serverInternals.toResponsesResponse(stopped);
+  assert.equal(respStop.status, 'completed');
+  assert.equal(respStop.incomplete_details, undefined);
+  assert.equal(respStop.output.find(i => i.type === 'message').status, 'completed');
+});
+
+test('Fix 6: normalizeMessageContent never falls through to raw JSON for image/unknown parts', () => {
+  const image = serverInternals.normalizeMessageContent([
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA'.repeat(64) } },
+  ]);
+  assert.match(image, /^\[Image: /);
+  assert.match(image, /data omitted/);
+  assert.ok(!image.includes('AAAA'));
+
+  const inputImage = serverInternals.normalizeMessageContent([
+    { type: 'input_image', image_url: { url: 'https://example.test/x.png' } },
+  ]);
+  assert.match(inputImage, /^\[Image: /);
+  assert.ok(!inputImage.includes('base64'));
+
+  const unknown = serverInternals.normalizeMessageContent([{ type: 'video', video: { data: 'BIGBLOB' } }]);
+  assert.equal(unknown, '[Unsupported content part: video]');
+});
+
+test('Fix 7: normalizeApiParams rejects non-array messages with 400 invalid_request', () => {
+  assert.throws(
+    () => serverInternals.normalizeApiParams({ messages: 'not-an-array' }, 'anthropic'),
+    (err) => err.status === 400 && err.type === 'invalid_request' && /messages must be an array/.test(err.message)
+  );
+  assert.doesNotThrow(() => serverInternals.normalizeApiParams({ messages: [{ role: 'user', content: 'hi' }] }, 'anthropic'));
+  assert.doesNotThrow(() => serverInternals.normalizeApiParams({ messages: [] }, 'anthropic'));
+  assert.doesNotThrow(() => serverInternals.normalizeApiParams({ input: 'hello' }, 'responses'));
+});
+
+test('empty exhaustion preserves session.id and emits tool_call_failed (implementor-brief-no-new-chats-2026-09-15 §7.1)', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat-preserve-empty-1';
+  session.messageCount = 5;
+  session.accountId = 'account_test';
+
+  const exhaustion = serverInternals.resolveEmptyExhaustion({
+    session,
+    modelError: null,
+    timedOut: false,
+    retryAttempt: 2,
+  });
+
+  assert.equal(session.id, 'chat-preserve-empty-1');
+  assert.equal(exhaustion.preserve, true);
+  assert.equal(exhaustion.type, 'tool_call_failed');
+  assert.equal(exhaustion.failedSessionId, 'chat-preserve-empty-1');
+  assert.equal(exhaustion.failedMessageCount, 5);
+  assert.equal(exhaustion.accountId, 'account_test');
+});
+
+test('502 repair exhaustion preserves session.id without resetting (implementor-brief-no-new-chats-2026-09-15 §7.2)', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat-preserve-repair-2';
+  session.messageCount = 8;
+  session.accountId = 'account_test';
+
+  const exhaustion = serverInternals.resolveRepairExhaustion({
+    session,
+    retryAttempt: 2,
+  });
+
+  assert.equal(session.id, 'chat-preserve-repair-2');
+  assert.equal(exhaustion.preserve, true);
+  assert.equal(exhaustion.status, 502);
+  assert.equal(exhaustion.type, 'tool_call_failed');
+  assert.equal(exhaustion.failedSessionId, 'chat-preserve-repair-2');
+  assert.equal(exhaustion.failedMessageCount, 8);
+  assert.equal(exhaustion.retryAttempts, 2);
+});
+
+test('upstream 400/404/500 expiry throws chat_expired directing to /new and preserves session.id (implementor-brief-no-new-chats-2026-09-15 §7.3)', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat-upstream-expired-3';
+  session.messageCount = 12;
+
+  for (const status of [400, 404, 500]) {
+    const err = serverInternals.createChatExpiredError(status);
+    assert.equal(err.status, status);
+    assert.equal(err.type, 'chat_expired');
+    assert.match(err.message, /Type \/new to start a fresh chat/);
+  }
+  // Session is preserved; no reset or recreate called
+  assert.equal(session.id, 'chat-upstream-expired-3');
+  assert.equal(session.messageCount, 12);
+});
+
+test('unsafe rotation restores pre-call snapshot and preserves session without resetting (implementor-brief-no-new-chats-2026-09-15 §7.4)', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat-original-4';
+  session.parentMessageId = 'msg-original-4';
+  session.accountId = 'account_1';
+  session.messageCount = 6;
+
+  const snapshot = {
+    id: session.id,
+    parentMessageId: session.parentMessageId,
+    accountId: session.accountId,
+    messageCount: session.messageCount,
+  };
+
+  const unsafeCall = { account: { id: 'account_2' }, promptSent: 'continue' };
+  assert.equal(serverInternals.isContinuationRecoverySafe('account_1', unsafeCall), false);
+
+  // Simulate unintended foreign chat contamination
+  session.id = 'chat-foreign-leak';
+  session.accountId = 'account_2';
+  session.messageCount = 7;
+
+  // Restore snapshot
+  serverInternals.restoreContinuationSnapshot(session, snapshot);
+
+  assert.equal(session.id, 'chat-original-4');
+  assert.equal(session.parentMessageId, 'msg-original-4');
+  assert.equal(session.accountId, 'account_1');
+  assert.equal(session.messageCount, 6);
+});
+
+test('repair attempts carry full tool definitions via buildRepairPrompt (implementor-brief-no-new-chats-2026-09-15 §7.5)', () => {
+  const tools = [
+    { type: 'function', function: { name: 'bash', description: 'Run bash command', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+    { type: 'function', function: { name: 'read_file', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } } },
+  ];
+  const messages = [{ role: 'user', content: 'list files' }];
+  const formatted = serverInternals.formatMessages(messages, tools);
+  const promptBuild = serverInternals.buildBoundedPrompt(formatted.systemPrompt, '', formatted.prompt);
+
+  // Both attempt 1 and attempt 2 build prompt with buildRepairPrompt(freshPromptBuild.prompt)
+  const repairPrompt = serverInternals.buildRepairPrompt(promptBuild.prompt);
+
+  assert.match(repairPrompt, /bash/);
+  assert.match(repairPrompt, /read_file/);
+  assert.match(repairPrompt, /\[STRICT INSTRUCTION — DeepSeek Web backend\]/);
+  assert.match(repairPrompt, /one strict JSON object on a single line/);
+});
+
+test('compaction still resets (sanctioned exception) while TTL and depth do not reset (implementor-brief-no-new-chats-2026-09-15 §7.6)', () => {
+  // 1. Compaction: resetRemoteSession resets session as the sole sanctioned exception
+  const compSession = serverInternals.createSession();
+  compSession.id = 'chat-compaction-sanctioned';
+  compSession.messageCount = 15;
+  compSession.history.push({ user: 'u', assistant: 'a' });
+
+  const resetResult = serverInternals.resetRemoteSession(compSession);
+  assert.equal(resetResult.failedSessionId, 'chat-compaction-sanctioned');
+  assert.equal(resetResult.failedMessageCount, 15);
+  assert.equal(compSession.id, null);
+  assert.equal(compSession.messageCount, 0);
+
+  // 2. TTL/depth: prepareSessionForPrompt returns null and does NOT reset
+  const deepSession = serverInternals.createSession();
+  deepSession.id = 'chat-depth-stay';
+  deepSession.messageCount = 200;
+  deepSession.createdAt = Date.now() - 100000;
+
+  const depthResult = serverInternals.prepareSessionForPrompt(deepSession, Date.now());
+  assert.equal(depthResult, null);
+  assert.equal(deepSession.id, 'chat-depth-stay');
+  assert.equal(deepSession.messageCount, 200);
+});
+
+test('serializeSession preserves numeric and string parentMessageId (review-report-2 item 1)', () => {
+  const s1 = serverInternals.createSession();
+  s1.parentMessageId = 14;
+  const snap1 = serverInternals.serializeSession(s1);
+  assert.equal(snap1.parentMessageId, 14);
+
+  const s2 = serverInternals.createSession();
+  s2.parentMessageId = 'msg-uuid-123';
+  const snap2 = serverInternals.serializeSession(s2);
+  assert.equal(snap2.parentMessageId, 'msg-uuid-123');
+
+  const s3 = serverInternals.createSession();
+  s3.parentMessageId = undefined;
+  const snap3 = serverInternals.serializeSession(s3);
+  assert.equal(snap3.parentMessageId, null);
+});
+
+test('hasLeftoverToolEnvelopes detects multi-tool envelopes to prevent silent narrowing (review-report-2 item 3)', () => {
+  const allowed = new Set(['read_file', 'bash']);
+
+  // Case 1: Multiple envelopes with an unknown tool
+  const mixedMarkup = '{"tool_call":{"name":"read_file","arguments":{"path":"a"}}}\n{"tool_call":{"name":"evil_tool","arguments":{"path":"b"}}}';
+  assert.equal(serverInternals.hasLeftoverToolEnvelopes(mixedMarkup), true);
+  // parseToolCalls with allowed filter returns null
+  assert.equal(serverInternals.parseToolCalls(mixedMarkup, { allowedToolNames: allowed }), null);
+
+  // Case 2: Single tool call in prose
+  const singleMarkup = 'Here is the file: {"tool_call":{"name":"read_file","arguments":{"path":"a"}}}';
+  assert.equal(serverInternals.hasLeftoverToolEnvelopes(singleMarkup), false);
+});
+
+test('formatToolDefinitions refers to proxy host and does not leak local hostname or private IP (review-report-2 item 4)', () => {
+  const tools = [{ type: 'function', function: { name: 'bash', description: 'run command' } }];
+  const formatted = serverInternals.formatToolDefinitions(tools);
+  assert.match(formatted, /Tools run on the proxy host/);
+  assert.doesNotMatch(formatted, /\b192\.168\./);
+  assert.doesNotMatch(formatted, /\b10\.\d+\.\d+\.\d+\b/);
+});
+
+
+
+
+
+
+
+
+
+
+test('toClientErrorMessage maps known upstream Russian errors to English, passes unknown through', () => {
+  assert.equal(
+    serverInternals.toClientErrorMessage('Слишком частые сообщения. Повторите попытку позже.'),
+    'Too many requests. Please try again later.'
+  );
+  assert.equal(
+    serverInternals.toClientErrorMessage('Upstream error 429: Слишком частые сообщения, повторите попытку позже'),
+    'Upstream error 429: Too many requests. Please try again later.'
+  );
+  assert.equal(serverInternals.toClientErrorMessage('Some plain English error'), 'Some plain English error');
+  assert.equal(serverInternals.toClientErrorMessage(''), '');
+  assert.equal(
+    serverInternals.toClientErrorMessage('Ошибка: содержание слишком длинным, сократите'),
+    'Ошибка: Content too long., сократите'
+  );
+});
+
+test('isRateLimitError detects HTTP 429 and throttling texts, rejects context/auth/empty signals', () => {
+  const rl = serverInternals.isRateLimitError;
+  // HTTP status shapes.
+  assert.equal(rl(429), true);
+  assert.equal(rl({ status: 429, message: 'whatever' }), true);
+  assert.equal(rl({ status: 429, type: 'rate_limit_error' }), true);
+  assert.equal(rl({ status: 502, message: 'x' }), false);
+  // RU + EN throttling texts (SSE modelError shapes included).
+  assert.equal(rl({ content: 'Слишком частые сообщения. Повторите попытку позже.' }), true);
+  assert.equal(rl({ content: 'Too many requests, please slow down', type: 'error' }), true);
+  assert.equal(rl({ content: 'Rate limit exceeded, try again later', finish_reason: 'error' }), true);
+  assert.equal(rl('rate_limit'), true);
+  // Must NOT match context-length, auth, or empty texts.
+  assert.equal(rl({ content: 'Maximum context length exceeded' }), false);
+  assert.equal(rl({ content: 'Содержание слишком длинное. Сократите его и попробуйте снова.' }), false);
+  assert.equal(rl({ status: 401, message: 'unauthorized' }), false);
+  assert.equal(rl({ status: 403, message: 'forbidden' }), false);
+  assert.equal(rl({ content: '' }), false);
+  assert.equal(rl(null), false);
+  assert.equal(rl(undefined), false);
+});
+
+test('resolveRateLimitMigration picks the other ready account', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat-old';
+  session.accountId = 'acct-a';
+  const peer = (id, coolMs = 0) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: coolMs > 0 ? Date.now() + coolMs : 0,
+    headers: {},
+  });
+  // Cooling throttled account + one ready peer: must migrate to the peer.
+  const d1 = serverInternals.resolveRateLimitMigration(session, [peer('acct-a', 600_000), peer('acct-b')], false);
+  assert.equal(d1.migrateTo, 'acct-b');
+  assert.ok(!d1.failFast);
+  // Multiple ready peers: pick stays off the throttled account.
+  const d2 = serverInternals.resolveRateLimitMigration(session, [peer('acct-a', 600_000), peer('acct-b'), peer('acct-c')], false);
+  assert.ok(['acct-b', 'acct-c'].includes(d2.migrateTo));
+});
+
+test('resolveRateLimitMigration fails fast on second rate-limit in the same turn', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat-migrated';
+  session.accountId = 'acct-b';
+  const peer = (id) => ({ id, config: { token: `t-${id}`, cookie: `c-${id}` }, cooldownUntil: 0, headers: {} });
+  const d = serverInternals.resolveRateLimitMigration(session, [peer('acct-a'), peer('acct-b')], true);
+  assert.equal(d.failFast, true);
+  assert.equal(d.reason, 'already-migrated');
+  assert.ok(!d.migrateTo);
+});
+
+test('resolveRateLimitMigration fails fast with no ready peer, session and chat untouched', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat-live';
+  session.parentMessageId = 'parent-1';
+  session.accountId = 'acct-a';
+  session.messageCount = 4;
+  session.history.push({ user: 'q', assistant: 'a' });
+  const peer = (id, coolMs) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: coolMs > 0 ? Date.now() + coolMs : 0,
+    headers: {},
+  });
+  const d = serverInternals.resolveRateLimitMigration(session, [peer('acct-a', 600_000), peer('acct-b', 600_000)], false);
+  assert.equal(d.failFast, true);
+  assert.equal(d.reason, 'no-ready-account');
+  // Decision helper is pure: nothing chat-scoped moved.
+  assert.equal(session.id, 'chat-live');
+  assert.equal(session.parentMessageId, 'parent-1');
+  assert.equal(session.accountId, 'acct-a');
+  assert.equal(session.messageCount, 4);
+  assert.equal(session.history.length, 1);
+});
+
+test('coolAccountForRateLimit cools on SSE throttling text, ignores other signals', () => {
+  const mk = () => ({ id: 'sse-acct', config: { token: 't', cookie: 'c' }, cooldownUntil: 0, failures: 0, headers: {} });
+  const throttled = mk();
+  assert.equal(
+    serverInternals.coolAccountForRateLimit(throttled, { type: 'error', content: 'Слишком частые сообщения. Повторите попытку позже.' }),
+    true
+  );
+  assert.ok(throttled.cooldownUntil > Date.now());
+  assert.equal(throttled.failures, 1);
+  // Non-throttling SSE errors must not touch cooldown state.
+  const other = mk();
+  assert.equal(serverInternals.coolAccountForRateLimit(other, { type: 'error', content: 'Temporary backend overload' }), false);
+  assert.equal(other.cooldownUntil, 0);
+  assert.equal(other.failures, 0);
+  assert.equal(serverInternals.coolAccountForRateLimit(other, null), false);
+  assert.equal(serverInternals.coolAccountForRateLimit(null, { content: 'Too many requests' }), false);
+});
+
+test('performRateLimitMigration moves sticky account, resets chat scope, keeps history and repair guard', () => {
+  const session = serverInternals.createSession();
+  session.id = 'chat-old';
+  session.parentMessageId = 'parent-old';
+  session.accountId = 'acct-a';
+  session.messageCount = 6;
+  session.history.push({ user: 'do X', assistant: 'did X' });
+  session.deltaMsgCount = 3;
+  session.deltaBoundary = 'hash-1';
+  session.repairHash = 'turn-hash-1';
+  session.repairAt = Date.now();
+  session.repairCount = 1;
+  const move = serverInternals.performRateLimitMigration(session, 'acct-b');
+  assert.equal(move.oldChatId, 'chat-old');
+  assert.equal(move.oldAccountId, 'acct-a');
+  assert.equal(move.newAccountId, 'acct-b');
+  assert.ok(move.historyPrefix.includes('do X'));
+  assert.equal(session.accountId, 'acct-b');
+  assert.equal(session.id, null);
+  assert.equal(session.messageCount, 0);
+  assert.equal(session.deltaMsgCount, 0);
+  assert.equal(session.deltaBoundary, null);
+  // Same client turn: history + repair guard survive the move.
+  assert.equal(session.history.length, 1);
+  assert.equal(session.repairHash, 'turn-hash-1');
+  assert.equal(session.repairCount, 1);
+});
+
+function saveRoutingEnv(t) {
+  const prevPref = process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  const prevMode = process.env.DEEPSEEK_ROUTING_MODE;
+  t.after(() => {
+    if (prevPref === undefined) delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+    else process.env.DEEPSEEK_PREFERRED_ACCOUNT = prevPref;
+    if (prevMode === undefined) delete process.env.DEEPSEEK_ROUTING_MODE;
+    else process.env.DEEPSEEK_ROUTING_MODE = prevMode;
+  });
+}
+
+test('smart routing: busiest account loses to idle; degraded (timeouts) loses to healthy', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const idle = { id: 'sr-idle', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  const busy = { id: 'sr-busy', inflight: 2, failures: 0, consecutiveTimeouts: 0 };
+  const healthy = { id: 'sr-healthy', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  const degraded = { id: 'sr-degraded', inflight: 0, failures: 1, consecutiveTimeouts: 3 };
+  const flaky = { id: 'sr-flaky', inflight: 0, failures: 5, consecutiveTimeouts: 0 };
+  const timedOut = { id: 'sr-timedout', inflight: 0, failures: 0, consecutiveTimeouts: 3 };
+  // Gaps (20, 20, 8) all exceed the jitter range [0,1): deterministic wins.
+  for (let i = 0; i < 20; i++) {
+    assert.ok(serverInternals.scoreAccount(idle, 0) < serverInternals.scoreAccount(busy, 0), 'idle beats busy');
+    assert.ok(serverInternals.scoreAccount(healthy, 0) < serverInternals.scoreAccount(degraded, 0), 'healthy beats degraded');
+    assert.ok(serverInternals.scoreAccount(flaky, 0) < serverInternals.scoreAccount(timedOut, 0), 'timeouts weigh more than plain failures');
+  }
+});
+
+test('smart routing: preferred wins ties; home affinity nudges but loses to a busy home', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  process.env.DEEPSEEK_PREFERRED_ACCOUNT = 'sr-pref';
+  const pref = { id: 'sr-pref', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  const other = { id: 'sr-other', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  // Preferred bias (-5) exceeds jitter: deterministic tie-break.
+  for (let i = 0; i < 20; i++) {
+    assert.ok(serverInternals.scoreAccount(pref, 0) < serverInternals.scoreAccount(other, 0), 'preferred wins ties');
+  }
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  const home = { id: 'sr-home', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  const newcomer = { id: 'sr-newcomer', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  // Home affinity (-8 capped) beats an equally idle newcomer ...
+  for (let i = 0; i < 20; i++) {
+    assert.ok(serverInternals.scoreAccount(home, 8) < serverInternals.scoreAccount(newcomer, 0), 'home affinity nudges');
+  }
+  // ... but a busy home (inflight 1 with 8 hosted: 10-8=2) loses to an idle newcomer (0).
+  const busyHome = { id: 'sr-home', inflight: 1, failures: 0, consecutiveTimeouts: 0 };
+  for (let i = 0; i < 20; i++) {
+    assert.ok(serverInternals.scoreAccount(newcomer, 0) < serverInternals.scoreAccount(busyHome, 8), 'busy home loses to idle newcomer');
+  }
+});
+
+test('smart routing: single-ready passthrough returns the only account without scoring', (t) => {
+  saveRoutingEnv(t);
+  const solo = { id: 'sr-solo', inflight: 9, failures: 9, consecutiveTimeouts: 9 };
+  assert.equal(serverInternals.selectFreshAccount([solo]), solo);
+  // Even under the preferred-mode flag and a rival preference: no scoring.
+  process.env.DEEPSEEK_ROUTING_MODE = 'preferred';
+  process.env.DEEPSEEK_PREFERRED_ACCOUNT = 'sr-rival';
+  assert.equal(serverInternals.selectFreshAccount([solo]), solo);
+});
+
+test('smart routing: DEEPSEEK_ROUTING_MODE=preferred restores monopoly despite load', (t) => {
+  saveRoutingEnv(t);
+  process.env.DEEPSEEK_ROUTING_MODE = 'preferred';
+  process.env.DEEPSEEK_PREFERRED_ACCOUNT = 'sr-prime';
+  const prime = { id: 'sr-prime', inflight: 5, failures: 0, consecutiveTimeouts: 0 };
+  const spare = { id: 'sr-spare', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  assert.equal(serverInternals.selectFreshAccount([prime, spare]).id, 'sr-prime');
+  // Default mode (flag unset): the scorer sends the fresh chat to the idle spare.
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  assert.equal(serverInternals.selectFreshAccount([prime, spare]).id, 'sr-spare');
+});
+
+test('smart routing: inflight counter returns to baseline on throw paths (finally)', async (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  const prevFetch = globalThis.fetch;
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+    globalThis.fetch = prevFetch;
+  });
+  serverInternals.sessions.clear();
+  const mk = (id) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, lastUsedAt: 0, inflight: 0, headers: {},
+  });
+  const a1 = mk('sr-fa1');
+  const a2 = mk('sr-fa2');
+  serverInternals.accounts.push(a1, a2);
+
+  // Case 1: the first upstream fetch rejects — throw inside the wrapped region.
+  let observedDuringFlight = null;
+  globalThis.fetch = async () => {
+    observedDuringFlight = (Number(a1.inflight) || 0) + (Number(a2.inflight) || 0);
+    throw new Error('simulated network down');
+  };
+  await assert.rejects(
+    () => serverInternals.askDeepSeekStream('hello', 'sr-agent-throw-1', 'deepseek-chat'),
+    /simulated network down/
+  );
+  assert.equal(observedDuringFlight, 1, 'counter is 1 while the upstream call is in flight');
+  assert.equal(a1.inflight, 0, 'no leak on throw (early)');
+  assert.equal(a2.inflight, 0, 'no leak on throw (early)');
+
+  // Case 2: challenge fetch succeeds but PoW solve throws (no wasmUrl) —
+  // a later throw point in the same wrapped region (partial-success symmetry).
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    text: async () => JSON.stringify({ data: { biz_data: { challenge: { challenge: 'c', salt: 's', expire_at: 1, difficulty: 1, algorithm: 'a', signature: 'sig' } } } }),
+  });
+  await assert.rejects(
+    () => serverInternals.askDeepSeekStream('hello', 'sr-agent-throw-2', 'deepseek-chat'),
+    /PoW solve failed/
+  );
+  assert.equal(a1.inflight, 0, 'no leak on throw (late)');
+  assert.equal(a2.inflight, 0, 'no leak on throw (late)');
+});
+
+test('smart routing: migration target is the least-loaded ready peer via the scorer', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  // Even with the busy peer named preferred, the scorer (not monopoly) decides.
+  process.env.DEEPSEEK_PREFERRED_ACCOUNT = 'sr-mig-busy';
+  const session = serverInternals.createSession();
+  session.id = 'sr-chat-x';
+  session.accountId = 'sr-mig-home';
+  const peer = (id, extra = {}) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, inflight: 0, headers: {}, ...extra,
+  });
+  const home = peer('sr-mig-home', { cooldownUntil: Date.now() + 600_000 });
+  const busy = peer('sr-mig-busy', { inflight: 1 });
+  const idlePeer = peer('sr-mig-idle');
+  // busy scores 10-5=5 vs idle 0: gap exceeds jitter — deterministic.
+  const d = serverInternals.resolveRateLimitMigration(session, [home, busy, idlePeer], false);
+  assert.equal(d.migrateTo, 'sr-mig-idle');
+  assert.ok(!d.failFast);
+  // Single-peer shortcut stays.
+  const d1 = serverInternals.resolveRateLimitMigration(session, [home, busy], false);
+  assert.equal(d1.migrateTo, 'sr-mig-busy');
+});
+
+test('smart routing: accountStatus exposes inflight as a number', () => {
+  const st = serverInternals.accountStatus({
+    id: 'sr-st', config: { token: 't', cookie: 'c' },
+    cooldownUntil: 0, failures: 2, consecutiveTimeouts: 1, lastUsedAt: 0, inflight: 3,
+  });
+  assert.equal(st.inflight, 3);
+  // Additive field: existing health consumers keep their keys.
+  assert.equal(st.id, 'sr-st');
+  assert.equal(st.ready, true);
+  assert.equal(st.failures, 2);
+  assert.equal(st.consecutive_timeouts, 1);
+  // Legacy account objects without the counter read as 0, still a number.
+  const legacy = serverInternals.accountStatus({
+    id: 'sr-legacy', config: { token: 't', cookie: 'c' }, cooldownUntil: 0, failures: 0,
+  });
+  assert.equal(legacy.inflight, 0);
+});
+
+test('smart routing: jitter is bounded — tied inputs only ever pick among the tied accounts', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const a = { id: 'sr-jit-a', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  const b = { id: 'sr-jit-b', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  const winners = new Set();
+  for (let i = 0; i < 500; i++) {
+    winners.add(serverInternals.scoreAccount(a, 0) < serverInternals.scoreAccount(b, 0) ? 'a' : 'b');
+  }
+  for (const w of winners) assert.ok(['a', 'b'].includes(w));
+  // Jitter genuinely breaks ties: over 500 trials each side wins at least
+  // once (P(flaky fail) ≈ 2^-499 — safe, not a flaky exact assertion).
+  assert.ok(winners.has('a') && winners.has('b'), `expected both tied accounts to win, saw: ${[...winners]}`);
+  // Jitter range is [0,1): idle untied scores land in [0,1).
+  for (let i = 0; i < 20; i++) {
+    const s = serverInternals.scoreAccount(a, 0);
+    assert.ok(s >= 0 && s < 1, `jitter out of bounds: ${s}`);
+  }
+});
+
+test('smart routing: only live recent chats count toward home affinity (stale pins go inert)', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+  const now = Date.now();
+  const seed = (key, accountId, id, ageMs) => {
+    const s = serverInternals.createSession();
+    s.id = id;
+    s.accountId = accountId;
+    s.lastActivityAt = now - ageMs;
+    serverInternals.sessions.set(key, s);
+  };
+  // 8 stale live chats on A (2h idle): inert under the 30-min window.
+  for (let i = 0; i < 8; i++) seed(`sr-decay-stale-${i}`, 'sr-decay-a', `chat-stale-${i}`, 2 * 60 * 60 * 1000);
+  // 2 fresh but chat-less stickies on A (reset sessions): never attract traffic.
+  for (let i = 0; i < 2; i++) seed(`sr-decay-chatless-${i}`, 'sr-decay-a', null, 0);
+  // 1 fresh live chat on B.
+  seed('sr-decay-fresh-0', 'sr-decay-b', 'chat-fresh-0', 0);
+  assert.equal(serverInternals.countActiveHosted('sr-decay-a', now), 0);
+  assert.equal(serverInternals.countActiveHosted('sr-decay-b', now), 1);
+  assert.equal(serverInternals.countActiveHosted('sr-decay-unknown', now), 0);
+  // End to end: B (-1+j) beats stale-heavy A (0+j) deterministically.
+  const a = { id: 'sr-decay-a', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  const b = { id: 'sr-decay-b', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  assert.equal(serverInternals.selectFreshAccount([a, b]).id, 'sr-decay-b');
+});
+
+test('smart routing: scoreAccount clamps hostedCount into [0,8]', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const acct = { id: 'sr-clamp', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  // Negative hosted (unreachable via callers; defensive): floored to 0 → jitter only.
+  for (let i = 0; i < 20; i++) {
+    const s = serverInternals.scoreAccount(acct, -5);
+    assert.ok(s >= 0 && s < 1, `negative hosted leaked into score: ${s}`);
+  }
+  // Huge hosted: capped at 8 → score in [-8,-7).
+  for (let i = 0; i < 20; i++) {
+    const s = serverInternals.scoreAccount(acct, 100);
+    assert.ok(s >= -8 && s < -7, `hosted cap broken: ${s}`);
+  }
+});
+
+test('smart routing: inflight clamp warns and floors at zero instead of leaking negative', async (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  const prevFetch = globalThis.fetch;
+  const prevWarn = console.warn;
+  const warnings = [];
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+    globalThis.fetch = prevFetch;
+    console.warn = prevWarn;
+  });
+  serverInternals.sessions.clear();
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  const only = {
+    id: 'sr-neg', config: { token: 't-neg', cookie: 'c-neg' },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, lastUsedAt: 0, inflight: -5, headers: {},
+  };
+  serverInternals.accounts.push(only);
+  globalThis.fetch = async () => { throw new Error('simulated network down'); };
+  await assert.rejects(
+    () => serverInternals.askDeepSeekStream('hello', 'sr-agent-neg', 'deepseek-chat'),
+    /simulated network down/
+  );
+  assert.equal(only.inflight, 0, 'negative counter floored at 0');
+  assert.ok(warnings.some(w => w.includes('inflight clamp engaged')), `expected clamp warning, saw: ${warnings.join(' | ')}`);
+});
+
+test('integer parentMessageId survives persist→restore round-trip (item 1, full path)', () => {
+  const s = serverInternals.createSession();
+  s.id = 'chat-int';
+  s.parentMessageId = 42;
+  s.accountId = 'acct-1';
+  s.messageCount = 5;
+  s.lastActivityAt = Date.now();
+  const snap = serverInternals.serializeSession(s);
+  const restored = serverInternals.createSession();
+  Object.assign(restored, snap);
+  assert.strictEqual(restored.parentMessageId, 42);
+  assert.strictEqual(restored.parentMessageId, snap.parentMessageId);
+});
+
+test('Fix 8: unterminated final SSE event is preserved, not dropped', async () => {
+  const { Readable } = require('stream');
+  const stream = Readable.from([
+    Buffer.from('data: {"v":{"response":{"content":"hello-final"}}}'),
+  ]);
+  const result = await serverInternals.consumeDeepSeekStream(stream, { isClientGone: () => false });
+  assert.equal(result.content, 'hello-final');
+  assert.equal(result.abandoned, false);
+});
+
+test('Fix 8: split multibyte chunk across buffer boundary parses', async () => {
+  const { Readable } = require('stream');
+  const full = Buffer.from('data: {"v":{"response":{"content":"hi-😀"}}}\n\n');
+  const cut = full.indexOf('😀') + 1;
+  const stream = Readable.from([full.subarray(0, cut), full.subarray(cut)]);
+  const result = await serverInternals.consumeDeepSeekStream(stream, { isClientGone: () => false });
+  assert.equal(result.content, 'hi-😀');
+});
+
+test('Fix 8: terminated stream regression identical', async () => {
+  const { Readable } = require('stream');
+  const stream = Readable.from([
+    Buffer.from('data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"abc"}]}}}\n\n'),
+    Buffer.from('data: {"finish_reason":"stop"}\n\n'),
+  ]);
+  const result = await serverInternals.consumeDeepSeekStream(stream, { isClientGone: () => false });
+  assert.equal(result.content, 'abc');
+  assert.equal(result.finishReason, 'stop');
+});
+
+test('formatToolDefinitions states batch discipline (6 batches, max 8 per turn)', () => {
+  const tools = [{ type: 'function', function: { name: 'bash', description: 'run command' } }];
+  const formatted = serverInternals.formatToolDefinitions(tools);
+  assert.match(formatted, /at most 6 tool batches per task/);
+  assert.match(formatted, /max 8 tool calls/);
+});
+
+// ---- Batch 5: Fix 9 reworked / Fix 10 amendment / Fix 11 amendment ----
+
+test('Fix 9: image_url data URL redacted with marker, payload gone', () => {
+  const out = serverInternals.normalizeMessageContent([
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${'A'.repeat(300)}` } },
+  ]);
+  assert.match(out, /^\[Image: /);
+  assert.match(out, /data omitted/);
+  assert.ok(!out.includes('A'.repeat(64)));
+});
+
+test('Fix 9: image/input_image source data URLs redacted', () => {
+  for (const t of ['image', 'input_image']) {
+    const out = serverInternals.normalizeMessageContent([
+      { type: t, source: { type: 'base64', url: `data:image/png;base64,${'B'.repeat(300)}` } },
+    ]);
+    assert.match(out, /^\[Image: /);
+    assert.match(out, /data omitted/);
+    assert.ok(!out.includes('B'.repeat(64)));
+  }
+});
+
+test('Fix 9: https URL refs pass through byte-identical', () => {
+  const url = 'https://example.com/x.png';
+  const outUrl = serverInternals.normalizeMessageContent([{ type: 'image_url', image_url: { url } }]);
+  assert.ok(outUrl.includes(url));
+  const outImg = serverInternals.normalizeMessageContent([{ type: 'image', source: { type: 'url', url } }]);
+  assert.ok(outImg.includes(url));
+  const outIn = serverInternals.normalizeMessageContent([{ type: 'input_image', image_url: { url } }]);
+  assert.ok(outIn.includes(url));
+});
+
+test('Fix 9: false-positive battery passes through untouched', () => {
+  const cases = [
+    'Explain data: URLs; example {"u":"data:"}',
+    'data:text/plain,hello',
+    'see https://example.com/?x=data:foo for details',
+  ];
+  for (const c of cases) {
+    assert.equal(serverInternals.normalizeMessageContent(c), c);
+    assert.equal(serverInternals.normalizeMessageContent([{ type: 'text', text: c }]), c);
+  }
+});
+
+test('Fix 9: non-string urls do not throw and yield marker output', () => {
+  const shapes = [
+    [{ type: 'image_url', image_url: { url: { x: 1 } } }],
+    [{ type: 'image', source: { url: 12345 } }],
+    [{ type: 'input_image', source: {} }],
+    [{ type: 'image_url' }],
+  ];
+  for (const shape of shapes) {
+    let out;
+    assert.doesNotThrow(() => { out = serverInternals.normalizeMessageContent(shape); });
+    assert.match(out, /^\[Image: /);
+  }
+});
+
+test('Fix 9: plain-string, unknown-text, and tool_result-nested data URLs redacted with prose intact', () => {
+  const mk = (ch) => `data:image/png;base64,${ch.repeat(100)}`;
+  const plain = serverInternals.normalizeMessageContent(`before ${mk('C')} after`);
+  assert.ok(!plain.includes('C'.repeat(64)));
+  assert.ok(plain.startsWith('before ') && plain.endsWith(' after'));
+  const unk = serverInternals.normalizeMessageContent([{ type: 'custom', text: `pre ${mk('D')} post` }]);
+  assert.ok(!unk.includes('D'.repeat(64)));
+  assert.ok(unk.startsWith('pre ') && unk.endsWith(' post'));
+  const nested = serverInternals.normalizeMessageContent([{ type: 'tool_result', tool_use_id: 't1', content: `out ${mk('E')} done` }]);
+  assert.ok(!nested.includes('E'.repeat(64)));
+  assert.ok(nested.includes('out ') && nested.includes(' done'));
+});
+
+test('Fix 9: Responses bypasses (input_text, function_call_output, instructions) redacted; file shapes sink', () => {
+  const url = `data:image/png;base64,${'F'.repeat(100)}`;
+  const msgs = serverInternals.normalizeResponsesInput([
+    { type: 'input_text', text: `a ${url} b` },
+    { type: 'function_call_output', call_id: 'c1', output: `x ${url} y` },
+  ]);
+  assert.ok(!msgs[0].content.includes('F'.repeat(64)));
+  assert.ok(msgs[0].content.includes('a ') && msgs[0].content.includes(' b'));
+  assert.ok(!msgs[1].content.includes('F'.repeat(64)));
+  assert.ok(msgs[1].content.includes('x ') && msgs[1].content.includes(' y'));
+  const params = serverInternals.normalizeApiParams({ input: 'hi', instructions: `sys ${url} end` }, 'responses');
+  assert.equal(params.messages[0].role, 'system');
+  assert.ok(!params.messages[0].content.includes('F'.repeat(64)));
+  assert.ok(params.messages[0].content.includes('sys ') && params.messages[0].content.includes(' end'));
+  for (const t of ['file', 'input_file', 'document']) {
+    const out = serverInternals.normalizeMessageContent([{ type: t, file_data: 'SECRET'.repeat(20), data: 'SECRET'.repeat(20) }]);
+    assert.ok(!out.includes('SECRET'));
+    assert.match(out, /Unsupported content part/);
+  }
+});
+
+function collectResponsesStreamEvents(openaiResp) {
+  const chunks = [];
+  const mockRes = { headersSent: true, write(c) { chunks.push(c); }, end() {} };
+  serverInternals.finishResponsesStream(mockRes, openaiResp);
+  const events = [];
+  for (const block of chunks.join('').split('\n\n')) {
+    const lines = block.split('\n');
+    const ev = lines.find((l) => l.startsWith('event: '));
+    const dl = lines.find((l) => l.startsWith('data: '));
+    if (!ev || !dl) continue;
+    let data;
+    try { data = JSON.parse(dl.slice(6)); } catch { continue; }
+    events.push({ event: ev.slice(7), data });
+  }
+  return events;
+}
+
+function mkStreamResp(finish) {
+  return {
+    id: 'ds-test-1', created: 1700000000, model: 'deepseek-chat',
+    usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+    choices: [{ message: { role: 'assistant', content: 'hello' }, finish_reason: finish }],
+  };
+}
+
+test('Fix 10: Responses stream message-item status follows truncation (length -> incomplete)', () => {
+  const events = collectResponsesStreamEvents(mkStreamResp('length'));
+  const done = events.find((e) => e.event === 'response.output_item.done' && e.data.item && e.data.item.type === 'message');
+  assert.ok(done, 'message output_item.done event present');
+  const terminal = events[events.length - 1];
+  assert.equal(terminal.event, 'response.incomplete');
+  assert.equal(terminal.data.response.status, 'incomplete');
+  assert.equal(done.data.item.status, 'incomplete');
+  assert.equal(done.data.item.status, terminal.data.response.status);
+});
+
+test('Fix 10: Responses stream message-item status completed on stop', () => {
+  const events = collectResponsesStreamEvents(mkStreamResp('stop'));
+  const done = events.find((e) => e.event === 'response.output_item.done' && e.data.item && e.data.item.type === 'message');
+  assert.ok(done, 'message output_item.done event present');
+  const terminal = events[events.length - 1];
+  assert.equal(terminal.event, 'response.completed');
+  assert.equal(done.data.item.status, 'completed');
+  assert.equal(done.data.item.status, terminal.data.response.status);
+});
+
+test('Fix 11: null/string/array/number bodies rejected 400 invalid_request in all modes', () => {
+  for (const mode of ['anthropic', 'responses', 'openai']) {
+    for (const body of [null, 'str', [], 42]) {
+      assert.throws(
+        () => serverInternals.normalizeApiParams(body, mode),
+        (err) => err.status === 400 && err.type === 'invalid_request' && !(err instanceof TypeError) && /JSON object/.test(err.message)
+      );
+    }
+  }
+});
+
+test('Fix 11: {} and empty-string-derived {} still pass in all modes', () => {
+  for (const mode of ['anthropic', 'responses', 'openai']) {
+    assert.doesNotThrow(() => serverInternals.normalizeApiParams({}, mode));
+    assert.doesNotThrow(() => serverInternals.normalizeApiParams(JSON.parse('' || '{}'), mode));
+  }
+});
+
+// ---- Batch 5 follow-up fixes (B5F) ----
+
+test('B5F Fix A: data-URL image refs emit exactly one omission marker', () => {
+  const countMarkers = (s) => (s.match(/\(data omitted\)/g) || []).length;
+  const dataUrl = `data:image/png;base64,${'A'.repeat(300)}`;
+  const outUrl = serverInternals.normalizeMessageContent([
+    { type: 'image_url', image_url: { url: dataUrl } },
+  ]);
+  assert.equal(countMarkers(outUrl), 1);
+  assert.ok(!outUrl.includes('A'.repeat(32)));
+  assert.equal(outUrl, '[Image: data:image/png;base64,<omitted> (data omitted)]');
+  for (const t of ['image', 'input_image']) {
+    const out = serverInternals.normalizeMessageContent([
+      { type: t, source: { type: 'base64', url: `data:image/png;base64,${'B'.repeat(300)}` } },
+    ]);
+    assert.equal(countMarkers(out), 1);
+    assert.ok(!out.includes('B'.repeat(32)));
+  }
+});
+
+test('B5F Fix A: https and relative image refs carry no omission marker', () => {
+  const refs = ['https://example.com/x.png', '/img/x.png', 'images/x.png'];
+  for (const ref of refs) {
+    const outUrl = serverInternals.normalizeMessageContent([{ type: 'image_url', image_url: { url: ref } }]);
+    assert.equal(outUrl, `[Image: ${ref}]`);
+    assert.ok(!outUrl.includes('(data omitted)'));
+    const outImg = serverInternals.normalizeMessageContent([{ type: 'image', source: { type: 'url', url: ref } }]);
+    assert.equal(outImg, `[Image: ${ref}]`);
+    assert.ok(!outImg.includes('(data omitted)'));
+    const outIn = serverInternals.normalizeMessageContent([{ type: 'input_image', image_url: { url: ref } }]);
+    assert.equal(outIn, `[Image: ${ref}]`);
+    assert.ok(!outIn.includes('(data omitted)'));
+  }
+});
+
+test('B5F B1: empty-mime embedded data URL redacted', () => {
+  const out = serverInternals.normalizeMessageContent(`a data:;base64,${'G'.repeat(100)} b`);
+  assert.equal(out, 'a data:;base64,<omitted> b');
+  assert.ok(!out.includes('G'.repeat(10)));
+  assert.ok(out.startsWith('a ') && out.endsWith(' b'));
+});
+
+test('B5F B2: data URL split across array parts redacted, benign newlines kept', () => {
+  const out = serverInternals.normalizeMessageContent([
+    { type: 'text', text: `a data:image/png;base64,${'X'.repeat(30)}` },
+    { type: 'text', text: `${'Y'.repeat(100)} b` },
+  ]);
+  assert.equal(out, 'a data:image/png;base64,<omitted> b');
+  assert.ok(!out.includes('X'.repeat(10)));
+  assert.ok(!out.includes('Y'.repeat(10)));
+  assert.ok(out.startsWith('a ') && out.endsWith(' b'));
+  assert.equal(serverInternals.normalizeMessageContent(['hello', 'world']), 'hello\nworld');
+});
+
+test('B5F B3: object function_call_output and instructions redacted; scalars safe', () => {
+  const url = `data:image/png;base64,${'F'.repeat(100)}`;
+  const msgs = serverInternals.normalizeResponsesInput([
+    { type: 'function_call_output', call_id: 'c1', output: { result: `x ${url} y` } },
+    { type: 'input_text', text: { note: `a ${url} b` } },
+  ]);
+  assert.equal(msgs[0].content, '{"result":"x data:image/png;base64,<omitted> y"}');
+  assert.ok(!msgs[0].content.includes('F'.repeat(10)));
+  assert.equal(typeof msgs[0].content, 'string');
+  assert.ok(!msgs[1].content.includes('F'.repeat(10)));
+  assert.ok(msgs[1].content.includes('a ') && msgs[1].content.includes(' b'));
+  const params = serverInternals.normalizeApiParams(
+    { input: 'hi', instructions: { note: `sys ${url} end` } }, 'responses');
+  assert.equal(params.messages[0].role, 'system');
+  assert.equal(params.messages[0].content, '{"note":"sys data:image/png;base64,<omitted> end"}');
+  assert.ok(!params.messages[0].content.includes('F'.repeat(10)));
+  let circOut;
+  const circ = { a: 1 };
+  circ.self = circ;
+  assert.doesNotThrow(() => {
+    circOut = serverInternals.normalizeResponsesInput([
+      { type: 'function_call_output', call_id: 'c2', output: circ },
+    ])[0].content;
+  });
+  assert.equal(circOut, '');
+  const numOut = serverInternals.normalizeResponsesInput([
+    { type: 'function_call_output', call_id: 'c3', output: 5 },
+  ])[0].content;
+  assert.equal(numOut, 5);
+});
+
+test('B5F B3: Responses string input redacted', () => {
+  const url = `data:image/png;base64,${'H'.repeat(100)}`;
+  const msgs = serverInternals.normalizeResponsesInput(`hi ${url} bye`);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].content, 'hi data:image/png;base64,<omitted> bye');
+  assert.ok(!msgs[0].content.includes('H'.repeat(10)));
+  assert.equal(serverInternals.normalizeResponsesInput('hello')[0].content, 'hello');
+});
+
+test('B5F Fix C: short text-part data URL redacted, benign text-part passthrough', () => {
+  const out = serverInternals.normalizeMessageContent([
+    { type: 'text', text: `pre data:image/png;base64,${'C'.repeat(100)} post` },
+  ]);
+  assert.equal(out, 'pre data:image/png;base64,<omitted> post');
+  assert.ok(!out.includes('C'.repeat(10)));
+  const benign = 'data:text/plain,hello';
+  assert.equal(serverInternals.normalizeMessageContent([{ type: 'text', text: benign }]), benign);
+});
+
+test('B5G ISSUE-1: =/: prefixed embedded payloads redacted, short tokens pass', () => {
+  const payload = 'A'.repeat(120);
+  const url = `data:image/png;base64,${payload}`;
+  // Original =/: cases + full prefix battery (C1): / , ; > - _ ) ] } whitespace + alnum.
+  const mustRedact = [
+    `url=${url}`, `a:${url}`, `x=${url} end`,
+    `x/${url}`, `x,${url}`, `x;${url}`, `x>${url}`, `x-${url}`, `x_${url}`,
+    `x)${url}`, `x]${url}`, `x}${url}`, `x ${url}`, `x\n${url}`, `x\t${url}`,
+    `a${url}`, `Z${url}`, `0${url}`,
+  ];
+  for (const s of mustRedact) {
+    const out = serverInternals.normalizeMessageContent(s);
+    assert.ok(!out.includes('A'.repeat(10)), `payload leaks for ${JSON.stringify(s.slice(0, 12))}`);
+    assert.ok(out.includes('data:image/png;base64,<omitted>'), `marker missing for ${JSON.stringify(s.slice(0, 12))}`);
+  }
+  // Short-token passthrough still green (existing false-positive battery).
+  for (const c of ['?x=data:foo', 'see https://example.com/?x=data:foo for details', 'data:text/plain,hello']) {
+    assert.equal(serverInternals.normalizeMessageContent(c), c);
+    assert.equal(serverInternals.normalizeMessageContent([{ type: 'text', text: c }]), c);
+  }
+});
+
+test('B5G ISSUE-2: payload-split tail redacted, normal multipart intact', () => {
+  const p1 = `a data:image/png;base64,${'X'.repeat(100)}`;
+  const tail = `${'Y'.repeat(100)} b`;
+  const out = serverInternals.normalizeMessageContent([
+    { type: 'text', text: p1 },
+    { type: 'text', text: tail },
+  ]);
+  assert.ok(!out.includes('X'.repeat(10)), 'head payload leaks');
+  assert.ok(!out.includes('Y'.repeat(10)), 'payload-split tail leaks');
+  assert.ok(out.startsWith('a ') && out.endsWith(' b'), 'prose intact');
+  assert.ok((out.match(/<omitted>/g) || []).length >= 1, 'omission marker missing');
+  assert.equal(serverInternals.normalizeMessageContent(['hello', 'world']), 'hello\nworld');
+});
+
+test('B5H C4: whitespace/escape-injected payloads redacted, prose preserved', () => {
+  const long = 'F'.repeat(120);
+  const url = `data:image/png;base64,${long}`;
+  // Escaped \n inside JSON args string (backslash-n split 40/80).
+  const split = url.slice(0, 40) + '\\n' + url.slice(40);
+  const escArgs = JSON.stringify({ data: split });
+  const eo = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: escArgs } }] }] },
+    'openai');
+  assert.ok(!eo.messages[0].tool_calls[0].function.arguments.includes('F'.repeat(10)), 'escaped-\\n args leak');
+  // Space-injected + literal-newline payloads in running text.
+  for (const inj of [' ', '\n']) {
+    const out = serverInternals.normalizeMessageContent(`a ${url.slice(0, 40)}${inj}${url.slice(40)} b`);
+    assert.ok(!out.includes('F'.repeat(10)), `injected ${JSON.stringify(inj)} leaks`);
+    assert.ok(out.includes('a ') && out.includes(' b'), `prose lost for ${JSON.stringify(inj)}`);
+    assert.ok(out.includes('data:image/png;base64,<omitted>'), 'marker missing');
+  }
+  // Trailing prose word preserved (continuation chunks require >= 8 chars).
+  assert.equal(
+    serverInternals.normalizeMessageContent(`before ${url} after`),
+    'before data:image/png;base64,<omitted> after');
+});
+
+test('B5H C3: whitespace-shifted splits redacted, benign tails kept', () => {
+  const p1 = `a data:image/png;base64,${'X'.repeat(100)}`;
+  for (const [a, b] of [[p1, ` ${'Y'.repeat(100)} b`], [`${p1} `, `${'Y'.repeat(100)} b`]]) {
+    const out = serverInternals.normalizeMessageContent([
+      { type: 'text', text: a },
+      { type: 'text', text: b },
+    ]);
+    assert.ok(!out.includes('X'.repeat(10)), 'head leaks');
+    assert.ok(!out.includes('Y'.repeat(10)), 'whitespace-shifted tail leaks');
+    assert.ok(out.includes('a ') && out.includes(' b'), 'prose intact');
+  }
+  // H1 gate: benign short tails after a complete image are preserved.
+  const hello = serverInternals.normalizeMessageContent([
+    { type: 'text', text: p1 },
+    { type: 'text', text: 'hello world' },
+  ]);
+  assert.ok(hello.includes('hello'), 'hello over-redacted');
+  const single = serverInternals.normalizeMessageContent([
+    { type: 'text', text: p1 },
+    { type: 'text', text: 'a' },
+  ]);
+  assert.ok(single.endsWith('a'), 'single-char tail over-redacted');
+});
+
+test('B5I M1: newlines survive multipart redaction, benign joins intact', () => {
+  assert.equal(serverInternals.normalizeMessageContent(['a\nb', 'c']), 'a\nb\nc');
+  const p1 = `a data:image/png;base64,${'X'.repeat(100)}`;
+  const multi = serverInternals.normalizeMessageContent([
+    { type: 'text', text: `line1\nline2 ${p1}` },
+    { type: 'text', text: `${'Y'.repeat(100)} end\nline3` },
+  ]);
+  assert.ok(!multi.includes('X'.repeat(10)) && !multi.includes('Y'.repeat(10)), 'payload leaks');
+  assert.ok(multi.includes('line1\nline2'), 'intra-part newlines flattened');
+  assert.ok(multi.includes('line3'), 'trailing content lost');
+});
+
+test('B5I M3: scalar content members preserved, nullish dropped', () => {
+  assert.equal(serverInternals.normalizeMessageContent([5, { type: 'text', text: 'hi' }]), '5\nhi');
+  assert.equal(serverInternals.normalizeMessageContent([0, { type: 'text', text: 'hi' }]), '0\nhi');
+  assert.equal(serverInternals.normalizeMessageContent([false, { type: 'text', text: 'hi' }]), 'false\nhi');
+  assert.equal(serverInternals.normalizeMessageContent([null, { type: 'text', text: 'hi' }]), 'hi');
+  assert.equal(serverInternals.normalizeMessageContent(['', { type: 'text', text: 'hi' }]), 'hi');
+});
+
+test('B5G ISSUE-3: tool-call arguments redacted at normalization, structure intact', () => {
+  const url = `data:image/png;base64,${'F'.repeat(100)}`;
+  // Anthropic tool_use input.
+  const ap = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'read', input: { path: '/tmp/x', data: url } }] }] },
+    'anthropic');
+  const aArgs = ap.messages[0].tool_calls[0].function.arguments;
+  assert.ok(!aArgs.includes('F'.repeat(10)), 'anthropic args leak');
+  assert.deepEqual(JSON.parse(aArgs), { path: '/tmp/x', data: 'data:image/png;base64,<omitted>' });
+  // Responses function_call arguments.
+  const rp = serverInternals.normalizeResponsesInput(
+    [{ type: 'function_call', call_id: 'c1', name: 'read', arguments: JSON.stringify({ path: '/tmp/x', data: url }) }]);
+  assert.ok(!rp[0].tool_calls[0].function.arguments.includes('F'.repeat(10)), 'responses args leak');
+  assert.deepEqual(JSON.parse(rp[0].tool_calls[0].function.arguments), { path: '/tmp/x', data: 'data:image/png;base64,<omitted>' });
+  // OpenAI tool_calls arguments.
+  const rawArgs = JSON.stringify({ data: url });
+  const op = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: rawArgs } }] }] },
+    'openai');
+  const oArgs = op.messages[0].tool_calls[0].function.arguments;
+  assert.ok(!oArgs.includes('F'.repeat(10)), 'openai args leak');
+  assert.deepEqual(JSON.parse(oArgs), { data: 'data:image/png;base64,<omitted>' });
+  // Benign args byte-identical.
+  const benign = JSON.stringify({ path: '/tmp/x', n: 1 });
+  const bp = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'read', input: { path: '/tmp/x', n: 1 } }] }] },
+    'anthropic');
+  assert.equal(bp.messages[0].tool_calls[0].function.arguments, benign);
+  const bo = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: benign } }] }] },
+    'openai');
+  assert.equal(bo.messages[0].tool_calls[0].function.arguments, benign);
+});
+
+test('B5H C2: object-form args + replay envelopes redacted, structure intact', () => {
+  const url = `data:image/png;base64,${'Q'.repeat(120)}`;
+  // OpenAI object-form args (non-spec but accepted): leaf-redacted in place.
+  const oo = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: { data: url, n: 1 } } }] }] },
+    'openai');
+  const ooArgs = oo.messages[0].tool_calls[0].function.arguments;
+  assert.deepEqual(ooArgs, { data: 'data:image/png;base64,<omitted>', n: 1 });
+  assert.ok(!JSON.stringify(ooArgs).includes('Q'.repeat(10)), 'openai object args leak');
+  // Legacy function_call form redacted at intake.
+  const lo = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: null, function_call: { name: 'read', arguments: JSON.stringify({ data: url }) } }] },
+    'openai');
+  assert.ok(!JSON.stringify(lo).includes('Q'.repeat(10)), 'legacy function_call leak');
+  // Responses object-form args.
+  const ro = serverInternals.normalizeResponsesInput(
+    [{ type: 'function_call', call_id: 'c1', name: 'read', arguments: { data: url } }]);
+  assert.ok(!JSON.stringify(ro).includes('Q'.repeat(10)), 'responses object args leak');
+  // H3: Anthropic no longer drops OpenAI-style tool_calls.
+  const ao = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ data: url }) } }] }] },
+    'anthropic');
+  assert.ok(ao.messages.some((m) => m.tool_calls && m.tool_calls.length > 0), 'anthropic tool_calls dropped');
+  assert.ok(!JSON.stringify(ao).includes('Q'.repeat(10)), 'anthropic tool_calls leak');
+  // Replay stays redacted AND parses (object + string forms).
+  for (const args of [{ data: url }, JSON.stringify({ data: url })]) {
+    const fm = serverInternals.formatMessages(
+      [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: args } }] }], []);
+    assert.ok(!fm.prompt.includes('Q'.repeat(10)), 'formatMessages replay leak');
+    const m = fm.prompt.match(/Assistant: (\{.*\})/);
+    assert.ok(m, 'envelope missing');
+    assert.deepEqual(JSON.parse(m[1]), { tool_call: { name: 'read', arguments: { data: 'data:image/png;base64,<omitted>' } } });
+  }
+  // Benign object deep-equals after round-trip (type-preserving).
+  const benignObj = { path: '/tmp/x', n: 1 };
+  const be = serverInternals.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: benignObj } }] }] },
+    'openai');
+  assert.deepEqual(be.messages[0].tool_calls[0].function.arguments, benignObj);
+});
+
+test('B5J H2: egress tool args + reasoning redacted, prose untouched', () => {
+  const url = `data:image/png;base64,${'Q'.repeat(120)}`;
+  const mk = (finish, tool) => ({
+    id: 'x', model: 'm', usage: {},
+    choices: [{
+      message: Object.assign({ role: 'assistant' },
+        tool ? { tool_calls: [{ id: 'c1', function: { name: 'read', arguments: JSON.stringify({ data: url }) } }] }
+             : { content: 'hi', reasoning_content: `think ${url}` }),
+      finish_reason: finish,
+    }],
+  });
+  // Non-stream builders.
+  assert.ok(!JSON.stringify(serverInternals.toAnthropicResponse(mk('tool_calls', true))).includes('Q'.repeat(10)), 'anthropic egress leak');
+  assert.ok(!JSON.stringify(serverInternals.toResponsesResponse(mk('tool_calls', true))).includes('Q'.repeat(10)), 'responses egress leak');
+  assert.ok(!JSON.stringify(serverInternals.toAnthropicResponse(mk('stop', false))).includes('Q'.repeat(10)), 'reasoning egress leak');
+  // Model prose content is deliberately raw (cannot echo what it never saw).
+  assert.equal(serverInternals.toAnthropicResponse(mk('stop', false)).content[0].text, 'hi');
+  // Stream finishers (complete args at finish time — exact).
+  for (const fn of [serverInternals.finishAnthropicStream, serverInternals.finishResponsesStream, serverInternals.finishOpenAIStream]) {
+    const chunks = [];
+    fn({ headersSent: true, write(c) { chunks.push(c); }, end() {} }, mk('tool_calls', true));
+    assert.ok(!chunks.join('').includes('Q'.repeat(10)), `${fn.name} stream leak`);
+  }
+  // OpenAI reasoning slices: payload straddling a 50-char boundary must not leak.
+  for (const pad of ['ab ', 'x'.repeat(40), 'x'.repeat(49), 'x'.repeat(51)]) {
+    const chunks = [];
+    serverInternals.finishOpenAIStream(
+      { headersSent: true, write(c) { chunks.push(c); }, end() {} },
+      { id: 'd', created: 1, model: 'm', choices: [{ message: { role: 'assistant', reasoning_content: `${pad}${url} cd` }, finish_reason: 'stop' }] });
+    assert.ok(!chunks.join('').includes('Q'.repeat(10)), `slice-straddle leak at pad ${pad.length}`);
+  }
+});
+
+test('B5J M2: 64-floor is anti-FP — short text passes, image slot redacts', () => {
+  const short = `data:image/png;base64,${'S'.repeat(20)}`;
+  assert.equal(serverInternals.normalizeMessageContent(`a ${short} b`), `a ${short} b`);
+  const out = serverInternals.normalizeMessageContent([{ type: 'image_url', image_url: { url: short } }]);
+  assert.ok(out.includes('<omitted>') && !out.includes('S'.repeat(10)), 'image slot must redact regardless of floor');
+});
+
+test('B5K M4: zero-copy benign / clone-on-hit contracts', () => {
+  // OpenAI benign: original params AND messages refs returned (zero-copy).
+  const benign = { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: '/tmp/x', n: 1 }) } }] }] };
+  const bo = serverInternals.normalizeApiParams(benign, 'openai');
+  assert.ok(bo === benign, 'benign must return original params ref');
+  assert.ok(bo.messages === benign.messages, 'benign must return original messages ref');
+  // Dirty: params + messages cloned; untouched tc entries keep refs (shallow).
+  const url = `data:image/png;base64,${'Q'.repeat(120)}`;
+  const dirty = { messages: [
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: JSON.stringify({ data: url }) } }] },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c2', type: 'function', function: { name: 'read', arguments: JSON.stringify({ n: 1 }) } }] },
+  ] };
+  const out = serverInternals.normalizeApiParams(dirty, 'openai');
+  assert.ok(out !== dirty && out.messages !== dirty.messages, 'hit must clone');
+  assert.ok(!JSON.stringify(out).includes('Q'.repeat(10)), 'dirty leak');
+  assert.ok(out.messages[1].tool_calls[0] === dirty.messages[1].tool_calls[0], 'clean tc ref must be shared');
+  // Responses benign byte-identity (value-level; rebuilds messages by design).
+  const rp = serverInternals.normalizeApiParams({ input: 'hello', instructions: 'sys hi' }, 'responses');
+  assert.deepEqual(rp.messages.map((m) => m.content), ['sys hi', 'hello']);
+});

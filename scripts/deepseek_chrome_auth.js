@@ -453,13 +453,13 @@ async function main() {
     await cdp.send('Network.enable');
 
     console.log(
-        '\n[auth] Chrome открыт. Войди в DeepSeek в ЭТОМ отдельном окне.',
+        '\n[auth] Chrome is open. Log in to DeepSeek in THIS separate window.',
     );
     console.log(
-        '[auth] После логина отправь в DeepSeek короткое сообщение, например: ok',
+        '[auth] After logging in, send a short message in DeepSeek, e.g.: ok',
     );
     await ask(
-        '[auth] Когда залогинился и отправил тестовое сообщение — нажми ENTER здесь: ',
+        '[auth] Once logged in and the test message is sent — press ENTER here: ',
     );
 
     let auth = null;
@@ -469,7 +469,10 @@ async function main() {
         await sleep(500);
     }
     const { href, cookiesCount, ...persisted } = auth;
-    fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2));
+    fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+    if (process.platform !== 'win32') {
+        try { fs.chmodSync(outPath, 0o600); } catch (e) { /* ignore */ }
+    }
     console.log(`[auth] Saved: ${outPath}`);
     console.log(`[auth] page: ${href || 'unknown'}`);
     console.log(

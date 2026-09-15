@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const BASE = process.env.BASE_URL || 'http://127.0.0.1:9665';
+const BASE = process.env.BASE_URL || 'http://127.0.0.1:9655';
 const MODEL = process.env.MODEL || 'deepseek-chat';
 
 async function post(path, body, timeoutMs = 120000) {
