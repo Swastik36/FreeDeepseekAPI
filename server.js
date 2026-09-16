@@ -2960,15 +2960,29 @@ function finishOpenAIStream(res, openaiResp, opts = {}) {
             };
         });
         res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: null, tool_calls: streamingToolCalls }, finish_reason: null }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
     } else {
         for (let i = 0; i < (msg.content || '').length; i += 50) {
             const chunk = msg.content.substring(i, i + 50);
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] })}\n\n`);
         }
         const finishReason = choice.finish_reason || 'stop';
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\ndata: [DONE]\n\n`);
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\n`);
     }
+    // Usage egress: emit a terminal usage chunk by default so OpenAI-compatible
+    // clients that never set stream_options (e.g. opencode, whose TUI context
+    // widget stays at 0% when it records zero tokens) still learn per-turn
+    // token counts. Suppressed only on explicit opt-out (literal boolean
+    // false under stream_options; other falsy shapes still emit), plumbed via
+    // opts.includeUsage.
+    // Deviation from strict OpenAI spec (default omit) is intentional
+    // client-compat behavior. Display-only: same chars/4 estimates as the
+    // non-stream path, no upstream behavior change.
+    // Must precede [DONE] — SSE parsers stop there and ignore the rest.
+    if (opts.includeUsage !== false && openaiResp.usage && !res.writableEnded && !res.destroyed) {
+        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [], usage: openaiResp.usage })}\n\n`);
+    }
+    if (!res.writableEnded && !res.destroyed) res.write('data: [DONE]\n\n');
     if (res.writableEnded || res.destroyed) return; // §9: no double-end on dead sockets
     res.end();
 }
@@ -4437,7 +4451,7 @@ const server = http.createServer(async (req, res) => {
                     openaiResponse.id = streamMeta.id;
                     openaiResponse.created = streamMeta.created;
                 }
-                const streamOpts = { skipReasoning: Boolean(res._reasoningEmitted || toolCall) };
+                const streamOpts = { skipReasoning: Boolean(res._reasoningEmitted || toolCall), includeUsage: params.stream_options?.include_usage !== false };
                 if (apiMode === 'anthropic') {
                     finishAnthropicStream(res, openaiResponse, streamOpts);
                 } else if (apiMode === 'responses') {

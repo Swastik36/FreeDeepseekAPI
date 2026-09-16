@@ -3781,3 +3781,51 @@ test('W5 shared title bucket: bare + namespaced match, spoofed does not', () => 
   assert.equal(T.isSharedTitleBucket(''), false);
   assert.equal(T.isSharedTitleBucket(null), false);
 });
+
+test('OpenAI stream emits terminal usage chunk before [DONE] (TUI context widget)', () => {
+  const T = serverInternals;
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, write(c) { writes.push(c); }, end() {} };
+  T.finishOpenAIStream(res, { id: 'x', model: 'm', created: 1,
+    choices: [{ message: { role: 'assistant', content: 'hello world, this is a long enough response to count tokens here' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 } });
+  const raw = writes.join('');
+  const doneIdx = raw.indexOf('data: [DONE]');
+  assert.ok(doneIdx > 0, '[DONE] missing');
+  const chunks = writes
+    .flatMap((w) => w.split('\n\n'))
+    .map((s) => s.replace(/^data: /, '').trim())
+    .filter((s) => s && s !== '[DONE]')
+    .map((s) => JSON.parse(s));
+  const usageChunk = chunks.find((c) => c.usage);
+  assert.ok(usageChunk, 'no usage chunk emitted');
+  assert.equal(usageChunk.usage.prompt_tokens, 100);
+  const usageIdx = raw.indexOf('"usage"');
+  assert.ok(usageIdx !== -1 && usageIdx < doneIdx, 'usage must be present and precede [DONE]');
+});
+
+test('OpenAI stream suppresses usage chunk on explicit include_usage:false opt-out', () => {
+  const T = serverInternals;
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, write(c) { writes.push(c); }, end() {} };
+  T.finishOpenAIStream(res, { id: 'x', model: 'm', created: 1,
+    choices: [{ message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 } }, { includeUsage: false });
+  const raw = writes.join('');
+  assert.ok(raw.indexOf('data: [DONE]') > 0, '[DONE] missing');
+  assert.ok(!raw.includes('"usage"'), 'usage chunk must be suppressed on explicit opt-out');
+});
+
+test('OpenAI tool-call stream emits terminal usage chunk before [DONE]', () => {
+  const T = serverInternals;
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, write(c) { writes.push(c); }, end() {} };
+  T.finishOpenAIStream(res, { id: 'x', model: 'm', created: 1,
+    choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'bash', arguments: '{"command":"ls"}' } }] }, finish_reason: 'tool_calls' }],
+    usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55 } });
+  const raw = writes.join('');
+  const doneIdx = raw.indexOf('data: [DONE]');
+  const usageIdx = raw.indexOf('"usage"');
+  assert.ok(doneIdx > 0, '[DONE] missing');
+  assert.ok(usageIdx !== -1 && usageIdx < doneIdx, 'usage must be present and precede [DONE]');
+});
