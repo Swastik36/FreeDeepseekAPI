@@ -261,6 +261,10 @@ Response (stream, stream=true):
   data: [DONE]
 ```
 
+OpenAI mode emits reasoning_content on tool-call turns. Anthropic and
+Responses modes suppress reasoning on tool-call turns (streaming and
+non-streaming).
+
 ### 3.4 Anthropic Messages Shim — Claude Code / Anthropic SDK
 
 ```

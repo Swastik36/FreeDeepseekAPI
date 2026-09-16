@@ -3829,3 +3829,74 @@ test('OpenAI tool-call stream emits terminal usage chunk before [DONE]', () => {
   assert.ok(doneIdx > 0, '[DONE] missing');
   assert.ok(usageIdx !== -1 && usageIdx < doneIdx, 'usage must be present and precede [DONE]');
 });
+
+test('buildToolCallResponse attaches redacted reasoning_content for thinking on tool turns', () => {
+  const T = serverInternals;
+  const resp = T.buildToolCallResponse(
+    [{ id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' }],
+    'm', 'prompt', 'I should list files first.');
+  assert.equal(resp.choices[0].message.reasoning_content, 'I should list files first.');
+  assert.equal(resp.choices[0].finish_reason, 'tool_calls');
+  // Absent when there is no reasoning (wire shape unchanged for plain turns)
+  const plain = T.buildToolCallResponse(
+    [{ id: 'call_2', name: 'bash', arguments: '{}' }], 'm', 'prompt', '');
+  assert.ok(!('reasoning_content' in plain.choices[0].message));
+  // Embedded payloads in thinking are redacted like text turns
+  const dirty = T.buildToolCallResponse(
+    [{ id: 'call_3', name: 'bash', arguments: '{}' }],
+    'm', 'prompt', 'leak data:text/plain,' + 'A'.repeat(64));
+  assert.ok(!dirty.choices[0].message.reasoning_content.includes('A'.repeat(64)));
+});
+
+test('finishOpenAIStream emits thinking before tool_calls chunk on tool turns (default opts)', () => {
+  const T = serverInternals;
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, write(c) { writes.push(c); }, end() {} };
+  const resp = T.buildToolCallResponse(
+    [{ id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' }],
+    'm', 'prompt', 'I should list files first, then report back to the user.');
+  T.finishOpenAIStream(res, resp);
+  const raw = writes.join('');
+  const thinkIdx = raw.indexOf('"reasoning_content"');
+  const toolIdx = raw.indexOf('"tool_calls"');
+  const doneIdx = raw.indexOf('data: [DONE]');
+  assert.ok(thinkIdx !== -1, 'no thinking emitted on tool turn');
+  assert.ok(toolIdx !== -1, 'tool_calls chunk missing');
+  assert.ok(thinkIdx < toolIdx && toolIdx < doneIdx, 'order must be thinking -> tool_calls -> [DONE]');
+});
+
+test('finishOpenAIStream honors res._reasoningEmitted guard', () => {
+  const T = serverInternals;
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, _reasoningEmitted: true, write(c) { writes.push(c); }, end() {} };
+  const resp = T.buildToolCallResponse(
+    [{ id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' }],
+    'm', 'prompt', 'Thinking that already streamed live.');
+  T.finishOpenAIStream(res, resp); // default opts: suppression comes only from the live-emit flag
+  const raw = writes.join('');
+  assert.ok(!raw.includes('"reasoning_content"'), 'reasoning must not re-emit after live phase');
+  assert.ok(raw.includes('"tool_calls"'), 'tool_calls chunk missing');
+  assert.ok(raw.includes('data: [DONE]'), '[DONE] missing');
+});
+
+test('finishOpenAIStream delivers tool-turn thinking exactly once, ahead of tool_calls', () => {
+  const T = serverInternals;
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, write(c) { writes.push(c); }, end() {} };
+  const thinking = 'Step one: inspect. Step two: act. Step three: report back with a summary.';
+  const resp = T.buildToolCallResponse(
+    [{ id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' }],
+    'm', 'prompt', thinking);
+  T.finishOpenAIStream(res, resp);
+  const payloads = writes.join('').split('\n')
+    .filter((l) => l.startsWith('data: ') && l !== 'data: [DONE]')
+    .map((l) => JSON.parse(l.slice(6)));
+  const thinkParts = payloads
+    .filter((p) => p.choices?.[0]?.delta?.reasoning_content !== undefined)
+    .map((p) => p.choices[0].delta.reasoning_content);
+  assert.equal(thinkParts.join(''), thinking, 'thinking must arrive whole, exactly once');
+  assert.ok(thinkParts.length >= 1, 'expected at least one thinking chunk');
+  const firstThink = payloads.findIndex((p) => p.choices?.[0]?.delta?.reasoning_content !== undefined);
+  const toolIdx = payloads.findIndex((p) => p.choices?.[0]?.delta?.tool_calls);
+  assert.ok(firstThink !== -1 && firstThink < toolIdx, 'thinking must precede tool_calls');
+});

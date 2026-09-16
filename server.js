@@ -2155,8 +2155,14 @@ function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = ''
         content: null,
         tool_calls
     };
-    // Do not attach reasoning to tool-call turns. Some agent clients treat any
-    // reasoning/text payload as a final assistant answer and stop their tool loop.
+    if (reasoningContent) message.reasoning_content = redactEmbeddedDataUrls(reasoningContent);
+    // Attach reasoning to tool-call turns (same redaction as text turns) so
+    // clients with first-class reasoning parts (opencode TUI thinking toggle)
+    // can display thinking before the tool executes. Reasoning travels as its
+    // own delta chunks ahead of the tool_calls chunk — never as final text —
+    // so tool-loop clients keep looping. OpenAI mode only: the Anthropic and
+    // Responses shims suppress reasoning on tool-call turns by design
+    // (see docs/api-documentation.md).
     return {
         id: 'ds-' + now,
         object: 'chat.completion',
@@ -2933,9 +2939,11 @@ function finishOpenAIStream(res, openaiResp, opts = {}) {
     const model = openaiResp.model;
     const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
     const skipReasoning = Boolean(opts.skipReasoning || res._reasoningEmitted);
-    if (!hasToolCalls && msg.reasoning_content && !skipReasoning) {
+    if (msg.reasoning_content && !skipReasoning) {
         // H2 egress exact: redact the whole reasoning string first, then slice
         // (a payload straddling a 50-char boundary would otherwise leak).
+        // Runs for text AND tool-call turns: reasoning chunks always precede
+        // the tool_calls/content chunks so thinking displays before execution.
         const cleanReasoning = redactEmbeddedDataUrls(msg.reasoning_content);
         for (let i = 0; i < cleanReasoning.length; i += 50) {
             const chunk = cleanReasoning.substring(i, i + 50);
@@ -4062,7 +4070,7 @@ const server = http.createServer(async (req, res) => {
             const readOpts = {
                 onReasoningDone: (reasoning) => {
                     if (!stream || clientGone || res.writableEnded) return;
-                    if (allowedToolNames.size > 0) return; // tool turns must strictly suppress reasoning
+                    if (allowedToolNames.size > 0) return; // tool-capable requests: live reasoning suppressed. Finish-phase: OpenAI emits on both tool-call and text turns; Anthropic/Responses emit on text turns and suppress on tool-call turns — see finishOpenAIStream and docs/api-documentation.md
                     if (res._reasoningEmitted) return;
                     res._reasoningEmitted = true;
                     const sanitized = sanitizeContent(reasoning || '');
@@ -4451,7 +4459,7 @@ const server = http.createServer(async (req, res) => {
                     openaiResponse.id = streamMeta.id;
                     openaiResponse.created = streamMeta.created;
                 }
-                const streamOpts = { skipReasoning: Boolean(res._reasoningEmitted || toolCall), includeUsage: params.stream_options?.include_usage !== false };
+                const streamOpts = { skipReasoning: Boolean(res._reasoningEmitted), includeUsage: params.stream_options?.include_usage !== false };
                 if (apiMode === 'anthropic') {
                     finishAnthropicStream(res, openaiResponse, streamOpts);
                 } else if (apiMode === 'responses') {
