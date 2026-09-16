@@ -1901,24 +1901,20 @@ test('opener adoption requires exactly one candidate and rejects ambiguous multi
   assert.equal(shouldAdopt, false, 'Ambiguous opener adoption must refuse and fork');
 });
 
-test('markAccountFailure tracks consecutive timeouts and triggers cooldown after 3 (BUG-C)', () => {
-  const account = { id: 'acct_test', failures: 0, consecutiveTimeouts: 0, cooldownUntil: 0 };
-  // Timeout 1
+test('markAccountFailure tracks consecutive timeouts and triggers cooldown after 2 (hypersensitive strikes)', () => {
+  const account = { id: 'acct_test', failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, cooldownUntil: 0 };
+  // Timeout 1: counted, no sideline yet (one blip is forgiven).
   serverInternals.markAccountFailure(account, 504, 'timeout');
   assert.equal(account.failures, 1);
   assert.equal(account.consecutiveTimeouts, 1);
+  assert.equal(account.consecutiveFailures, 1);
   assert.equal(account.cooldownUntil, 0);
 
-  // Timeout 2
+  // Timeout 2 -> triggers the long cooldown for a dead network path.
   serverInternals.markAccountFailure(account, 504, 'timeout / fetch abort');
   assert.equal(account.failures, 2);
-  assert.equal(account.consecutiveTimeouts, 2);
-  assert.equal(account.cooldownUntil, 0);
-
-  // Timeout 3 -> triggers cooldown
-  serverInternals.markAccountFailure(account, 504, 'fetch timeout');
-  assert.equal(account.failures, 3);
   assert.equal(account.consecutiveTimeouts, 0);
+  assert.equal(account.consecutiveFailures, 0);
   assert.ok(account.cooldownUntil > Date.now());
 });
 
@@ -2493,7 +2489,7 @@ test('smart routing: busiest account loses to idle; degraded (timeouts) loses to
   const degraded = { id: 'sr-degraded', inflight: 0, failures: 1, consecutiveTimeouts: 3 };
   const flaky = { id: 'sr-flaky', inflight: 0, failures: 5, consecutiveTimeouts: 0 };
   const timedOut = { id: 'sr-timedout', inflight: 0, failures: 0, consecutiveTimeouts: 3 };
-  // Gaps (20, 20, 8) all exceed the jitter range [0,1): deterministic wins.
+  // Gaps (20, 40, 16) all exceed the jitter range [0,1): deterministic wins.
   for (let i = 0; i < 20; i++) {
     assert.ok(serverInternals.scoreAccount(idle, 0) < serverInternals.scoreAccount(busy, 0), 'idle beats busy');
     assert.ok(serverInternals.scoreAccount(healthy, 0) < serverInternals.scoreAccount(degraded, 0), 'healthy beats degraded');
@@ -2695,8 +2691,64 @@ test('smart routing: only live recent chats count toward home affinity (stale pi
   assert.equal(serverInternals.selectFreshAccount([a, b]).id, 'sr-decay-b');
 });
 
-test('smart routing: scoreAccount clamps hostedCount into [0,8]', (t) => {
+test('smart routing: two consecutive soft failures trigger a short escalation cooldown', () => {
+  const account = { id: 'sr-esc', failures: 0, consecutiveFailures: 0, consecutiveTimeouts: 0, cooldownUntil: 0 };
+  // First PoW-missing (auth-expired symptom): counted, still ready.
+  serverInternals.markAccountFailure(account, 200, 'pow challenge missing');
+  assert.equal(account.failures, 1);
+  assert.equal(account.consecutiveFailures, 1);
+  assert.equal(account.cooldownUntil, 0);
+  assert.ok(account.lastFailureAt > 0);
+  // Second consecutive failure: sidelined briefly so fresh chats fail over.
+  serverInternals.markAccountFailure(account, 200, 'pow challenge missing');
+  assert.equal(account.failures, 2);
+  assert.equal(account.consecutiveFailures, 0);
+  assert.ok(account.cooldownUntil > Date.now(), 'escalation cooldown set');
+  assert.ok(account.cooldownUntil <= Date.now() + 65_000, 'escalation cooldown is short (~60s)');
+});
+
+test('smart routing: PoW-solve failures never strike out (F16 WASM/CDN exemption)', () => {
+  const account = { id: 'sr-f16', failures: 0, consecutiveFailures: 0, consecutiveTimeouts: 0, cooldownUntil: 0 };
+  for (let i = 0; i < 3; i++) serverInternals.markAccountFailure(account, 500, 'pow solve');
+  assert.equal(account.failures, 3, 'counted for the scorer');
+  assert.ok(!account.consecutiveFailures, 'no strike counted');
+  assert.equal(account.cooldownUntil, 0, 'never sidelined');
+});
+
+test('smart routing: failure half-life decay forgives old blips but punishes fresh ones', (t) => {
   saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const now = Date.now();
+  const fresh = { id: 'sr-freshfail', inflight: 0, failures: 8, consecutiveTimeouts: 0, lastFailureAt: now };
+  const stale = { id: 'sr-stalefail', inflight: 0, failures: 8, consecutiveTimeouts: 0, lastFailureAt: now - 30 * 60 * 1000 };
+  // 8 fresh failures (4*8=32) vs 8 failures from 30min ago (~6 half-lives: ~0.5).
+  assert.ok(serverInternals.effectiveFailures(fresh, now) > 7);
+  assert.ok(serverInternals.effectiveFailures(stale, now) < 1);
+  for (let i = 0; i < 20; i++) {
+    assert.ok(serverInternals.scoreAccount(stale, 0, now) < serverInternals.scoreAccount(fresh, 0, now), 'stale failures route before fresh ones');
+  }
+});
+
+test('smart routing: recent success wins near-ties but never outruns real failures', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const now = Date.now();
+  const hot = { id: 'sr-hot', inflight: 0, failures: 0, consecutiveTimeouts: 0, lastSuccessAt: now };
+  const cold = { id: 'sr-cold', inflight: 0, failures: 0, consecutiveTimeouts: 0 };
+  // Hot bonus (-2) exceeds jitter: deterministic near-tie win.
+  for (let i = 0; i < 20; i++) {
+    assert.ok(serverInternals.scoreAccount(hot, 0, now) < serverInternals.scoreAccount(cold, 0, now), 'proven-hot wins ties');
+  }
+  // ... but a single fresh failure (+4) outweighs the bonus: failures dominate.
+  const hotFlaky = { id: 'sr-hotflaky', inflight: 0, failures: 1, consecutiveTimeouts: 0, lastFailureAt: now, lastSuccessAt: now };
+  for (let i = 0; i < 20; i++) {
+    assert.ok(serverInternals.scoreAccount(cold, 0, now) < serverInternals.scoreAccount(hotFlaky, 0, now), 'one failure beats the hot bonus');
+  }
+});
+
+test('smart routing: scoreAccount clamps hostedCount into [0,8]', (t) => {  saveRoutingEnv(t);
   delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
   delete process.env.DEEPSEEK_ROUTING_MODE;
   const acct = { id: 'sr-clamp', inflight: 0, failures: 0, consecutiveTimeouts: 0 };

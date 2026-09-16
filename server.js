@@ -280,6 +280,25 @@ const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'd
 const DEFAULT_ACCOUNT_COOLDOWN_MS = numEnv('DEEPSEEK_ACCOUNT_COOLDOWN_MS', 10 * 60 * 1000, 1000);
 const MAX_ACCOUNT_COOLDOWN_MS = 30 * 60 * 1000; // upper clamp: a malicious or
 // absurd Retry-After must never brick an account for years (8b).
+// Hypersensitive smart-routing tuning (2026-09-16). All load-time env knobs:
+// - FAILURE/TIMEOUT_WEIGHT: scorer penalty per effective failure / consecutive
+//   timeout (timeouts still weigh 3x plain failures, as before).
+// - CONSECUTIVE_STRIKES: consecutive failures (any kind except PoW-solve, see
+//   F16) that sideline an account. 2 = one blip is forgiven, a repeat is not.
+// - ESCALATION_COOLDOWN_MS: short sideline for strike-outs (fast failover +
+//   fast recovery probe). Hard auth/rate-limit faults keep the long default.
+// - FAILURE_HALFLIFE_MS: failures decay exponentially (forgives old blips, so
+//   routing reacts to the last minutes, not ancient history). <=0 disables.
+// - HOT_BONUS/HOT_WINDOW_MS: a small nudge toward the account with the most
+//   recent success (proven-hot wins near-ties). Small on purpose: it must not
+//   become a monopoly — failures still dominate within a strike or two.
+const ROUTING_FAILURE_WEIGHT = numEnv('DEEPSEEK_ROUTING_FAILURE_WEIGHT', 4, 0);
+const ROUTING_TIMEOUT_WEIGHT = numEnv('DEEPSEEK_ROUTING_TIMEOUT_WEIGHT', 12, 0);
+const ROUTING_CONSECUTIVE_STRIKES = Math.max(1, Math.floor(numEnv('DEEPSEEK_ROUTING_CONSECUTIVE_STRIKES', 2, 1)));
+const ROUTING_ESCALATION_COOLDOWN_MS = numEnv('DEEPSEEK_ROUTING_ESCALATION_COOLDOWN_MS', 60 * 1000, 1000);
+const ROUTING_FAILURE_HALFLIFE_MS = numEnv('DEEPSEEK_ROUTING_FAILURE_HALFLIFE_MS', 5 * 60 * 1000, 0);
+const ROUTING_HOT_BONUS = numEnv('DEEPSEEK_ROUTING_HOT_BONUS', 2, 0);
+const ROUTING_HOT_WINDOW_MS = numEnv('DEEPSEEK_ROUTING_HOT_WINDOW_MS', 60 * 1000, 0);
 let DS_CONFIG = {};
 let dsHeaders = {};
 const accounts = [];
@@ -361,7 +380,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
                 // solve throws and the account 500s every request (F16).
                 console.error(`[DS-API] ${id} (${file}) has no wasmUrl; PoW solves will fail until it is imported.`);
             }
-            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, lastUsedAt: 0, inflight: 0 });
+            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0 });
         } catch (e) {
             console.error(`[DS-API] Could not load auth config ${file}: ${e.message}`);
         }
@@ -387,6 +406,7 @@ function accountStatus(account) {
         cooldown_remaining_sec: Math.max(0, Math.ceil((account.cooldownUntil - Date.now()) / 1000)),
         failures: account.failures,
         consecutive_timeouts: account.consecutiveTimeouts || 0,
+        consecutive_failures: account.consecutiveFailures || 0,
         inflight: Number(account.inflight) || 0,
         last_used_at: account.lastUsedAt || null,
     };
@@ -453,20 +473,40 @@ function selectAccountForSession(session) {
 // while home is cooling down (cooling accounts are excluded from `ready`).
 // DEEPSEEK_ROUTING_MODE=preferred restores the legacy preferred-first /
 // home-max / round-robin path below.
-// Smart-routing scorer (implementor-brief-smart-routing-2026-09-15 §2):
-// lowest score wins. A busy account sheds load fast (10 dominates),
-// degraded accounts are avoided (timeouts weigh 3x plain failures), home
-// affinity is a nudge not a lock (capped at 8), preferred is bias not
-// monopoly (-5), jitter breaks exact ties. Exported pure for tests (reads
-// only its args + DEEPSEEK_PREFERRED_ACCOUNT, no turn-scoped state).
-function scoreAccount(account, hostedCount = 0) {
+// Smart-routing scorer (implementor-brief-smart-routing-2026-09-15 §2, tuned
+// hypersensitive 2026-09-16): lowest score wins. A busy account sheds load
+// fast (10 dominates), degraded accounts are avoided fast (failures weigh 4,
+// timeouts 3x that at 12), failures decay with a 5-minute half-life so the
+// score tracks the last minutes not ancient history, a recently-successful
+// account gets a small hot bonus (-2, never a monopoly), home affinity is a
+// nudge not a lock (capped at 8), preferred is bias not monopoly (-5), jitter
+// breaks exact ties. Exported pure for tests (reads only its args + routing
+// env, no turn-scoped state). nowMs is injectable so tests can age failures.
+// Time-decayed failure count: recent failures hit hard, old blips fade.
+// Accounts without a lastFailureAt timestamp (legacy/test objects) decay
+// nothing — their raw count applies in full, keeping scoring deterministic.
+function effectiveFailures(account, nowMs = Date.now()) {
+    const raw = Math.max(0, Number(account?.failures) || 0);
+    if (raw === 0) return 0;
+    const half = ROUTING_FAILURE_HALFLIFE_MS;
+    const last = Number(account?.lastFailureAt) || 0;
+    if (!(half > 0) || !(last > 0)) return raw;
+    const age = nowMs - last;
+    if (age <= 0) return raw;
+    return raw * Math.pow(0.5, age / half);
+}
+function scoreAccount(account, hostedCount = 0, nowMs = Date.now()) {
     const inflight = Number(account?.inflight) || 0;
-    const failures = Number(account?.failures) || 0;
+    const failures = effectiveFailures(account, nowMs);
     const timeouts = Number(account?.consecutiveTimeouts) || 0;
     const hosted = Math.min(Math.max(Number(hostedCount) || 0, 0), 8);
     const preferred = (process.env.DEEPSEEK_PREFERRED_ACCOUNT || '').trim();
     const isPreferred = !!preferred && !!account && account.id === preferred;
-    return 10 * inflight + 2 * failures + 6 * timeouts - hosted - (isPreferred ? 5 : 0) + Math.random();
+    let score = 10 * inflight + ROUTING_FAILURE_WEIGHT * failures + ROUTING_TIMEOUT_WEIGHT * timeouts - hosted - (isPreferred ? 5 : 0);
+    const lastOk = Number(account?.lastSuccessAt) || 0;
+    const okAge = nowMs - lastOk;
+    if (ROUTING_HOT_BONUS > 0 && lastOk > 0 && okAge >= 0 && okAge <= ROUTING_HOT_WINDOW_MS) score -= ROUTING_HOT_BONUS;
+    return score + Math.random();
 }
 function isPreferredRoutingMode() {
     return (process.env.DEEPSEEK_ROUTING_MODE || '').trim().toLowerCase() === 'preferred';
@@ -494,7 +534,7 @@ function pickLowestScoredAccount(candidates, nowMs = Date.now()) {
     let best = Infinity;
     let winner = null;
     for (const candidate of candidates) {
-        const score = scoreAccount(candidate, countActiveHosted(candidate.id, nowMs));
+        const score = scoreAccount(candidate, countActiveHosted(candidate.id, nowMs), nowMs);
         if (score < best) { best = score; winner = candidate; }
     }
     return winner;
@@ -548,14 +588,26 @@ function parseRetryAfterMs(retryAfterRaw) {
 }
 function markAccountFailure(account, status, reason = '', retryAfterRaw = null) {
     if (!account) return;
+    const now = Date.now();
     account.failures++;
+    account.lastFailureAt = now;
+    // F16: a PoW SOLVE failure is a WASM/CDN fault, not a login fault — count
+    // it for the scorer but never let it strike out or sideline the account.
+    if (/pow solve/i.test(reason || '')) return;
+    account.consecutiveFailures = (account.consecutiveFailures || 0) + 1;
     if (status === 504 || isTimeoutError({ message: reason }) || /timeout|abort/i.test(reason)) {
         account.consecutiveTimeouts = (account.consecutiveTimeouts || 0) + 1;
-        if (account.consecutiveTimeouts >= 3) {
-            const cooldownMs = DEFAULT_ACCOUNT_COOLDOWN_MS;
-            account.cooldownUntil = Date.now() + cooldownMs;
+        // A dead network path backs off hard; anything else trips the short
+        // escalation sideline so traffic fails over within a strike or two.
+        if (account.consecutiveTimeouts >= ROUTING_CONSECUTIVE_STRIKES) {
+            account.cooldownUntil = now + DEFAULT_ACCOUNT_COOLDOWN_MS;
             account.consecutiveTimeouts = 0;
-            console.log(`[account:${account.id}] cooldown for ${Math.round(cooldownMs / 1000)}s after 3 consecutive timeouts/network aborts (${reason})`);
+            account.consecutiveFailures = 0;
+            console.log(`[account:${account.id}] cooldown for ${Math.round(DEFAULT_ACCOUNT_COOLDOWN_MS / 1000)}s after ${ROUTING_CONSECUTIVE_STRIKES} consecutive timeouts/network aborts (${reason})`);
+        } else if (account.consecutiveFailures >= ROUTING_CONSECUTIVE_STRIKES) {
+            account.cooldownUntil = now + ROUTING_ESCALATION_COOLDOWN_MS;
+            account.consecutiveFailures = 0;
+            console.log(`[account:${account.id}] cooldown for ${Math.round(ROUTING_ESCALATION_COOLDOWN_MS / 1000)}s after ${ROUTING_CONSECUTIVE_STRIKES} consecutive failures (last: ${reason})`);
         }
         return;
     }
@@ -568,8 +620,18 @@ function markAccountFailure(account, status, reason = '', retryAfterRaw = null) 
         const cooldownMs = retryMs != null
             ? Math.min(retryMs, MAX_ACCOUNT_COOLDOWN_MS)
             : DEFAULT_ACCOUNT_COOLDOWN_MS;
-        account.cooldownUntil = Date.now() + cooldownMs;
+        account.cooldownUntil = now + cooldownMs;
+        account.consecutiveFailures = 0;
         console.log(`[account:${account.id}] cooldown for ${Math.round(cooldownMs / 1000)}s after HTTP ${status}${reason ? ` (${reason})` : ''}${retryMs != null ? ' (Retry-After)' : ''}`);
+        return;
+    }
+    // Hypersensitive escalation (2026-09-16): repeated soft failures
+    // (auth-expired PoW, 5xx, bad payloads) sideline the account briefly so
+    // fresh chats fail over fast; the short cooldown re-probes it soon after.
+    if (account.consecutiveFailures >= ROUTING_CONSECUTIVE_STRIKES) {
+        account.cooldownUntil = now + ROUTING_ESCALATION_COOLDOWN_MS;
+        account.consecutiveFailures = 0;
+        console.log(`[account:${account.id}] cooldown for ${Math.round(ROUTING_ESCALATION_COOLDOWN_MS / 1000)}s after ${ROUTING_CONSECUTIVE_STRIKES} consecutive failures (last: ${reason || status})`);
     }
 }
 async function readDeepSeekJsonResponse(resp, label, account) {
@@ -1334,7 +1396,9 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     // any future backoff policy instead of write-only).
     account.cooldownUntil = 0;
     account.failures = 0;
+    account.consecutiveFailures = 0;
     account.consecutiveTimeouts = 0;
+    account.lastSuccessAt = Date.now();
     return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: recoveredFreshSession };
     } catch (e) {
         if (isTimeoutError(e) || e.name === 'AbortError' || /timeout|abort/i.test(e.message || '')) {
@@ -4893,6 +4957,7 @@ module.exports = {
         selectAccountForSession,
         selectFreshAccount,
         scoreAccount,
+        effectiveFailures,
         countActiveHosted,
         accountStatus,
         askDeepSeekStream,
