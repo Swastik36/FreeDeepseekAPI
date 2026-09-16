@@ -94,6 +94,16 @@ curl -N -s http://127.0.0.1:9655/v1/chat/completions \
 - `reasoning_content` chunks: **EXACTLY 0**.
 - Agent clients (OpenCode, Claude Code) receive pure tool calls without preceding text/reasoning deltas that could prematurely terminate tool execution loops.
 
+> **2026-09-16 override note:** the "EXACTLY 0" expectation above was a
+> precautionary constraint — the loop-termination risk was hypothesized
+> ("could"), never observed as an incident. Commit `4c1cac5` deliberately
+> overrides it for OpenAI mode: tool-call turns now carry
+> `reasoning_content` so thinking displays before tool execution.
+> Evidence: headless opencode run (deepseek-chat) continued the tool loop;
+> live re-probe showed reasoning + tool_calls + `[DONE]` well-formed.
+> Anthropic/Responses shims keep the suppression (see
+> `docs/api-documentation.md`). TUI confirmation remains a follow-up.
+
 ---
 
 ## 3. Test Case 3: Anthropic and Responses Streaming

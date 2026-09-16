@@ -3900,3 +3900,277 @@ test('finishOpenAIStream delivers tool-turn thinking exactly once, ahead of tool
   const toolIdx = payloads.findIndex((p) => p.choices?.[0]?.delta?.tool_calls);
   assert.ok(firstThink !== -1 && firstThink < toolIdx, 'thinking must precede tool_calls');
 });
+
+test('thinking pump emits first packet immediately, throttles, then releases', () => {
+  const T = serverInternals;
+  const emitted = [];
+  const pump = T.createThinkingPump({ intervalMs: 2000, onEmit: (tail) => emitted.push(tail) });
+  const think = 'A'.repeat(200);
+  pump.push(think, 0);
+  assert.equal(emitted.length, 1, 'first push must emit immediately');
+  assert.equal(emitted[0], think.slice(0, 136));
+  pump.push(think + 'B'.repeat(100), 1000);
+  assert.equal(emitted.length, 1, 'push inside interval must not emit');
+  pump.push(think + 'B'.repeat(100), 2500);
+  assert.equal(emitted.length, 2, 'push after interval must emit');
+  assert.equal(emitted.join(''), (think + 'B'.repeat(100)).slice(0, 236));
+});
+
+test('thinking pump holds emission on upstream revision', () => {
+  const T = serverInternals;
+  const emitted = [];
+  const pump = T.createThinkingPump({ intervalMs: 2000, onEmit: (t) => emitted.push(t) });
+  pump.push('X'.repeat(200), 0);
+  assert.equal(emitted.length, 1);
+  pump.push('TOTALLY DIFFERENT thinking that replaces everything ' + 'Y'.repeat(200), 5000);
+  assert.equal(emitted.length, 1, 'revision must not emit');
+  assert.equal(pump.state().sent, '', 'full revision re-bases sent to empty common prefix');
+});
+
+test('thinking pump re-bases (not stalls) when redaction completes mid-stream', () => {
+  const T = serverInternals;
+  const emitted = [];
+  const pump = T.createThinkingPump({ intervalMs: 500, onEmit: (t) => emitted.push(t) });
+  pump.push('A'.repeat(200), 0);
+  assert.equal(emitted.length, 1, 'first packet must emit');
+  // A data: payload completes past the floor: redaction rewrites already-sent bytes.
+  const diverged = 'A'.repeat(100) + 'data:text/plain;base64,' + 'B'.repeat(80) + ' tail words here and then some more prose to follow';
+  pump.push(diverged, 600);
+  assert.equal(emitted.length, 1, 'divergent push must not emit, only re-base');
+  assert.equal(pump.state().sent, 'A'.repeat(100), 'sent must re-base to longest common prefix');
+  pump.push(diverged + ' finally done here.', 1200);
+  assert.equal(emitted.length, 2, 'live emission must resume after re-base, not stall until finish');
+  const joined = emitted.join('');
+  assert.ok(!joined.includes('B'.repeat(20)), 'raw payload must never cross, including across re-base');
+  assert.ok(joined.includes('<omitted>'), 'resumed emission carries the redacted form');
+});
+
+test('thinking pump records phase timing even when hold-back emits nothing', () => {
+  const T = serverInternals;
+  const pump = T.createThinkingPump({ intervalMs: 2000, onEmit: () => {} });
+  assert.equal(pump.state().phaseMs, 0);
+  assert.equal(pump.state().sawThinking, false);
+  pump.push('short thought', 1000);
+  pump.push('short thought plus more words here yes', 3500);
+  const s = pump.state();
+  assert.equal(s.sawThinking, true);
+  assert.equal(s.phaseMs, 2500);
+  assert.equal(s.sent, '', 'nothing long enough to emit');
+  pump.reset();
+  assert.equal(pump.state().sawThinking, false);
+  assert.equal(pump.state().phaseMs, 0);
+  const g = T.shouldLogThinkPhase;
+  assert.equal(g({ sawThinking: true, phaseMs: 2500, sent: '' }), true);
+  assert.equal(g({ sawThinking: false, phaseMs: 0, sent: '' }), false);
+  assert.equal(g(null), false);
+});
+
+test('thinking pump never emits a raw sub-floor payload across snapshots', () => {
+  const T = serverInternals;
+  const emitted = [];
+  const pump = T.createThinkingPump({ intervalMs: 0, onEmit: (t) => emitted.push(t) });
+  const part1 = 'Thinking about the file data:text/plain;base64,SGVs';
+  pump.push(part1, 0);
+  assert.equal(emitted.length, 0, 'sub-floor partial must be withheld, not emitted raw');
+  const part2 = part1 + 'bG8gd29ybGQ=' + 'A'.repeat(60) + ' and then I will call the tool with these arguments in mind, carefully.';
+  pump.push(part2, 1);
+  assert.ok(emitted.length >= 1, 'emission must resume once decidable');
+  assert.ok(!emitted.join('').includes('SGVs'), 'raw partial must never cross, even after completion');
+  // LOW-1 boundary pin: terminal sub-floor URL + trailing prose emits once, finish agrees.
+  const pump2 = T.createThinkingPump({ intervalMs: 0, onEmit: (t) => emitted.push('P2:' + t) });
+  const terminal = 'Note data:text/plain,abc then some trailing prose words here ok today';
+  pump2.push(terminal, 0);
+  assert.equal(pump2.state().sent, terminal.slice(0, 5));
+});
+
+test('thinking pump sent agrees with finish-side redact(sanitize(·))', () => {
+  const T = serverInternals;
+  const emitted = [];
+  const pump = T.createThinkingPump({ intervalMs: 0, onEmit: (t) => emitted.push(t) });
+  const LONE = String.fromCharCode(0xD800); // lone surrogate; built programmatically so no raw surrogate lives in source
+  const think = 'Step one ' + LONE + ' then step two with enough trailing words to pass the hold window comfortably yes indeed';
+  pump.push(think, 0);
+  pump.push(think, 1);
+  const finishClean = T.redactEmbeddedDataUrls(T.sanitizeContent(think));
+  assert.ok(finishClean.startsWith(emitted.join('')), 'pump sent must prefix-match finish-side string');
+  assert.ok(!emitted.join('').includes(LONE), 'lone surrogate must not cross');
+});
+
+test('finishOpenAIStream emits only the un-sent remainder after live thinking', () => {
+  const T = serverInternals;
+  const thinking = 'First I will inspect the directory layout, then decide which files to read for the requested change.';
+  const resp = T.buildToolCallResponse(
+    [{ id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' }],
+    'm', 'prompt', thinking);
+  const full = resp.choices[0].message.reasoning_content;
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, write(c) { writes.push(c); }, end() {} };
+  res._reasoningLiveSent = full.slice(0, 70);
+  T.finishOpenAIStream(res, resp);
+  const payloads = writes.join('').split('\n')
+    .filter((l) => l.startsWith('data: ') && l !== 'data: [DONE]')
+    .map((l) => JSON.parse(l.slice(6)));
+  const thinkParts = payloads
+    .filter((p) => p.choices?.[0]?.delta?.reasoning_content !== undefined)
+    .map((p) => p.choices[0].delta.reasoning_content);
+  assert.equal(thinkParts.join(''), full.slice(70), 'finish must emit remainder only');
+  const firstThink = payloads.findIndex((p) => p.choices?.[0]?.delta?.reasoning_content !== undefined);
+  const toolIdx = payloads.findIndex((p) => p.choices?.[0]?.delta?.tool_calls);
+  assert.ok(firstThink !== -1 && firstThink < toolIdx, 'remainder must precede tool_calls');
+});
+
+test('finishOpenAIStream full-emits thinking on live-prefix diverge without crashing', () => {
+  const T = serverInternals;
+  const thinking = 'Inspect first, then act on what the directory shows us here.';
+  const resp = T.buildToolCallResponse(
+    [{ id: 'call_1', name: 'bash', arguments: '{"command":"ls"}' }],
+    'm', 'prompt', thinking);
+  const full = resp.choices[0].message.reasoning_content;
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, write(c) { writes.push(c); }, end() {} };
+  res._reasoningLiveSent = 'something entirely different, not a prefix at all, xyz';
+  T.finishOpenAIStream(res, resp);
+  const raw = writes.join('');
+  assert.ok(raw.includes(JSON.stringify(full.slice(0, 20)).slice(1, 21)), 'diverged finish must emit full reasoning');
+  assert.ok(raw.includes('data: [DONE]'), '[DONE] missing');
+});
+
+test('consumeDeepSeekStream notifies reasoning progress with growing prefixes', async () => {
+  const { Readable } = require('stream');
+  const progress = [];
+  let done = null;
+  const sse = [
+    'data: {"v":{"response":{"fragments":[{"type":"THINK","content":"deep "}]}}}\n\n',
+    'data: {"v":{"response":{"fragments":[{"type":"THINK","content":"deep "},{"type":"THINK","content":"thoughts "}]}}}\n\n',
+    'data: {"p":"response/fragments","v":[{"type":"RESPONSE","content":"Answer."}]}\n\n',
+    'data: {"finish_reason":"stop"}\n\n',
+  ];
+  const result = await serverInternals.consumeDeepSeekStream(Readable.from(sse.map((c) => Buffer.from(c))), {
+    onReasoningDone: (r) => { done = r; },
+    onReasoningProgress: (r) => { progress.push(r); },
+    isClientGone: () => false,
+  });
+  assert.deepEqual(progress, ['deep ', 'deep thoughts ']);
+  assert.equal(done, 'deep thoughts ');
+  assert.equal(result.reasoningContent, 'deep thoughts ');
+});
+
+test('consumeDeepSeekStream fires progress before transition on combined snapshots', async () => {
+  const { Readable } = require('stream');
+  const order = [];
+  const sse = [
+    'data: {"v":{"response":{"fragments":[{"type":"THINK","content":"hmm "},{"type":"RESPONSE","content":"Ans"}]}}}\n\n',
+    'data: {"finish_reason":"stop"}\n\n',
+  ];
+  await serverInternals.consumeDeepSeekStream(Readable.from(sse.map((c) => Buffer.from(c))), {
+    onReasoningDone: () => { order.push('done'); },
+    onReasoningProgress: () => { order.push('progress'); },
+    isClientGone: () => false,
+  });
+  assert.deepEqual(order, ['progress', 'done']);
+});
+
+test('redactEmbeddedDataUrls is idempotent (live/finish parity depends on it)', () => {
+  const T = serverInternals;
+  const r = T.redactEmbeddedDataUrls;
+  const cases = [
+    'plain prose, nothing special here at all, just words',
+    'leak data:text/plain;base64,' + 'A'.repeat(100) + ' tail',
+    'short data:image/png;base64,' + 'B'.repeat(20) + ' x',
+    'pct data:text/plain,' + '%20'.repeat(70),
+    'surr ' + String.fromCharCode(0xD800) + ' ok',
+  ];
+  for (const c of cases) assert.equal(r(r(c)), r(c));
+});
+
+test('liveThinkingMode truth table pins the OpenAI tool-capable flip', () => {
+  const f = serverInternals.liveThinkingMode;
+  assert.equal(f('openai', false), 'progressive');
+  assert.equal(f('openai', true), 'progressive');
+  assert.equal(f('anthropic', true), 'suppressed');
+  assert.equal(f('anthropic', false), 'legacy-burst');
+  assert.equal(f('responses', true), 'suppressed');
+  assert.equal(f('responses', false), 'legacy-burst');
+});
+
+test('emit-then-full-revision keeps legacy burst suppressed (Concern-6 regression)', () => {
+  const T = serverInternals;
+  const pump = T.createThinkingPump({ intervalMs: 0, onEmit: () => {} });
+  pump.push('Q'.repeat(200), 0);
+  assert.equal(pump.state().everEmitted, true);
+  pump.push('entirely new thinking replacing the old one wholesale ' + 'Z'.repeat(200), 1);
+  assert.equal(pump.state().sent, '', 'full revision rewinds sent');
+  assert.equal(pump.state().everEmitted, true, 'rewind must not un-claim emission');
+  assert.equal(T.shouldLegacyBurst('progressive', pump.state().everEmitted, false), false);
+});
+
+test('shouldLegacyBurst truth table (burst only on fresh pumps and legacy modes)', () => {
+  const b = serverInternals.shouldLegacyBurst;
+  assert.equal(b('progressive', false, false), true, 'fresh pump bursts');
+  assert.equal(b('progressive', true, false), false, 'emitted pump never re-bursts');
+  assert.equal(b('progressive', false, true), false, 'post-burst never re-bursts');
+  assert.equal(b('suppressed', false, false), false);
+  assert.equal(b('suppressed', true, false), false);
+  assert.equal(b('legacy-burst', false, false), true);
+  assert.equal(b('legacy-burst', false, true), false);
+});
+
+test('THINK_LIVE_INTERVAL_MS default pins 0.5s cadence', () => {
+  assert.equal(serverInternals.THINK_LIVE_INTERVAL_MS, 500);
+});
+
+test('already-emitted sub-floor prefix stays bounded when payload completes', () => {
+  const T = serverInternals;
+  const emitted = [];
+  const pump = T.createThinkingPump({ intervalMs: 0, onEmit: (t) => emitted.push(t) });
+  // Partial sits ≥64 behind the frontier: emitted raw (documented boundary).
+  // Spaces in the trailing prose keep the second redactor pass from firing.
+  const part1 = 'A'.repeat(100) + 'data:text/plain;base64,' + 'C'.repeat(10) + ' some plain prose words here ok ' + 'D'.repeat(100);
+  pump.push(part1, 0);
+  assert.ok(emitted.join('').includes('C'.repeat(10)), 'sub-floor partial behind frontier is emitted');
+  // Completion flips redaction: pump re-bases instead of stalling.
+  const part2 = 'A'.repeat(100) + 'data:text/plain;base64,' + 'C'.repeat(10) + 'E'.repeat(80) + ' some plain prose words here ok ' + 'D'.repeat(100);
+  pump.push(part2, 1);
+  const finishClean = T.redactEmbeddedDataUrls(T.sanitizeContent(part2));
+  assert.ok(finishClean.startsWith(pump.state().sent), 'finish agrees from the re-based point');
+  assert.ok(!emitted.join('').includes('E'.repeat(20)), 'post-completion payload never crosses raw');
+});
+
+test('two reads through one pump with base sync emit concatenated thinking exactly once', async () => {
+  const T = serverInternals;
+  const { Readable } = require('stream');
+  const emitted = [];
+  const pump = T.createThinkingPump({ intervalMs: 0, onEmit: (t) => emitted.push(t) });
+  // pumpBase mirrors the handler rule: cumulative reasoning finalized by prior reads.
+  let pumpBase = '';
+  const prev = 'P'.repeat(150);
+  const cont = 'Q'.repeat(150);
+  const mk = (think) => Readable.from([
+    Buffer.from(`data: {"v":{"response":{"fragments":[{"type":"THINK","content":"${think}"}]}}}\n\n`),
+    Buffer.from('data: {"finish_reason":"stop"}\n\n'),
+  ]);
+  const r1 = await T.consumeDeepSeekStream(mk(prev), {
+    onReasoningProgress: (t) => pump.push(pumpBase ? pumpBase + '\n' + t : t, 0),
+    isClientGone: () => false,
+  });
+  pumpBase = r1.reasoningContent;
+  const r2 = await T.consumeDeepSeekStream(mk(cont), {
+    onReasoningProgress: (t) => pump.push(pumpBase ? pumpBase + '\n' + t : t, 1),
+    isClientGone: () => false,
+  });
+  pumpBase = r1.reasoningContent + '\n' + r2.reasoningContent; // handler append rule
+  // Finish with the concatenated reasoning, live mirror from the pump.
+  const thinking = pumpBase;
+  const resp = T.buildToolCallResponse(
+    [{ id: 'call_1', name: 'bash', arguments: '{}' }], 'm', 'prompt', thinking);
+  const writes = [];
+  const res = { headersSent: true, writableEnded: false, destroyed: false, write(c) { writes.push(c); }, end() {} };
+  res._reasoningLiveSent = pump.state().sent;
+  T.finishOpenAIStream(res, resp);
+  const finishParts = writes.join('').split('\n')
+    .filter((l) => l.startsWith('data: ') && l !== 'data: [DONE]')
+    .map((l) => JSON.parse(l.slice(6)))
+    .filter((p) => p.choices?.[0]?.delta?.reasoning_content !== undefined)
+    .map((p) => p.choices[0].delta.reasoning_content);
+  assert.equal(emitted.join('') + finishParts.join(''), thinking, 'concatenated thinking must cross exactly once, in order');
+});

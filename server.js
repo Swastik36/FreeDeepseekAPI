@@ -1076,6 +1076,8 @@ async function consumeDeepSeekStream(readable, { onReasoningDone, isClientGone }
     let finishReason = null;
     let modelError = null;
     let reasoningFlushed = false;
+    let lastProgressThink = '';
+    let snapshotAfterFlushWarned = false;
 
     const checkReasoningTransition = () => {
         if (reasoningFlushed) return;
@@ -1125,6 +1127,13 @@ async function consumeDeepSeekStream(readable, { onReasoningDone, isClientGone }
                         fullContent = d.v.response.content;
                     }
                     if (Array.isArray(d.v.response.fragments)) {
+                        // Guard: a full snapshot after the reasoning flush would
+                        // supersede already-emitted thinking (irreversible).
+                        // Never observed; warn once per turn if it ever happens.
+                        if (reasoningFlushed && !snapshotAfterFlushWarned) {
+                            snapshotAfterFlushWarned = true;
+                            console.log('[fragments] Full snapshot arrived after reasoning flush; client may hold superseded thinking');
+                        }
                         fragments.length = 0;
                         appendFragments(d.v.response.fragments);
                     }
@@ -1153,6 +1162,14 @@ async function consumeDeepSeekStream(readable, { onReasoningDone, isClientGone }
                 }
                 if (lastPath === 'response/status' && d.v !== undefined && d.v !== 'FINISHED') {
                     finishReason = d.v;
+                }
+                // Progress BEFORE transition (live-thinking pump): on a combined
+                // THINK+RESPONSE snapshot the pump must emit before onReasoningDone
+                // runs, or the legacy burst fires on an unused pump and the same
+                // thinking emits twice. Value comparison suffices (no identity).
+                if (typeof onReasoningProgress === 'function' && reasoningContent !== lastProgressThink) {
+                    lastProgressThink = reasoningContent;
+                    try { onReasoningProgress(reasoningContent); } catch (e) { }
                 }
                 checkReasoningTransition();
             } catch (e) { }
@@ -2721,6 +2738,86 @@ function emitReasoningPhase(res, apiMode, meta = {}) {
     }
 }
 
+const THINK_LIVE_INTERVAL_MS = 500;
+// Hold-back (C-1): never emit within this many chars of the cumulative
+// frontier. A data: payload completing inside the withheld window would
+// otherwise cross the wire raw (sub-floor) and redact only later.
+// Equals the redactor floor; both redactor passes floor at 64 today, so if
+// those floors ever diverge HOLD must cover the maximum (LOW-4).
+const THINK_HOLD_BACK_CHARS = EMBEDDED_DATA_URL_MIN_LENGTH;
+// Progressive live-thinking pump: emits sanitized+redacted thinking in
+// throttled packets while guaranteeing (a) only strict prefixes of a
+// redacted cumulative cross the wire (revision-safe) and (b) nothing
+// within the hold-back window is emitted (sub-floor-safe). Finish emits
+// the remainder (§finishOpenAIStream top-up).
+function createThinkingPump({ intervalMs = THINK_LIVE_INTERVAL_MS, onEmit, label = '' } = {}) {
+    let sent = '';
+    let lastEmitTs = 0;
+    let startTs = 0;
+    let endTs = 0;
+    // Sticky: once anything has crossed the wire, later re-bases must not
+    // un-claim emission (else the legacy burst re-arms and duplicates).
+    let everEmitted = false;
+    return {
+        push(fullThink, now) {
+            if (!fullThink) return;
+            if (!startTs) startTs = now;
+            endTs = now;
+            let clean;
+            try { clean = redactEmbeddedDataUrls(sanitizeContent(fullThink)); } catch (e) { return; }
+            if (!clean.startsWith(sent)) {
+                // Diverged (upstream revision, or a data: payload completing
+                // past the floor rewrites already-sent bytes): re-base to
+                // the longest common prefix instead of holding forever. The
+                // next push resumes from there; already-shown text may partially
+                // re-appear corrected — bounded, and strictly better than the
+                // old stall-then-full-burst-at-finish. Lengths only in logs
+                // (inLen distinguishes a wiped base from a flipped cumulative).
+                let lcp = 0;
+                const n = Math.min(sent.length, clean.length);
+                while (lcp < n && sent.charCodeAt(lcp) === clean.charCodeAt(lcp)) lcp++;
+                try { console.log(`[think] Live thinking diverged, re-based${label ? ` ${label}` : ''} (in=${fullThink.length}, sent=${sent.length}, clean=${clean.length}, lcp=${lcp})`); } catch (e) { }
+                sent = clean.slice(0, lcp);
+                return;
+            }
+            const frontier = Math.max(sent.length, clean.length - THINK_HOLD_BACK_CHARS);
+            if (frontier <= sent.length) return;
+            if (sent && now - lastEmitTs < intervalMs) return;
+            const tail = clean.slice(sent.length, frontier);
+            sent = clean.slice(0, frontier);
+            lastEmitTs = now;
+            everEmitted = true;
+            // Crash-consistency note: sent advances before res.write, so a
+            // write throw loses this tail (finish tops up from the advanced
+            // sent). Accepted: a throwing socket is a dead turn anyway, and
+            // the alternative (emit-then-record) duplicates on retry.
+            try { onEmit(tail, sent); } catch (e) { }
+        },
+        reset() { sent = ''; lastEmitTs = 0; startTs = 0; endTs = 0; everEmitted = false; },
+        state() { return { sent, phaseMs: startTs ? endTs - startTs : 0, everEmitted, sawThinking: startTs > 0 }; },
+    };
+}
+// MED-1: timing gate reads sawThinking (any thinking observed), NOT whether
+// anything streamed — short held-back thoughts are still timed.
+function shouldLogThinkPhase(thinkState) {
+    return Boolean(thinkState && thinkState.sawThinking);
+}
+// Legacy-burst decision, extracted for unit coverage (Concern-6 re-review).
+// pumpEmittedEver is sticky across re-bases: a full revision rewinds sent
+// but must never re-arm the burst over already-streamed packets.
+function shouldLegacyBurst(mode, pumpEmittedEver, reasoningEmitted) {
+    if (reasoningEmitted) return false;
+    if (mode === 'suppressed') return false;
+    if (mode === 'progressive') return !pumpEmittedEver;
+    return true;
+}
+// MED-4 gate predicate: 'progressive' | 'legacy-burst' | 'suppressed'.
+// The OpenAI+tools row is the feature flip; all other rows are legacy rules.
+function liveThinkingMode(apiMode, toolsOffered) {
+    if (apiMode === 'openai') return 'progressive';
+    return toolsOffered ? 'suppressed' : 'legacy-burst';
+}
+
 function startAnthropicStream(res, meta = {}) {
     if (!res.headersSent) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
@@ -2945,8 +3042,14 @@ function finishOpenAIStream(res, openaiResp, opts = {}) {
         // Runs for text AND tool-call turns: reasoning chunks always precede
         // the tool_calls/content chunks so thinking displays before execution.
         const cleanReasoning = redactEmbeddedDataUrls(msg.reasoning_content);
-        for (let i = 0; i < cleanReasoning.length; i += 50) {
-            const chunk = cleanReasoning.substring(i, i + 50);
+        let tail = cleanReasoning;
+        const liveSent = typeof res._reasoningLiveSent === 'string' ? res._reasoningLiveSent : '';
+        if (liveSent) {
+            if (cleanReasoning.startsWith(liveSent)) tail = cleanReasoning.slice(liveSent.length);
+            else try { console.log(`[think] Live-sent thinking prefix diverged at finish (sent=${liveSent.length}, clean=${cleanReasoning.length}); emitting full reasoning (possible duplicate)`); } catch (e) { }
+        }
+        for (let i = 0; i < tail.length; i += 50) {
+            const chunk = tail.substring(i, i + 50);
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }] })}\n\n`);
         }
     }
@@ -4067,11 +4170,31 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
+            // Cumulative reasoning finalized by prior reads this turn. Progress
+            // fragments are per-read; prepending the base keeps the pump input
+            // cumulative so multi-read turns (continuation/retries) preserve
+            // the prefix invariant instead of rebasing every read (High).
+            // Synced after each read finalizes reasoningContent below.
+            let pumpBase = '';
+            const thinkPump = createThinkingPump({ label: agentTag, onEmit: (tail, sentSoFar) => {
+                if (!stream || clientGone || res.writableEnded || res.destroyed) return;
+                // LOW-6: record per-packet so an exception between emit and the
+                // pre-build backstop cannot orphan the sent prefix.
+                res._reasoningLiveSent = sentSoFar;
+                const id = streamMeta?.id || ('ds-' + Date.now());
+                const created = streamMeta?.created || Math.floor(Date.now() / 1000);
+                const model = streamMeta?.model || requestedModel;
+                for (let i = 0; i < tail.length; i += 50) {
+                    res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: tail.substring(i, i + 50) }, finish_reason: null }] })}\n\n`);
+                }
+            } });
             const readOpts = {
                 onReasoningDone: (reasoning) => {
                     if (!stream || clientGone || res.writableEnded) return;
-                    if (allowedToolNames.size > 0) return; // tool-capable requests: live reasoning suppressed. Finish-phase: OpenAI emits on both tool-call and text turns; Anthropic/Responses emit on text turns and suppress on tool-call turns — see finishOpenAIStream and docs/api-documentation.md
-                    if (res._reasoningEmitted) return;
+                    const mode = liveThinkingMode(apiMode, allowedToolNames.size > 0);
+                    if (!shouldLegacyBurst(mode, thinkPump.state().everEmitted, res._reasoningEmitted)) {
+                        return; // progressive already emitted (even if rebased), suppressed mode, or burst already ran
+                    }
                     res._reasoningEmitted = true;
                     const sanitized = sanitizeContent(reasoning || '');
                     emitReasoningPhase(res, apiMode, {
@@ -4080,6 +4203,18 @@ const server = http.createServer(async (req, res) => {
                         model: streamMeta?.model,
                         reasoningContent: sanitized,
                     });
+                },
+                onReasoningProgress: (thinkText) => {
+                    // Concern-6 freeze: once the legacy burst has fired
+                    // (_reasoningEmitted), the pump stays frozen — later
+                    // thinking is dropped from the stream rather than
+                    // duplicated over the burst prefix. Full text survives
+                    // in the non-stream body. Truncation beats duplication.
+                    if (liveThinkingMode(apiMode, allowedToolNames.size > 0) !== 'progressive' || res._reasoningEmitted || !stream || clientGone || res.writableEnded || res.destroyed) return;
+                    // Cumulative input (High fix): fragments are per-read but the
+                    // handler joins reads with '\n' (continuation append) — mirror
+                    // that join here so the pump prefix tracks the final text.
+                    thinkPump.push(pumpBase ? pumpBase + '\n' + thinkText : thinkText, Date.now());
                 },
             };
 
@@ -4092,6 +4227,7 @@ const server = http.createServer(async (req, res) => {
             async function readDeepSeekResponse(readable, opts = readOpts) {
                 const resResult = await consumeDeepSeekStream(readable, {
                     onReasoningDone: opts.onReasoningDone,
+                    onReasoningProgress: opts.onReasoningProgress,
                     isClientGone: () => clientGone,
                 });
                 if (resResult.abandoned) return resResult;
@@ -4113,6 +4249,7 @@ const server = http.createServer(async (req, res) => {
             if (abandoned || clientGone) return;
             fullContent = sanitizeContent(fullContent);
             reasoningContent = sanitizeContent(reasoningContent || '');
+            pumpBase = reasoningContent; // cumulative base for later reads' progress (§High fix)
             const elapsed = Date.now() - startTime;
             console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
 
@@ -4157,11 +4294,13 @@ const server = http.createServer(async (req, res) => {
                 initialCall = await askDeepSeekStream(migrationBuild.prompt, agentId, requestedModel, migrationBuild.prompt);
                 console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): rate-limit`);
                 dsResp = initialCall.resp;
+                thinkPump.reset(); // BEFORE the read: new remote chat; the dead attempt's prefix must not suppress the fresh attempt
                 const migratedResult = await readDeepSeekResponse(dsResp.body);
                 if (migratedResult.abandoned || clientGone) return;
                 const migratedState = normalizeRetryResponse(migratedResult);
                 fullContent = migratedState.content;
                 reasoningContent = migratedState.reasoningContent;
+                pumpBase = reasoningContent; // new attempt supersedes; base tracks it
                 finishReason = migratedState.finishReason;
                 modelError = migratedState.modelError;
             }
@@ -4207,6 +4346,7 @@ const server = http.createServer(async (req, res) => {
                     console.log(`${agentTag} Retry ${retryAttempt} succeeded`);
                     fullContent = retryState.content;
                     reasoningContent = retryState.reasoningContent;
+                    pumpBase = reasoningContent; // retry replaces: base tracks the new attempt
                 }
             }
 
@@ -4281,6 +4421,7 @@ const server = http.createServer(async (req, res) => {
                 if (contContent && contContent.trim().length > 0 && !contContent.includes('I am an AI')) {
                     fullContent += '\n' + contContent;
                     if (contReasoning) reasoningContent += (reasoningContent ? '\n' : '') + contReasoning;
+                    pumpBase = reasoningContent; // continuation appends: base stays cumulative
                     finishReason = contResult.finishReason;
                     console.log(`${agentTag} Continuation added ${contContent.length} chars (total: ${fullContent.length})`);
                 } else {
@@ -4380,17 +4521,20 @@ const server = http.createServer(async (req, res) => {
                             console.log(`${agentTag} Retry with strict prompt succeeded: ${retryTc.name} (attempt: ${succeededAttempt})`);
                             fullContent = retryContent2;
                             reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
+                            pumpBase = reasoningContent; // retry replaces: base tracks the new attempt
                             toolCall = retryTc;
                             clearRepairGuard(session, repairHash);
                         } else if (!retryTc && !looksLikeToolCallMarkup(retryContent2)) {
                             console.log(`${agentTag} Retry produced clean text response (${retryContent2.length} chars). Recovered from malformed turn.`);
                             fullContent = retryContent2;
                             reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
+                            pumpBase = reasoningContent; // retry replaces: base tracks the new attempt
                             toolCall = null;
                             clearRepairGuard(session, repairHash);
                         } else {
                             console.log(`${agentTag} Retry still has broken tool markup: ${retryContent2.substring(0, 160)}. Returning a safe error instead of leaking it as text.`);
                             reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : reasoningContent;
+                            pumpBase = reasoningContent; // retry replaces: base tracks the new attempt
                         }
                     }
                 }
@@ -4450,6 +4594,20 @@ const server = http.createServer(async (req, res) => {
 
             storeHistory(agentId, stripShellReminder(prompt, shellReminder), fullContent, toolCall);
 
+            const thinkState = thinkPump.state();
+            // Backstop: onEmit already records per-packet (LOW-6); this covers
+            // zero-emit turns (sent stays '') and any path that skipped onEmit.
+            // Authoritative writer: this must stay the LAST write to
+            // res._reasoningLiveSent before the build — reset() clears pump
+            // state only, so removing or reordering this line would let a
+            // post-migration turn compare fresh reasoning against a dead
+            // attempt's prefix (LOW-D).
+            res._reasoningLiveSent = thinkState.sent;
+            // MED-1: gate timing on sawThinking — a short
+            // thought (< ~64 new chars) never emits (hold-back) but was still
+            // thought; its phase time must still be logged.
+            if (shouldLogThinkPhase(thinkState)) res._thinkPhaseMs = thinkState.phaseMs;
+
             const openaiResponse = toolCall
                 ? buildToolCallResponse(toolCall, requestedModel, clientPromptText, reasoningContent)
                 : buildTextResponse(fullContent, clientPromptText, requestedModel, reasoningContent, finishReason);
@@ -4467,7 +4625,7 @@ const server = http.createServer(async (req, res) => {
                 } else {
                     finishOpenAIStream(res, openaiResponse, streamOpts);
                 }
-                console.log(`${agentTag} Streamed ${apiMode} (tool=${!!toolCall}) in ${Date.now() - startTime}ms`);
+                console.log(`${agentTag} Streamed ${apiMode} (tool=${!!toolCall}) in ${Date.now() - startTime}ms${res._thinkPhaseMs !== undefined ? ` (think ${res._thinkPhaseMs}ms)` : ''}`);
             } else {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 if (apiMode === 'anthropic') {
@@ -4477,7 +4635,7 @@ const server = http.createServer(async (req, res) => {
                 } else {
                     res.end(JSON.stringify(openaiResponse));
                 }
-                console.log(`${agentTag} Response ${apiMode} (tool=${!!toolCall}, ${Date.now() - startTime}ms, ${fullContent.length} chars)`);
+                console.log(`${agentTag} Response ${apiMode} (tool=${!!toolCall}, ${Date.now() - startTime}ms, ${fullContent.length} chars${res._thinkPhaseMs !== undefined ? `, think ${res._thinkPhaseMs}ms` : ''})`);
             }
         } catch (e) {
             console.log('[DS-API] Error:', (e && e.stack) || (e && e.message) || e);
@@ -4740,6 +4898,12 @@ module.exports = {
         startKeepAlive,
         clearKeepAlive,
         emitReasoningPhase,
+        createThinkingPump,
+        liveThinkingMode,
+        shouldLegacyBurst,
+        shouldLogThinkPhase,
+        THINK_LIVE_INTERVAL_MS,
+        THINK_HOLD_BACK_CHARS,
         consumeDeepSeekStream,
         writeSse,
         sendAnthropicStream,
