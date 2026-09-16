@@ -1478,7 +1478,10 @@ function localShellName() {
 function shellReminderLine() {
     const shell = localShellName();
     if (!shell) return '';
-    return `[SHELL: operator console uses ${shell} (Linux) — write ${shell}-compatible commands, no bash-isms.]`;
+    // Compact by design: this rides every suffix-only turn, so one short
+    // paragraph covers both shell compat and tool-call discipline.
+    return `[SHELL: operator console uses ${shell} — write ${shell}-compatible commands, no bash-isms. ` +
+        `Tool discipline: prefer read/edit/grep/glob over bash; batch independent calls in one block; no prose alongside tool calls (thinking OK); keep call count tight.]`;
 }
 
 function formatToolDefinitions(tools) {
