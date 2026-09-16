@@ -39,6 +39,12 @@ function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
     return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
 }
 
+// Log verbosity: DEEPSEEK_LOG_LEVEL=debug enables per-pick score breakdowns and
+// stage timings. Default info. Anything else falls back to info.
+const LOG_LEVELS = { debug: 0, info: 1 };
+const LOG_THRESHOLD = LOG_LEVELS[String(process.env.DEEPSEEK_LOG_LEVEL || 'info').trim().toLowerCase()] ?? 1;
+function logDebug(...args) { if (LOG_THRESHOLD <= 0) console.log(...args); }
+
 
 const FORGETMEAI_WATERMARK = 't.me/forgetmeai';
 // Validated like every other numeric env: PORT=garbage used to yield NaN and
@@ -411,7 +417,7 @@ function accountStatus(account) {
         last_used_at: account.lastUsedAt || null,
     };
 }
-function selectAccountForSession(session) {
+function selectAccountForSession(session, sessionKey = '') {
     const now = Date.now();
     if (session.accountId) {
         const sticky = accounts.find(a => a.id === session.accountId);
@@ -458,7 +464,11 @@ function selectAccountForSession(session) {
         noAuth.status = 503; noAuth.type = 'no_auth';
         throw noAuth;
     }
-    const account = selectFreshAccount(ready);
+    const detail = selectFreshAccountDetail(ready, sessionKey);
+    const account = detail.account;
+    if (detail.mode !== 'scored') {
+        logDebug(`[session:${logToken(sessionKey)}] pick acct:${account.id} mode=${detail.mode} from ${ready.length} ready (no scoring)`);
+    }
     session.accountId = account.id;
     persistSessions();
     return account;
@@ -495,18 +505,49 @@ function effectiveFailures(account, nowMs = Date.now()) {
     if (age <= 0) return raw;
     return raw * Math.pow(0.5, age / half);
 }
-function scoreAccount(account, hostedCount = 0, nowMs = Date.now()) {
+function isPreferredAccount(account) {
+    const preferred = (process.env.DEEPSEEK_PREFERRED_ACCOUNT || '').trim();
+    return !!preferred && !!account && account.id === preferred;
+}
+function isHotAccount(account, nowMs) {
+    const lastOk = Number(account?.lastSuccessAt) || 0;
+    const okAge = nowMs - lastOk;
+    return ROUTING_HOT_BONUS > 0 && lastOk > 0 && okAge >= 0 && okAge <= ROUTING_HOT_WINDOW_MS;
+}
+function scoreBase(account, hostedCount = 0, nowMs = Date.now()) {
     const inflight = Number(account?.inflight) || 0;
     const failures = effectiveFailures(account, nowMs);
     const timeouts = Number(account?.consecutiveTimeouts) || 0;
     const hosted = Math.min(Math.max(Number(hostedCount) || 0, 0), 8);
-    const preferred = (process.env.DEEPSEEK_PREFERRED_ACCOUNT || '').trim();
-    const isPreferred = !!preferred && !!account && account.id === preferred;
-    let score = 10 * inflight + ROUTING_FAILURE_WEIGHT * failures + ROUTING_TIMEOUT_WEIGHT * timeouts - hosted - (isPreferred ? 5 : 0);
-    const lastOk = Number(account?.lastSuccessAt) || 0;
-    const okAge = nowMs - lastOk;
-    if (ROUTING_HOT_BONUS > 0 && lastOk > 0 && okAge >= 0 && okAge <= ROUTING_HOT_WINDOW_MS) score -= ROUTING_HOT_BONUS;
-    return score + Math.random();
+    let score = 10 * inflight + ROUTING_FAILURE_WEIGHT * failures + ROUTING_TIMEOUT_WEIGHT * timeouts - hosted - (isPreferredAccount(account) ? 5 : 0);
+    if (isHotAccount(account, nowMs)) score -= ROUTING_HOT_BONUS;
+    return score;
+}
+function scoreAccount(account, hostedCount = 0, nowMs = Date.now()) {
+    return scoreBase(account, hostedCount, nowMs) + Math.random();
+}
+// Same terms as scoreBase, reported for observability. Single-sourced via the
+// shared isPreferredAccount/isHotAccount/effectiveFailures helpers —
+// scoreBase and scoreBreakdown cannot drift apart.
+function scoreBreakdown(account, hostedCount = 0, nowMs = Date.now()) {
+    const raw = Math.max(0, Number(account?.failures) || 0);
+    const hosted = Math.min(Math.max(Number(hostedCount) || 0, 0), 8);
+    return {
+        base: scoreBase(account, hostedCount, nowMs),
+        inflight: Number(account?.inflight) || 0,
+        failuresRaw: raw,
+        failuresEff: effectiveFailures(account, nowMs),
+        timeouts: Number(account?.consecutiveTimeouts) || 0,
+        hosted,
+        preferred: isPreferredAccount(account),
+        hot: isHotAccount(account, nowMs),
+    };
+}
+// Sanitize client-influenced values before log interpolation: newline and
+// control characters forge journal lines. Hot-path logic keeps raw values;
+// only new log lines use this.
+function logToken(value) {
+    return String(value ?? '').replace(/[^A-Za-z0-9_.:#/-]/g, '_').slice(0, 80);
 }
 function isPreferredRoutingMode() {
     return (process.env.DEEPSEEK_ROUTING_MODE || '').trim().toLowerCase() === 'preferred';
@@ -530,6 +571,9 @@ function countActiveHosted(accountId, nowMs = Date.now()) {
 // Score-min pick over ready candidates using active session-host counts.
 // Shared by fresh-chat selection (default mode) and rate-limit migration
 // (always — migration must never re-impose preferred-monopoly).
+// Returns { winner, score, nowMs }: score is the exact jittered value that won,
+// nowMs the timestamp shared by all candidates, so callers can log the decision
+// truthfully without re-sampling time or sessions.
 function pickLowestScoredAccount(candidates, nowMs = Date.now()) {
     let best = Infinity;
     let winner = null;
@@ -537,10 +581,15 @@ function pickLowestScoredAccount(candidates, nowMs = Date.now()) {
         const score = scoreAccount(candidate, countActiveHosted(candidate.id, nowMs), nowMs);
         if (score < best) { best = score; winner = candidate; }
     }
-    return winner;
+    return { winner, score: best, nowMs };
 }
-function selectFreshAccount(ready) {
-    if (ready.length === 1) return ready[0];
+// One debug line per scored decision. bd comes from scoreBreakdown with the
+// pick's own nowMs — never recomputed.
+function logScoredPick(tag, account, hosted, pick, bd, readyCount) {
+    logDebug(`${tag} pick acct:${account.id} score=${pick.score.toFixed(2)} base=${bd.base.toFixed(2)} (fail ${bd.failuresEff.toFixed(2)}/${bd.failuresRaw}, timeouts ${bd.timeouts}, hosted ${hosted}, preferred ${bd.preferred ? 'y' : 'n'}, hot ${bd.hot ? 'y' : 'n'}) from ${readyCount} ready`);
+}
+function selectFreshAccountDetail(ready, sessionKey = '') {
+    if (ready.length === 1) return { account: ready[0], mode: 'single' };
     // Escape hatch (brief §2): DEEPSEEK_ROUTING_MODE=preferred restores
     // today's exact behavior. Default when unset: score-based selection.
     // Asymmetry note (deliberate): the decay fix (countActiveHosted) applies
@@ -552,7 +601,7 @@ function selectFreshAccount(ready) {
         const preferred = (process.env.DEEPSEEK_PREFERRED_ACCOUNT || '').trim();
         if (preferred) {
             const pick = ready.find(a => a.id === preferred);
-            if (pick) return pick;
+            if (pick) return { account: pick, mode: 'preferred' };
         }
         const hosted = new Map();
         for (const [, s] of sessions) {
@@ -570,10 +619,18 @@ function selectFreshAccount(ready) {
         if (best === 0) {
             winner = ready[accountRoundRobin % ready.length];
             accountRoundRobin++;
+            return { account: winner, mode: 'preferred-rr' };
         }
-        return winner;
+        return { account: winner, mode: 'preferred-home' };
     }
-    return pickLowestScoredAccount(ready);
+    const pick = pickLowestScoredAccount(ready);
+    const hosted = countActiveHosted(pick.winner.id, pick.nowMs);
+    const bd = scoreBreakdown(pick.winner, hosted, pick.nowMs);
+    logScoredPick(`[session:${logToken(sessionKey)}]`, pick.winner, hosted, pick, bd, ready.length);
+    return { account: pick.winner, mode: 'scored', score: pick.score, breakdown: bd };
+}
+function selectFreshAccount(ready) {
+    return selectFreshAccountDetail(ready).account;
 }
 // Parse a Retry-After header value into a cooldown duration in ms, or null if
 // absent/unparseable. Supports both forms: delta-seconds (e.g. "120") and an
@@ -1274,7 +1331,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
     const hadRemoteSession = Boolean(session.id);
-    const account = selectAccountForSession(session);
+    const account = selectAccountForSession(session, agentId);
     const dsHeaders = account.headers;
     account.lastUsedAt = Date.now();
     // Per-account load signal (brief §2): incremented when an upstream call
@@ -1334,6 +1391,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     // whole single-process server. No blind cap (normal difficulty unknown);
     // log slow solves so a future worker-threads move has real data (6c).
     if (powMs > 5000) console.log(`[account:${account.id}] slow PoW solve: ${powMs}ms (difficulty ${challenge.difficulty})`);
+    logDebug(`[account:${account.id}] PoW solve: ${powMs}ms (difficulty ${challenge.difficulty})`);
 
     if (!session.id) {
         const sr = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
@@ -3502,8 +3560,14 @@ function resolveRateLimitMigration(session, accountList, alreadyMigrated = false
     // Smart routing (brief §2): score-min over the ready peers via the same
     // scorer — never selectFreshAccount, which would re-impose
     // preferred-monopoly. Single-peer shortcut stays.
-    const pick = others.length === 1 ? others[0] : pickLowestScoredAccount(others);
-    return { migrateTo: pick.id };
+    if (others.length === 1) {
+        logDebug(`migrate acct:${session ? session.accountId : 'none'} -> acct:${others[0].id} mode=single (no scoring)`);
+        return { migrateTo: others[0].id };
+    }
+    const pick = pickLowestScoredAccount(others, now);
+    const hosted = countActiveHosted(pick.winner.id, pick.nowMs);
+    logScoredPick('migrate', pick.winner, hosted, pick, scoreBreakdown(pick.winner, hosted, pick.nowMs), others.length);
+    return { migrateTo: pick.winner.id };
 }
 
 // SSE-embedded throttling cooling (brief §4): a 429-equivalent via the
@@ -4095,6 +4159,7 @@ const server = http.createServer(async (req, res) => {
 
             const session = getOrCreateAgentSession(agentId);
             activeSession = session;
+            console.log(`[${logToken(agentId)}] -> model=${logToken(requestedModel)} stream=${stream === true} api=${apiMode} sess=${session.id ? `chat#${session.messageCount}/acct:${session.accountId || 'none'}` : 'new'}`);
 
             // Rollover retired per implementor-brief-no-new-chats-2026-09-15.
             const promptRollover = null;
@@ -4326,7 +4391,7 @@ const server = http.createServer(async (req, res) => {
             reasoningContent = sanitizeContent(reasoningContent || '');
             pumpBase = reasoningContent; // cumulative base for later reads' progress (§High fix)
             const elapsed = Date.now() - startTime;
-            console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount})`);
+            console.log(`${agentTag} Got ${fullContent.length} chars (+${reasoningContent.length} reasoning chars) in ${elapsed}ms (msg#${session.messageCount}) acct:${initialCall.account?.id ?? 'none'} finish=${finishReason ?? 'none'}`);
 
             // SSE-embedded throttling (brief §3+§4): an SSE error event
             // carrying throttling text cools the degraded account (HTTP 429
@@ -4956,8 +5021,12 @@ module.exports = {
         accounts,
         selectAccountForSession,
         selectFreshAccount,
+        selectFreshAccountDetail,
         scoreAccount,
+        scoreBase,
         effectiveFailures,
+        scoreBreakdown,
+        logToken,
         countActiveHosted,
         accountStatus,
         askDeepSeekStream,

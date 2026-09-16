@@ -2748,6 +2748,48 @@ test('smart routing: recent success wins near-ties but never outruns real failur
   }
 });
 
+test('logging: scoreBase is deterministic and scoreAccount adds only jitter', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const acct = { id: 'sr-base', inflight: 1, failures: 2, consecutiveTimeouts: 1 };
+  const b1 = serverInternals.scoreBase(acct, 3);
+  const b2 = serverInternals.scoreBase(acct, 3);
+  assert.equal(b1, b2, 'no randomness in the base');
+  for (let i = 0; i < 20; i++) {
+    const s = serverInternals.scoreAccount(acct, 3);
+    assert.ok(s >= b1 && s < b1 + 1, `jitter out of [base, base+1): ${s} vs ${b1}`);
+  }
+});
+
+test('logging: scoreBreakdown reports the exact scorer components', (t) => {
+  saveRoutingEnv(t);
+  // Scorer reads the preferred env at call time: isolate it.
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  // NOTE: pins default-weight math (ROUTING_* knobs are load-time consts).
+  const now = Date.now();
+  const acct = { id: 'sr-bd', inflight: 1, failures: 4, consecutiveTimeouts: 2, lastFailureAt: now };
+  const bd = serverInternals.scoreBreakdown(acct, 3, now);
+  assert.equal(bd.failuresEff, 4, 'fresh failures apply in full (exact integer, no approx)');
+  assert.equal(bd.failuresRaw, 4);
+  assert.equal(bd.timeouts, 2);
+  assert.equal(bd.inflight, 1);
+  assert.equal(bd.hosted, 3);
+  assert.equal(bd.preferred, false);
+  assert.equal(bd.hot, false);
+  assert.equal(bd.base, 10 + 4 * 4 + 12 * 2 - 3);
+});
+
+test('logging: logToken strips log-forging characters and caps length', () => {
+  assert.equal(serverInternals.logToken('dev-agent'), 'dev-agent');
+  assert.equal(serverInternals.logToken('a\nb\r\x1bc[d'), 'a_b__c_d');
+  assert.equal(serverInternals.logToken('deepseek-chat'), 'deepseek-chat');
+  assert.equal(serverInternals.logToken(null), '');
+  assert.equal(serverInternals.logToken(undefined), '');
+  assert.equal(serverInternals.logToken('x'.repeat(200)).length, 80);
+});
+
 test('smart routing: scoreAccount clamps hostedCount into [0,8]', (t) => {  saveRoutingEnv(t);
   delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
   delete process.env.DEEPSEEK_ROUTING_MODE;
