@@ -383,6 +383,45 @@ async function readPageAuth(cdp) {
         cookiesCount: cookies.length,
     };
 }
+// Success-path writer (§12): tmp created with 0o600 then rename (rename
+// preserves the tmp mode — chmod-after-rename leaves a world-readable
+// window). One .bak, written ONLY on success just before overwrite, and only
+// when the existing file actually holds a token: if the existing file is
+// already empty/corrupt there is nothing worth backing up (a stale .bak from
+// an earlier success still preserves the last good state — inspect the .bak
+// before restoring it).
+function persistAuthResult(outPath, persisted) {
+    let existing = null;
+    try {
+        existing = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+    } catch (e) {
+        /* fresh install: nothing to back up */
+    }
+    if (existing && existing.token) {
+        try {
+            fs.copyFileSync(outPath, `${outPath}.bak`);
+        } catch (e) {
+            /* best effort */
+        }
+    }
+    const tmp = `${outPath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+    if (process.platform !== 'win32') {
+        try {
+            fs.chmodSync(tmp, 0o600);
+        } catch (e) {
+            /* ignore */
+        }
+    }
+    fs.renameSync(tmp, outPath);
+}
+
+// Guard rule (§12): a run counts as successful only with a non-null auth
+// object carrying BOTH token and cookie. Tested directly; main() returns
+// early (leaving file + .bak untouched) when this is false.
+function validatePageAuth(auth) {
+    return Boolean(auth && auth.token && auth.cookie);
+}
 function chromeInstallHelp(missingPath) {
     return `Chrome/Chrome for Testing not found${missingPath ? `: ${missingPath}` : ''}.
 
@@ -468,11 +507,24 @@ async function main() {
         if (auth.token && auth.cookie) break;
         await sleep(500);
     }
-    const { href, cookiesCount, ...persisted } = auth;
-    fs.writeFileSync(outPath, JSON.stringify(persisted, null, 2), { mode: 0o600 });
-    if (process.platform !== 'win32') {
-        try { fs.chmodSync(outPath, 0o600); } catch (e) { /* ignore */ }
+    // §12 guard BEFORE destructure: `const {...} = auth` throws on null, and
+    // the old unconditional write CLOBBERED a good auth file with an empty
+    // token when ENTER was pressed before login completed. Failed runs touch
+    // neither the auth file nor the .bak.
+    if (!validatePageAuth(auth)) {
+        try {
+            cdp.close();
+        } catch (e) {
+            /* ignore */
+        }
+        console.error(
+            '[auth] Login incomplete (token or cookie missing); existing auth file left untouched.',
+        );
+        process.exitCode = 2;
+        return;
     }
+    const { href, cookiesCount, ...persisted } = auth;
+    persistAuthResult(outPath, persisted);
     console.log(`[auth] Saved: ${outPath}`);
     console.log(`[auth] page: ${href || 'unknown'}`);
     console.log(
@@ -487,7 +539,11 @@ async function main() {
     cdp.close();
     if (!persisted.token || !persisted.cookie) process.exitCode = 2;
 }
-main().catch((e) => {
-    console.error('[auth] ERROR:', e);
-    process.exit(1);
-});
+if (require.main === module) {
+    main().catch((e) => {
+        console.error('[auth] ERROR:', e);
+        process.exit(1);
+    });
+}
+
+module.exports = { persistAuthResult, validatePageAuth };

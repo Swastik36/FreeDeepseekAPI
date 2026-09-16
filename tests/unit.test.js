@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -14,6 +15,79 @@ process.env.DEEPSEEK_SESSION_STORE = path.join(
   'sessions.json'
 );
 const serverInternals = require('../server.js').__test;
+const testServer = require('../server.js').server;
+
+// Live-HTTP helpers (bug-hunt 2026-09-16 regressions): drive the real server
+// on an ephemeral loopback port. Requests that pass the body gates but need
+// an upstream account fail fast with 503 no_auth (no network touched).
+function listenEphemeral() {
+  return new Promise((resolve, reject) => {
+    testServer.listen(0, '127.0.0.1', (err) => {
+      if (err) return reject(err);
+      resolve(testServer.address().port);
+    });
+  });
+}
+function closeServer() {
+  return new Promise((resolve) => {
+    try { testServer.closeAllConnections(); } catch (e) { /* old node */ }
+    testServer.close(() => resolve());
+  });
+}
+async function withServer(fn) {
+  const port = await listenEphemeral();
+  try { await fn(port); } finally { await closeServer(); }
+}
+function authHeaders() {
+  return process.env.PROXY_API_KEY ? { Authorization: `Bearer ${process.env.PROXY_API_KEY}` } : {};
+}
+function post(port, urlPath, body, headers = {}) {
+  const data = typeof body === 'string' ? body : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: urlPath, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), ...authHeaders(), ...headers } },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+    req.on('error', reject);
+    req.end(data);
+  });
+}
+// Trickled body: headers + partial chunk arrive first; beforeEnd() runs (e.g.
+// raising in-flight pressure) before the body completes — exercises the
+// body-end backpressure re-check deterministically.
+function tricklePost(port, beforeEnd, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked', ...authHeaders(), ...headers } },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+    req.on('error', reject);
+    req.write('{"model":"deepseek-chat","messages":[{');
+    setTimeout(async () => {
+      try { await beforeEnd(); } catch (e) { /* ignore */ }
+      req.end('"role":"user","content":"hi"}]}');
+    }, 50);
+  });
+}
+async function pollFor(fn, timeoutMs = 2000) {
+  const start = Date.now();
+  for (;;) {
+    if (fn()) return true;
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+function snapshotSessions() { return Array.from(serverInternals.sessions.entries()); }
+function restoreSessionsFrom(saved) {
+  serverInternals.sessions.clear();
+  for (const [k, v] of saved) serverInternals.sessions.set(k, v);
+}
 
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-test-'));
@@ -1331,12 +1405,17 @@ test('extractScreenshotPaths sees array-content text parts', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-media-'));
   const shot = path.join(dir, 'shot.png');
   fs.writeFileSync(shot, 'x');
+  // C3 containment: only paths under DEEPSEEK_MEDIA_ROOT are honored.
+  const prevRoot = process.env.DEEPSEEK_MEDIA_ROOT;
+  process.env.DEEPSEEK_MEDIA_ROOT = dir;
   try {
     const paths = serverInternals.extractScreenshotPaths([
       { role: 'user', content: [{ type: 'text', text: `see ${shot} please` }] },
     ]);
     assert.ok(paths.includes(`MEDIA:${shot}`), `expected MEDIA tag, got ${JSON.stringify(paths)}`);
   } finally {
+    if (prevRoot === undefined) delete process.env.DEEPSEEK_MEDIA_ROOT;
+    else process.env.DEEPSEEK_MEDIA_ROOT = prevRoot;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -3213,4 +3292,492 @@ test('B5K M4: zero-copy benign / clone-on-hit contracts', () => {
   // Responses benign byte-identity (value-level; rebuilds messages by design).
   const rp = serverInternals.normalizeApiParams({ input: 'hello', instructions: 'sys hi' }, 'responses');
   assert.deepEqual(rp.messages.map((m) => m.content), ['sys hi', 'hello']);
+});
+
+// === Bug-hunt survivors 2026-09-16 (§1-§10, §12, C1/C2b/C3/H2/H3/M1/H1) ===
+
+test('§1 session sanitize: 64-char cap, strict charset, rejects to fallback', () => {
+  const T = serverInternals;
+  assert.equal(T.MAX_SESSIONS, 500);
+  assert.equal(T.sanitizeSessionId('  abc-123_._X  '), 'abc-123_._X');
+  assert.equal(T.sanitizeSessionId('a'.repeat(100)).length, 64);
+  for (const bad of ['', '   ', 'has space', 'semi;colon', 'a/b', 'data:text/plain,AAA', 'uniçode', 'a:b']) {
+    assert.equal(T.sanitizeSessionId(bad), '', `must reject ${JSON.stringify(bad)}`);
+  }
+  assert.equal(T.sanitizeSessionId(null), '');
+  assert.equal(T.sanitizeSessionId(undefined), '');
+});
+
+test('§1 session cap: 429 past MAX_SESSIONS over HTTP, existing key unaffected', async () => {
+  const T = serverInternals;
+  const saved = snapshotSessions();
+  const prevKey = process.env.PROXY_API_KEY;
+  process.env.PROXY_API_KEY = 'http-test-key';
+  try {
+    const principal = T.principalForRequest('Bearer http-test-key', 'http-test-key');
+    assert.match(principal, /^[0-9a-f]{16}$/);
+    await withServer(async (port) => {
+      T.sessions.clear();
+      for (let i = 0; i < T.MAX_SESSIONS; i++) T.sessions.set(`${principal}:fill-${i}`, T.createSession());
+      const fresh = await post(port, '/v1/chat/completions',
+        { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] },
+        { 'x-agent-session': 'brand-new-key' });
+      assert.equal(fresh.status, 429, `new key past cap must 429, got ${fresh.status}`);
+      assert.match(fresh.body, /session_limit/);
+      assert.equal(fresh.headers['retry-after'], '60');
+      // Existing key sails past the gate (503 no_auth proves it reached upstream select).
+      const known = await post(port, '/v1/chat/completions',
+        { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] },
+        { 'x-agent-session': 'fill-0' });
+      assert.equal(known.status, 503, `existing key must pass gate, got ${known.status}`);
+      assert.equal(T.getInFlightCount(), 0, 'inFlight leaked');
+    });
+  } finally {
+    restoreSessionsFrom(saved);
+    if (prevKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = prevKey;
+  }
+});
+
+test('§2 tool names redacted at intake, persist, render; benign unchanged', () => {
+  const T = serverInternals;
+  const poison = `data:text/plain;base64,${'A'.repeat(100)}`;
+  const rp = T.normalizeResponsesInput(
+    [{ type: 'function_call', call_id: 'c1', name: poison, arguments: '{}' }]);
+  assert.ok(!JSON.stringify(rp).includes('A'.repeat(10)), 'responses intake name leak');
+  const ap = T.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: poison, input: {} }] }] },
+    'anthropic');
+  assert.ok(!JSON.stringify(ap).includes('A'.repeat(10)), 'anthropic native name leak');
+  const ao = T.normalizeApiParams(
+    { messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: poison, arguments: '{}' } }] }] },
+    'anthropic');
+  assert.ok(!JSON.stringify(ao).includes('A'.repeat(10)), 'anthropic openai-style name leak');
+  // Render covers pre-patch .sessions.json entries verbatim.
+  const fm = T.formatMessages(
+    [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: poison, arguments: '{}' } }] }], []);
+  assert.ok(!fm.prompt.includes('A'.repeat(10)), 'render name leak');
+  // Persisted history entry clean after a poisoned-name turn.
+  const saved = snapshotSessions();
+  try {
+    T.storeHistory('§2-agent', 'prompt', 'content', { name: poison, arguments: '{}' });
+    const hist = T.sessions.get('§2-agent').history;
+    assert.ok(hist.length > 0 && !JSON.stringify(hist).includes('A'.repeat(10)), 'persisted name leak');
+  } finally {
+    restoreSessionsFrom(saved);
+  }
+  // Benign names byte-identical.
+  for (const n of ['read', 'bash', 'read_file', 'unknown']) assert.equal(T.redactToolName(n), n);
+  const benign = T.normalizeResponsesInput(
+    [{ type: 'function_call', call_id: 'c1', name: 'read', arguments: '{}' }]);
+  assert.equal(benign[0].tool_calls[0].function.name, 'read');
+});
+
+test('§3 recovery prefix redacts data-URLs, benign history byte-identical', () => {
+  const T = serverInternals;
+  const url = `data:image/png;base64,${'A'.repeat(100)}`;
+  const out = T.buildRecoveryHistoryPrefix([{ user: `u ${url}`, assistant: `a ${url}` }]);
+  assert.ok(!out.includes('A'.repeat(20)), 'recovery prefix leak');
+  assert.ok(out.includes('<omitted>'), 'omission marker missing');
+  assert.equal(T.buildRecoveryHistoryPrefix([{ user: 'hello', assistant: 'world' }]),
+    '[Previous conversation]\nUser: hello\nAssistant: world\n\n[Continue from here]\n\n');
+});
+
+test('§4 non-base64 data-URLs redacted; short bodies and prose pass', () => {
+  const T = serverInternals;
+  const o1 = T.normalizeMessageContent(`a data:text/plain,${'A'.repeat(100)} b`);
+  assert.ok(!o1.includes('A'.repeat(20)) && o1.includes('<omitted>'), 'text/plain leak');
+  assert.ok(o1.startsWith('a ') && o1.endsWith(' b'), 'prose lost');
+  assert.ok(!T.normalizeMessageContent(`x data:,${'B'.repeat(80)} y`).includes('B'.repeat(20)), 'bare data: leak');
+  // 64+ %XX triplets fail closed by design, even pure %20 padding.
+  assert.ok(!T.normalizeMessageContent(`p data:text/plain,${'%20'.repeat(70)} q`).includes('%20'.repeat(5)), '%XX exfil leak');
+  // Short bodies + normal prose pass through.
+  assert.equal(T.normalizeMessageContent('data:text/plain,hello'), 'data:text/plain,hello');
+  assert.equal(T.normalizeMessageContent('see ?x=data:foo bar'), 'see ?x=data:foo bar');
+  assert.equal(T.normalizeMessageContent('normal spaced prose with no urls'), 'normal spaced prose with no urls');
+});
+
+test('§5 base64url alphabet redacted incl. carryover; hyphen prose intact under floor', () => {
+  const T = serverInternals;
+  const o = T.redactEmbeddedDataUrls(`a data:image/png;base64,${'AB-_'.repeat(30)} b`);
+  assert.ok(!o.includes('AB-_'.repeat(5)), 'base64url leak');
+  assert.ok(o.includes('data:image/png;base64,<omitted>'), 'marker missing');
+  assert.ok(!T.redactEmbeddedDataUrls(`m data:image/png;base64,${'AB+/=_-'.repeat(20)} n`).includes('AB+/=_-'.repeat(3)), 'mixed alphabet leak');
+  // Carryover tail in base64url alphabet.
+  const carry = T.normalizeMessageContent([
+    { type: 'text', text: `a data:image/png;base64,${'AB-_'.repeat(20)}` },
+    { type: 'text', text: `${'CD-_'.repeat(20)} b` },
+  ]);
+  assert.ok(!carry.includes('AB-_'.repeat(5)) && !carry.includes('CD-_'.repeat(5)), 'base64url carryover leak');
+  // Regression: real header + short payload + hyphen/underscore prose stays intact.
+  const prose = `see data:image/png;base64,${'A'.repeat(10)} well-known _private -stuff here`;
+  assert.equal(T.redactEmbeddedDataUrls(prose), prose);
+});
+
+test('§6 oversized body gets immediate 413 (no hang), byte-counted', async () => {
+  const T = serverInternals;
+  const prevKey = process.env.PROXY_API_KEY;
+  delete process.env.PROXY_API_KEY;
+  // Chunked sender: writes 256KB slices until the server answers, then stops.
+  // A single 11MB req.end() races the server's mid-upload destroy
+  // (ECONNRESET masks the 413); trickling models a real client and lets the
+  // documented 413 arrive. Post-resolve write errors are no-ops.
+  const postChunked = (port, slice, slices) => new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    const done = (fn) => (v) => { if (!settled) { settled = true; if (timer) clearInterval(timer); fn(v); } };
+    const ok = done(resolve), fail = done(reject);
+    const req = http.request({ host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked', ...authHeaders() } },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => ok({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+    req.on('error', fail);
+    let sent = 0;
+    timer = setInterval(() => {
+      if (sent >= slices) { clearInterval(timer); try { req.end(); } catch (e) { /* server already answered */ } return; }
+      sent++;
+      try { req.write(slice); } catch (e) { /* server destroyed mid-upload; response in flight */ }
+    }, 5);
+  });
+  try {
+    await withServer(async (port) => {
+      const r = await postChunked(port, 'x'.repeat(256 * 1024), 44); // ~11MB
+      assert.equal(r.status, 413, `expected 413, got ${r.status}`);
+      assert.match(r.body, /payload_too_large/);
+      // Multibyte: 6M chars but 12M bytes — char counting would pass, bytes must 413.
+      const r2 = await postChunked(port, 'é'.repeat(256 * 1024), 24); // ~12MB on the wire
+      assert.equal(r2.status, 413, `multibyte body must 413, got ${r2.status}`);
+      assert.equal(T.getInFlightCount(), 0, 'inFlight leaked');
+      assert.ok(await pollFor(() => T.getInflightBodyBytes() === 0), 'inflightBodyBytes leaked');
+    });
+  } finally {
+    if (prevKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = prevKey;
+  }
+});
+
+test('§7 backpressure re-checked at body-end; global body budget 503s', async () => {
+  const T = serverInternals;
+  const prevKey = process.env.PROXY_API_KEY;
+  delete process.env.PROXY_API_KEY;
+  const prevFlight = T.getInFlightCount();
+  const prevBytes = T.getInflightBodyBytes();
+  try {
+    await withServer(async (port) => {
+      // Arrival passes (inFlight low), cap hits before body-end → 503 with Retry-After.
+      const r = await tricklePost(port, async () => { T.setInFlightCount(T.MAX_CONCURRENT); });
+      assert.equal(r.status, 503, `re-check must 503, got ${r.status}`);
+      assert.equal(r.headers['retry-after'], '2');
+      T.setInFlightCount(prevFlight);
+      // Global 64MB in-flight body budget: nearly exhausted → small POST 503s.
+      T.setInflightBodyBytes(T.MAX_INFLIGHT_BODY_BYTES - 10);
+      const r2 = await post(port, '/v1/chat/completions', { small: 1 });
+      assert.equal(r2.status, 503, `global budget must 503, got ${r2.status}`);
+      assert.match(r2.body, /overloaded/);
+      T.setInflightBodyBytes(prevBytes);
+      assert.ok(await pollFor(() => T.getInflightBodyBytes() === prevBytes), 'byte charge leaked');
+      assert.equal(T.getInFlightCount(), prevFlight, 'inFlight leaked');
+    });
+  } finally {
+    T.setInFlightCount(prevFlight);
+    T.setInflightBodyBytes(prevBytes);
+    if (prevKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = prevKey;
+  }
+});
+
+test('§8/H1 null-id turn commits nothing; next turn full-resends', () => {
+  const T = serverInternals;
+  const s = T.createSession();
+  const u1 = { role: 'user', content: 'hi' };
+  const u2 = { role: 'user', content: 'there' };
+  // Null-id turn: commit skipped, cursor untouched.
+  assert.equal(T.commitTurnState(s, null, [u1], true), false);
+  assert.equal(T.commitTurnState(s, '', [u1], true), false);
+  assert.equal(s.messageCount, 0);
+  assert.equal(s.deltaMsgCount, 0);
+  assert.equal(s.parentMessageId, null);
+  // Next turn: full resend (isDelta:false), not a suffix delta.
+  const split = T.splitClientMessages([u1, u2], s);
+  assert.equal(split.isDelta, false);
+  assert.equal(split.effective.length, 2);
+  // Control: committed turn advances and enables suffix delta.
+  assert.equal(T.commitTurnState(s, 'm1', [u1], true), true);
+  assert.equal(s.messageCount, 1);
+  assert.equal(s.parentMessageId, 'm1');
+  const split2 = T.splitClientMessages([u1, u2], s);
+  assert.equal(split2.isDelta, true);
+  assert.equal(split2.effective.length, 1);
+});
+
+test('§9 dead-socket writes no-op at choke point; finishers skip trailing end', () => {
+  const T = serverInternals;
+  const mkResp = (tool) => ({
+    id: 'x', model: 'm', created: 1, usage: {},
+    choices: [{ message: Object.assign({ role: 'assistant' },
+      tool ? { tool_calls: [{ id: 'c1', function: { name: 'read', arguments: '{"a":1}' } }] }
+           : { content: 'hi' }), finish_reason: tool ? 'tool_calls' : 'stop' }],
+  });
+  // Doc falsifiability: throwing stub + writableEnded must no-op, not throw.
+  assert.doesNotThrow(() => T.finishAnthropicStream(
+    { headersSent: true, writableEnded: true, write: () => { throw new Error('write after end'); }, end: () => { throw new Error('double end'); } },
+    mkResp(false)));
+  // writeSse choke point directly.
+  let wrote = 0;
+  T.writeSse({ writableEnded: true, destroyed: false, write: () => { wrote++; } }, 'e', {});
+  T.writeSse({ writableEnded: false, destroyed: true, write: () => { wrote++; } }, 'e', {});
+  T.writeSse(null, 'e', {});
+  assert.equal(wrote, 0);
+  // Realistic dead socket: never end(), never throw, for every finisher.
+  for (const fn of [T.finishAnthropicStream, T.finishResponsesStream, T.finishOpenAIStream]) {
+    for (const resp of [mkResp(false), mkResp(true)]) {
+      let ended = 0;
+      assert.doesNotThrow(() => fn(
+        { headersSent: true, writableEnded: false, destroyed: true, write() {}, end() { ended++; } }, resp),
+        `${fn.name} threw on dead socket`);
+      assert.equal(ended, 0, `${fn.name} double-ended a dead socket`);
+    }
+  }
+});
+
+test('§10 object/string/array tool args identical on stream vs non-stream', () => {
+  const T = serverInternals;
+  const mk = (args) => ({
+    id: 'x', model: 'm', usage: {},
+    choices: [{ message: { role: 'assistant', tool_calls: [{ id: 'c1', function: { name: 'read', arguments: args } }] }, finish_reason: 'tool_calls' }],
+  });
+  const streamInputOf = (args) => {
+    const deltas = [];
+    T.finishAnthropicStream({ headersSent: true, write(c) { deltas.push(c); }, end() {} }, mk(args));
+    const events = deltas.map((c) => { try { return JSON.parse(c.replace(/^data: /, '').trim()); } catch (e) { return null; } }).filter(Boolean);
+    const delta = events.find((e) => e.type === 'content_block_delta');
+    assert.ok(delta, 'no input_json_delta emitted');
+    return JSON.parse(delta.delta.partial_json);
+  };
+  for (const args of [{ data: 'hi' }, JSON.stringify({ data: 'hi' })]) {
+    assert.deepEqual(T.toAnthropicResponse(mk(args)).content[0].input, { data: 'hi' });
+    assert.deepEqual(streamInputOf(args), { data: 'hi' });
+  }
+  for (const args of ['"42"', '[1,2]', 42, [1, 2], null]) {
+    assert.deepEqual(T.toAnthropicResponse(mk(args)).content[0].input, {}, `non-stream ${JSON.stringify(args)}`);
+    assert.deepEqual(streamInputOf(args), {}, `stream ${JSON.stringify(args)}`);
+  }
+});
+
+test('§12 chrome-auth: guard rule, tmp+rename, .bak only on success', () => {
+  const auth = require('../scripts/deepseek_chrome_auth.js');
+  assert.equal(auth.validatePageAuth(null), false);
+  assert.equal(auth.validatePageAuth({}), false);
+  assert.equal(auth.validatePageAuth({ token: 't' }), false);
+  assert.equal(auth.validatePageAuth({ cookie: 'c' }), false);
+  assert.equal(auth.validatePageAuth({ token: 't', cookie: 'c' }), true);
+  const dir = tmpdir();
+  const out = path.join(dir, 'deepseek-auth.json');
+  // Fresh install: written 0600, no .bak, no .tmp residue.
+  auth.persistAuthResult(out, { token: 'tok', cookie: 'c', wasmUrl: 'w' });
+  assert.ok(fs.existsSync(out));
+  assert.ok(!fs.existsSync(`${out}.bak`));
+  assert.ok(!fs.existsSync(`${out}.tmp`));
+  if (process.platform !== 'win32') assert.equal(fs.statSync(out).mode & 0o777, 0o600);
+  const saved = fs.readFileSync(out, 'utf8');
+  // Success over tokened existing: .bak preserves the previous file.
+  auth.persistAuthResult(out, { token: 'tok2', cookie: 'c2', wasmUrl: 'w' });
+  assert.equal(fs.readFileSync(`${out}.bak`, 'utf8'), saved);
+  assert.equal(JSON.parse(fs.readFileSync(out, 'utf8')).token, 'tok2');
+  // Success over empty existing: no backup (stale .bak keeps last good).
+  fs.writeFileSync(out, JSON.stringify({ token: '', cookie: '' }));
+  fs.rmSync(`${out}.bak`, { force: true });
+  auth.persistAuthResult(out, { token: 'tok3', cookie: 'c3', wasmUrl: 'w' });
+  assert.ok(!fs.existsSync(`${out}.bak`));
+  assert.equal(JSON.parse(fs.readFileSync(out, 'utf8')).token, 'tok3');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('C1 principal binding: keyed requests namespaced, keyless is IP-only', () => {
+  const T = serverInternals;
+  const p = T.principalForRequest('Bearer k', 'k');
+  assert.match(p, /^[0-9a-f]{16}$/);
+  assert.equal(T.principalForRequest('Bearer wrong', 'k'), '');
+  assert.equal(T.principalForRequest(undefined, ''), '');
+  assert.equal(T.resolveAgentId({ requestedSession: 'alice', remoteAddr: '1.2.3.4', principal: p }), `${p}:alice`);
+  assert.equal(T.resolveAgentId({ requestedSession: 'alice', remoteAddr: '127.0.0.1', principal: '' }), 'dev-agent');
+  assert.equal(T.resolveAgentId({ requestedSession: 'alice', remoteAddr: '9.9.9.9', principal: '' }), '9.9.9.9');
+  assert.equal(T.resolveAgentId({ requestedSession: 'x'.repeat(100), remoteAddr: '127.0.0.1', principal: p }), `${p}:${'x'.repeat(64)}`);
+  assert.equal(T.resolveAgentId({ requestedSession: 'has space', remoteAddr: '127.0.0.1', principal: p }), `${p}:dev-agent`);
+});
+
+test('C1 keyless HTTP ignores session header (IP-only bucket)', async () => {
+  const T = serverInternals;
+  const saved = snapshotSessions();
+  const prevKey = process.env.PROXY_API_KEY;
+  delete process.env.PROXY_API_KEY;
+  try {
+    await withServer(async (port) => {
+      T.sessions.clear();
+      const r = await post(port, '/v1/chat/completions',
+        { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] },
+        { 'x-agent-session': 'evil-id' });
+      assert.equal(r.status, 503, `expected no_auth 503, got ${r.status}`);
+      assert.ok(T.sessions.has('dev-agent'), 'loopback must land in dev-agent bucket');
+      assert.ok(![...T.sessions.keys()].some((k) => k.includes('evil-id')), 'header path must be disabled keyless');
+    });
+  } finally {
+    restoreSessionsFrom(saved);
+    if (prevKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = prevKey;
+  }
+});
+
+test('C1 keyed HTTP namespaces the session under the principal', async () => {
+  const T = serverInternals;
+  const saved = snapshotSessions();
+  const prevKey = process.env.PROXY_API_KEY;
+  process.env.PROXY_API_KEY = 'http-test-key';
+  try {
+    const principal = T.principalForRequest('Bearer http-test-key', 'http-test-key');
+    await withServer(async (port) => {
+      T.sessions.clear();
+      const r = await post(port, '/v1/chat/completions',
+        { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] },
+        { 'x-agent-session': 'alice' });
+      assert.equal(r.status, 503, `expected no_auth 503, got ${r.status}`);
+      assert.ok(T.sessions.has(`${principal}:alice`), `namespaced bucket missing: ${[...T.sessions.keys()]}`);
+    });
+  } finally {
+    restoreSessionsFrom(saved);
+    if (prevKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = prevKey;
+  }
+});
+
+test('C2b health hides private fields from anonymous probes unless opted in', () => {
+  const T = serverInternals;
+  assert.deepEqual(Object.keys(T.buildHealthPayload(undefined, '')).sort(), ['service', 'status', 'watermark']);
+  const authed = T.buildHealthPayload('Bearer k', 'k');
+  assert.ok(Array.isArray(authed.accounts) && authed.session_reuse, 'authorized must see private status');
+  assert.ok(!('accounts' in T.buildHealthPayload(undefined, 'k')), 'anonymous must not see accounts');
+  const prev = process.env.DEEPSEEK_PUBLIC_STATUS;
+  process.env.DEEPSEEK_PUBLIC_STATUS = '1';
+  try {
+    assert.ok('accounts' in T.buildHealthPayload(undefined, 'k'), 'opt-in must restore public status');
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_PUBLIC_STATUS;
+    else process.env.DEEPSEEK_PUBLIC_STATUS = prev;
+  }
+});
+
+test('C3 media root containment: inside honored, outside and .. rejected', () => {
+  const T = serverInternals;
+  const dir = tmpdir();
+  const inside = path.join(dir, 'a.png');
+  fs.writeFileSync(inside, 'x');
+  const outsideDir = tmpdir();
+  const outside = path.join(outsideDir, 'o.png');
+  fs.writeFileSync(outside, 'x');
+  const prev = process.env.DEEPSEEK_MEDIA_ROOT;
+  process.env.DEEPSEEK_MEDIA_ROOT = dir;
+  try {
+    assert.equal(T.isMediaPathAllowed(inside), true);
+    assert.equal(T.isMediaPathAllowed(path.join(dir, '..', 'evil.png')), false);
+    assert.equal(T.isMediaPathAllowed('/etc/hostname'), false);
+    assert.equal(T.isMediaPathAllowed(path.join(dir, 'missing.png')), false);
+    assert.equal(T.isMediaPathAllowed('relative/x.png'), false);
+    assert.ok(!T.getMediaRoot().includes('caelestia'), 'media root must be server-side, not a desktop config path');
+    const denied = T.extractScreenshotPaths([
+      { role: 'tool', content: JSON.stringify({ screenshot_path: outside }) },
+      { role: 'user', content: `see ${outside} please` },
+    ]);
+    assert.deepEqual(denied, [], `oracle must be closed, got ${JSON.stringify(denied)}`);
+    const allowed = T.extractScreenshotPaths([
+      { role: 'tool', content: JSON.stringify({ screenshot_path: inside }) },
+    ]);
+    assert.deepEqual(allowed, [`MEDIA:${inside}`]);
+  } finally {
+    if (prev === undefined) delete process.env.DEEPSEEK_MEDIA_ROOT;
+    else process.env.DEEPSEEK_MEDIA_ROOT = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('H2 persist debounced: schedule is lazy, Now writes through', async () => {
+  const T = serverInternals;
+  const saved = snapshotSessions();
+  try {
+    // Drain any stray timer from earlier tests so the lag assertion is exact.
+    await new Promise((r) => setTimeout(r, 1100));
+    T.sessions.clear();
+    T.sessions.set('h2-probe', T.createSession());
+    T.persistSessionsNow();
+    const store = process.env.DEEPSEEK_SESSION_STORE;
+    const before = fs.readFileSync(store, 'utf8');
+    assert.ok(before.includes('h2-probe'), 'Now must write synchronously');
+    T.sessions.set('h2-probe-2', T.createSession());
+    T.persistSessions(); // schedule only: sync read must still show the old snapshot
+    assert.equal(fs.readFileSync(store, 'utf8'), before, 'debounced persist must not write synchronously');
+    T.persistSessionsNow(); // explicit flush writes
+    assert.ok(fs.readFileSync(store, 'utf8').includes('h2-probe-2'), 'flush must write');
+  } finally {
+    restoreSessionsFrom(saved);
+  }
+});
+
+test('H3 proxy key lazy: import never touches disk', () => {
+  const dir = tmpdir();
+  try {
+    // A directory as PROXY_API_KEY_FILE throws EISDIR on read: the old
+    // import-time loadProxyApiKey() crashed the require; now it must succeed.
+    const r = runNode(['-e', `process.env.PROXY_API_KEY_FILE=${JSON.stringify(dir)}; require('./server.js'); console.log('import-ok');`]);
+    assert.equal(r.status, 0, `import must not throw, stderr: ${r.stderr}`);
+    assert.match(r.stdout, /import-ok/);
+    // Missing file still loads lazily to ''.
+    const r2 = runNode(['-e', `process.env.PROXY_API_KEY_FILE=${JSON.stringify(path.join(dir, 'missing'))}; const s = require('./server.js'); console.log('key=' + JSON.stringify(s.__test.getProxyKey()));`]);
+    assert.equal(r2.status, 0, `stderr: ${r2.stderr}`);
+    assert.match(r2.stdout, /key=""/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('H4 sentinel-join: newlines survive, split payload still redacted', () => {
+  const T = serverInternals;
+  assert.equal(T.normalizeMessageContent(['a\nb', 'c']), 'a\nb\nc');
+  const header = 'data:image/png;base64,';
+  const payload = 'Z'.repeat(120);
+  const frags = [];
+  for (let i = 0; i < payload.length; i += 5) frags.push(payload.slice(i, i + 5));
+  const texts = frags.map((f, i) => (i === 0 ? `line1\nline2 ${header}${f}` : f));
+  texts.push('!!! done.');
+  const out = T.normalizeMessageContent(texts.map((t) => ({ type: 'text', text: t })));
+  assert.ok(!out.includes('Z'.repeat(10)), 'split payload leaks');
+  assert.ok((out.match(/<omitted>/g) || []).length >= 1, 'omission marker missing');
+  assert.ok(out.includes('line1\nline2'), 'intra-part newlines flattened');
+  // Boundary note: the join sentinel is hex (base64-class, load-bearing so
+  // sub-8-char fragments fuse); the sentinel adjacent to the payload end is
+  // consumed as part of the redacted span, so the separator before the
+  // following part is lost. Text survives, one '\n' doesn't — cosmetic.
+  assert.ok(out.includes('!!! done.'), 'trailing part text lost');
+});
+
+test('M1 readyz minimal for anonymous, counts when authorized', () => {
+  const T = serverInternals;
+  assert.deepEqual(T.buildReadyzPayload(undefined, 2, 3, 'k'), { ready: true });
+  assert.deepEqual(T.buildReadyzPayload('Bearer k', 2, 3, 'k'), { ready: true, ready_accounts: 2, total_accounts: 3 });
+  assert.deepEqual(T.buildReadyzPayload(undefined, 0, 1, 'k'), { ready: false });
+});
+
+test('W5 shared title bucket: bare + namespaced match, spoofed does not', () => {
+  const T = serverInternals;
+  assert.equal(T.isSharedTitleBucket('dev-agent:title'), true);
+  assert.equal(T.isSharedTitleBucket('8254c329a92850f6:dev-agent:title'), true);
+  // Survives a hypothetical charset change allowing ':': attacker suffixes
+  // never match the strict 16-hex-principal shape.
+  assert.equal(T.isSharedTitleBucket('evil:dev-agent:title'), false);
+  assert.equal(T.isSharedTitleBucket('8254c329a92850f6:evil:dev-agent:title'), false);
+  assert.equal(T.isSharedTitleBucket('alice'), false);
+  assert.equal(T.isSharedTitleBucket(''), false);
+  assert.equal(T.isSharedTitleBucket(null), false);
 });

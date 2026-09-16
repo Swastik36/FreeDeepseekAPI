@@ -66,7 +66,21 @@ function requireProxyApiKey(key, required) {
     }
 }
 
-const PROXY_API_KEY = loadProxyApiKey();
+// Lazy proxy key (H3): module scope must not touch disk, so
+// `require('../server.js').__test` never throws on an unreadable secret.
+// First use caches; callers pass through getProxyKey().
+let PROXY_API_KEY = '';
+let _proxyKeyLoaded = false;
+function getProxyKey(env = process.env) {
+    // Env is read fresh (cheap, no disk); only the optional FILE read is
+    // cached. Semantics match the old import-time load when env is static,
+    // and unit tests can set/unset PROXY_API_KEY per case without a reset hook.
+    if (env.PROXY_API_KEY) return String(env.PROXY_API_KEY);
+    if (_proxyKeyLoaded) return PROXY_API_KEY;
+    PROXY_API_KEY = loadProxyApiKey(env);
+    _proxyKeyLoaded = true;
+    return PROXY_API_KEY;
+}
 const PROXY_CORS_ORIGINS = new Set(String(process.env.PROXY_CORS_ORIGINS || '')
     .split(',')
     .map(value => normalizeOrigin(value))
@@ -90,11 +104,12 @@ function prompt(question) {
 }
 function isTruthy(value) { return typeof value === 'string' && ['1','true','yes','on'].includes(value.trim().toLowerCase()); }
 
-function isProxyAuthorized(authorization, expectedKey = PROXY_API_KEY) {
-    if (!expectedKey) return true;
+function isProxyAuthorized(authorization, expectedKey) {
+    const key = expectedKey === undefined ? getProxyKey() : expectedKey;
+    if (!key) return true;
     if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) return false;
     const supplied = Buffer.from(authorization.slice('Bearer '.length), 'utf8');
-    const expected = Buffer.from(String(expectedKey), 'utf8');
+    const expected = Buffer.from(String(key), 'utf8');
     return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 }
 
@@ -193,7 +208,7 @@ function serializeSession(session) {
     };
 }
 
-function persistSessions(storePath = SESSION_STORE_PATH) {
+function persistSessionsNow(storePath = SESSION_STORE_PATH) {
     try {
         const target = String(storePath || SESSION_STORE_PATH);
         const payload = JSON.stringify({
@@ -208,6 +223,32 @@ function persistSessions(storePath = SESSION_STORE_PATH) {
     } catch (e) {
         console.log(`[DS-API] Session persist skipped: ${e && e.message ? e.message : e}`);
     }
+}
+
+// Debounced persist (H2): the hot path (per-session creation/turn) only marks
+// dirty and coalesces a trailing write 1s out, so bursts of new sessions cost
+// O(1) disk writes instead of one full stringify+tmp+rename per mutation.
+// Anything needing durability (shutdown, idle sweep) calls
+// persistSessionsNow() directly. Timer is unref'd: never keeps the process alive.
+const PERSIST_DEBOUNCE_MS = 1000;
+let _sessionsDirty = false;
+let _persistTimer = null;
+function persistSessions(storePath = SESSION_STORE_PATH) {
+    // An explicit non-default store path is the unit-test hook: write through
+    // synchronously so tests don't wait out the debounce window.
+    if (String(storePath || SESSION_STORE_PATH) !== String(SESSION_STORE_PATH)) {
+        persistSessionsNow(storePath);
+        return;
+    }
+    _sessionsDirty = true;
+    if (_persistTimer) return;
+    _persistTimer = setTimeout(() => {
+        _persistTimer = null;
+        if (!_sessionsDirty) return;
+        _sessionsDirty = false;
+        persistSessionsNow();
+    }, PERSIST_DEBOUNCE_MS);
+    if (_persistTimer && typeof _persistTimer.unref === 'function') _persistTimer.unref();
 }
 
 function restoreSessions(now = Date.now(), storePath = SESSION_STORE_PATH) {
@@ -248,6 +289,19 @@ let inFlight = 0;  // concurrent in-flight completions (backpressure cap)
 // loops), max concurrent completions, and the empty-response retry cap.
 const REQUEST_DEADLINE_MS = numEnv('DEEPSEEK_REQUEST_DEADLINE_MS', 120000, 1000);
 const MAX_CONCURRENT = Math.max(1, Math.floor(numEnv('DEEPSEEK_MAX_CONCURRENT', 24, 1)));
+// Request-body caps (§6/§7): per-request 10MB (413) plus a global
+// in-flight-body budget (64MB, 503+Retry-After) so concurrent trickled
+// uploads cannot balloon memory. inflightBodyBytes is charged per chunk and
+// released exactly once per request (settled flag guards end+close, which
+// Node fires BOTH of on normal completion).
+const MAX_BODY_BYTES = 10 * 1024 * 1024;  // chat payloads are small; cap memory before JSON.parse
+const MAX_INFLIGHT_BODY_BYTES = 64 << 20;
+let inflightBodyBytes = 0;
+function checkBackpressure(count = inFlight) { return count >= MAX_CONCURRENT; }
+function getInflightBodyBytes() { return inflightBodyBytes; }
+function setInflightBodyBytes(n) { inflightBodyBytes = Math.max(0, Number(n) || 0); } // test hook
+function getInFlightCount() { return inFlight; }
+function setInFlightCount(n) { inFlight = Math.max(0, Math.floor(Number(n) || 0)); } // test hook
 const configuredEmptyRetries = Number(process.env.DEEPSEEK_MAX_RETRIES);
 const MAX_EMPTY_RETRIES = Number.isFinite(configuredEmptyRetries)
     ? Math.max(0, Math.min(10, Math.floor(configuredEmptyRetries)))
@@ -616,8 +670,54 @@ function sweepIdleSessions(maxIdleMs = SESSION_TTL_MS * 2) {
         if (now - (session.lastActivityAt || 0) > maxIdleMs) { sessions.delete(agentId); removed++; }
     }
     if (removed) console.log(`[DS-API] swept ${removed} idle session(s); ${sessions.size} remain`);
-    if (removed) persistSessions();
+    if (removed) persistSessionsNow();
     return removed;
+}
+
+// === Session identity hardening (§1 cap+sanitize, C1 principal binding) ===
+// §1: client-supplied session keys are capped (64 chars, strict charset) and
+// the GLOBAL session count is capped at MAX_SESSIONS, enforced at intake
+// pre-creation (429 for new keys past the cap). getOrCreateAgentSession keeps
+// its unconditional contract; the gate lives at request entry. No eviction.
+// C1: the key is namespaced under a principal derived from the proxy
+// credential (sha256 hex prefix; no sub/rotation exists with a single static
+// key). With no proxy key configured the header path is disabled (IP-only),
+// so keyless deployments cannot mint arbitrary buckets.
+const MAX_SESSIONS = 500;
+const SESSION_ID_MAX_LENGTH = 64;
+const SESSION_ID_CHARSET = /^[A-Za-z0-9._-]+$/;
+function sanitizeSessionId(value) {
+    const s = String(value === null || value === undefined ? '' : value).trim().slice(0, SESSION_ID_MAX_LENGTH);
+    if (!s || !SESSION_ID_CHARSET.test(s)) return '';
+    return s;
+}
+function principalForRequest(authorization, key) {
+    const k = key === undefined ? getProxyKey() : key;
+    if (!k) return '';
+    if (!isProxyAuthorized(authorization, k)) return '';
+    return crypto.createHash('sha256').update(String(k)).digest('hex').slice(0, 16);
+}
+function resolveAgentId({ requestedSession, remoteAddr, authorization, principal } = {}) {
+    const addr = String(remoteAddr || 'unknown');
+    const ipFallback = (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1') ? 'dev-agent' : addr;
+    const bound = principal === undefined ? principalForRequest(authorization) : principal;
+    // No principal (keyless, or unauthorized which the 401 gate already
+    // rejected): header path disabled, IP-only bucket.
+    const requested = bound ? sanitizeSessionId(requestedSession) : '';
+    const base = requested || ipFallback;
+    return bound ? `${bound}:${base}` : base;
+}
+
+// Shared title-bucket check (C1 companion): only the title override in the
+// request handler produces this shape ('dev-agent:title', bare when keyless,
+// '<16-hex-principal>:dev-agent:title' when keyed). The strict full-shape
+// match is deliberate: a bare endsWith would also match
+// '<anything>:dev-agent:title' if sanitizeSessionId's charset ever allowed
+// ':' (today it cannot — ^[A-Za-z0-9._-]+$). Tied to principalForRequest's
+// sha256-hex-16 format; change both together.
+function isSharedTitleBucket(agentId) {
+    if (agentId === 'dev-agent:title') return true;
+    return /^[0-9a-f]{16}:dev-agent:title$/.test(String(agentId || ''));
 }
 
 // === Delta-prompt mode (DEEPSEEK_DELTA_PROMPT=1) ===
@@ -714,6 +814,22 @@ function splitClientMessages(messages, session) {
         }
     }
     return { effective: turnMessages, isDelta: false, forwardedCount: 0 };
+}
+
+// Single commit point for a turn (§8 deferred commit, H1): only a
+// deliverable turn advances the cursor. Poisoned/empty/rate-limited turns
+// return before the commit, leaving parentMessageId/messageCount/delta
+// untouched so the next turn retries from the last good parent (no rewind
+// needed — we simply never advanced). A null/empty messageId commits
+// nothing: deltaMsgCount stays put and the next turn full-resends
+// (isDelta:false). Returns true when the cursor advanced.
+function commitTurnState(session, messageId, messages, deltaMode) {
+    if (!session || !messageId) return false;
+    session.parentMessageId = messageId;
+    session.messageCount++;
+    if (deltaMode) commitDeltaState(session, messages);
+    persistSessions();
+    return true;
 }
 
 // Record the full client message list as forwarded after a successful
@@ -2115,11 +2231,30 @@ function redactEmbeddedDataUrls(text) {
     // newlines, spaces from pretty-print/part splits). Each continuation chunk
     // must be >= 8 base64 chars so trailing prose (` b`, ` after`) is preserved.
     // Length is checked on the stripped payload (separators removed).
-    return text.replace(/(data:[A-Za-z0-9\/\-\+\.]*(?:;[A-Za-z0-9\-\+\.=]+)*;base64),([A-Za-z0-9+/=]+(?:(?:\\[nrt\\]|[\s\\]+)[A-Za-z0-9+/=]{8,})*)/gi,
+    // base64url (§5): payload classes also accept `-`/`_` (RFC 4648 §5) —
+    // Buffer.from(s,'base64') decodes that alphabet upstream, so excluding it
+    // let the match stop at the first `-` and the remainder slide under the
+    // floor. Accepted side effect: the continuation matcher now also swallows
+    // `-`/`_` prose tokens >= 8 chars after a real header — benign (only
+    // fires post-header), pinned by regression test.
+    const once = text.replace(/(data:[A-Za-z0-9\/\-\+\.]*(?:;[A-Za-z0-9\-\+\.=]+)*;base64),([A-Za-z0-9+/\-_=]+(?:(?:\\[nrt\\]|[\s\\]+)[A-Za-z0-9+/\-_=]{8,})*)/gi,
         (match, header, rawPayload) => {
             const stripped = rawPayload.replace(/\\[nrt\\]|[\s\\]/g, '');
             if (header.length + 1 + stripped.length < EMBEDDED_DATA_URL_MIN_LENGTH) return match;
             return `${header},<omitted>`;
+        });
+    // Second pass (§4): non-`base64` data-URLs (`data:text/plain,`,
+    // `data:,`, percent-encoded bodies) that the `;base64` pass above never
+    // sees. Body-only floor >= 64 on REAL chars (`%XX` collapses to 1):
+    // deliberately fail-closed — 64+ triplets (even pure `%20` padding)
+    // redact by design, so percent-encoded exfil cannot escape via padding.
+    // Documented FP surface: long percent-encoded prose in a data: body
+    // redacts too. No percent-decoding before the gate. `?x=data:…` matches
+    // by design (no left-boundary allowlist); short bodies pass via the floor.
+    return once.replace(/(data:(?:[A-Za-z0-9\/\-\+\.]+)?(?:;[A-Za-z0-9\-\+\.=]+)*,)([A-Za-z0-9%\-_.~!$&'()*+,;=:@\/?]{64,})/gi,
+        (m, h, b) => {
+            const real = b.replace(/%[0-9A-Fa-f]{2}/g, 'X').replace(/[\s\\]/g, '');
+            return (real.length >= 64 ? h + '<omitted>' : m);
         });
 }
 
@@ -2147,6 +2282,15 @@ function redactToolArguments(args) {
     if (typeof args === 'string') return args ? redactEmbeddedDataUrls(args) : args;
     if (args && typeof args === 'object') return redactStringLeavesDeep(args);
     return args;
+}
+
+// Tool/function NAME redaction (§2): names replay verbatim upstream and into
+// persisted history, so a `data:`-carrying name exfiltrates like an argument.
+// Redact embedded data-URLs, collapse anything outside the inert allowlist to
+// `_`, cap at 64 chars. Benign names (`read`, `bash`, `read_file`) pass
+// through byte-identical.
+function redactToolName(name) {
+    return redactEmbeddedDataUrls(String(name || 'unknown')).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64);
 }
 
 function normalizeMessageContent(content) {
@@ -2177,7 +2321,7 @@ function normalizeMessageContent(content) {
             // Whitespace-tolerant (C3): allow trailing whitespace after prev's
             // payload run (`p1 + ' '` splits). Length gate + prev-redacted gate
             // unchanged so short header-splits still fuse below.
-            const tail = prev.match(/(data:[^,\s]*;base64),([A-Za-z0-9+/=]*)\s*$/i);
+            const tail = prev.match(/(data:[^,\s]*;base64),([A-Za-z0-9+/\-_=]*)\s*$/i);
             if (!tail || tail[1].length + 1 + tail[2].length < EMBEDDED_DATA_URL_MIN_LENGTH) return text;
             if (redactEmbeddedDataUrls(prev) === prev) return text;
             if (/^\s*data:/i.test(text)) return text;
@@ -2185,9 +2329,9 @@ function normalizeMessageContent(content) {
             // next part's leading base64 run when it is >= 20 chars, preserving
             // benign `hello world` / `a` after a complete image. Keeps leading
             // whitespace, stops at first non-base64 char.
-            const lead = text.match(/^(\s*)([A-Za-z0-9+/=]+)/);
+            const lead = text.match(/^(\s*)([A-Za-z0-9+/\-_=]+)/);
             if (!lead || lead[2].length < 20) return text;
-            return text.replace(/^(\s*)[A-Za-z0-9+/=]+/, '$1<omitted>');
+            return text.replace(/^(\s*)[A-Za-z0-9+/\-_=]+/, '$1<omitted>');
         };
         const pieces = content.map((part, idx) => {
             if (typeof part === 'string') return redactEmbeddedDataUrls(redactCarryoverTail(part, idx));
@@ -2240,17 +2384,27 @@ function normalizeMessageContent(content) {
         if (once !== joined) return once;
         const fused = pieces.join('');
         if (fused === joined) return joined;
-        const twice = redactEmbeddedDataUrls(fused);
-        if (twice === fused) return joined;
-        // A fused hit consumed join separators inside the payload span (correct)
-        // but also dropped the remaining join separators globally. Restore the
-        // surviving structure: re-split is impossible post-redaction, so return
-        // the redacted fused text (flattened) — this path only triggers on an
-        // actual exfil payload assembled from sub-8-char fragments, where
-        // security (no leak) outweighs newline cosmetics. Double-marker
-        // (`<omitted>\n<omitted>`) from the carryover path above is likewise
-        // accepted: tail-gone + prose-intact is what the tests assert.
-        return twice;
+        // H4 sentinel-join: the old code returned the redacted separator-free
+        // `fused` text, flattening every intra-part newline on a hit. Join
+        // with a per-call random token instead, redact, then split back, so
+        // newlines survive. The token is hex (base64-class, no regex meaning)
+        // so a payload assembled from sub-8-char fragments still matches as
+        // one run across it; a consumed span eats its interior tokens (correct
+        // — the payload owned those separators), survivors split back to \n.
+        // Collision-checked against the input (never a fixed literal). Known
+        // shift: the token counts toward the 64-floor inside a matched span,
+        // so a borderline split payload may redact where its single-part twin
+        // would not — fail-closed, documented.
+        let sentinel = null;
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const candidate = crypto.randomBytes(8).toString('hex');
+            if (!fused.includes(candidate)) { sentinel = candidate; break; }
+        }
+        if (!sentinel) return redactEmbeddedDataUrls(fused); // astronomically unlikely; fail closed
+        const fusedSent = pieces.join(sentinel);
+        const twiceSent = redactEmbeddedDataUrls(fusedSent);
+        if (twiceSent === fusedSent) return joined;
+        return twiceSent.split(sentinel).join('\n');
     }
     return String(content);
 }
@@ -2316,7 +2470,7 @@ function normalizeResponsesInput(input) {
                 tool_calls: [{
                     id: item.call_id || item.id || ('call_' + Date.now()),
                     type: 'function',
-                    function: { name: item.name || 'unknown', arguments: fnArgs || '{}' },
+                    function: { name: redactToolName(item.name), arguments: fnArgs || '{}' },
                 }],
             });
         } else if (item.type === 'function_call_output') {
@@ -2359,7 +2513,7 @@ function normalizeApiParams(params, apiMode) {
                     if (typeof args !== 'string') {
                         try { args = JSON.stringify(args); } catch (e) { args = '{}'; }
                     }
-                    messages.push({ role: 'assistant', content: null, tool_calls: [{ id: tc && tc.id, type: 'function', function: { name: (tc && tc.function && tc.function.name) || 'unknown', arguments: args || '{}' } }] });
+                    messages.push({ role: 'assistant', content: null, tool_calls: [{ id: tc && tc.id, type: 'function', function: { name: redactToolName(tc && tc.function && tc.function.name), arguments: args || '{}' } }] });
                 }
                 continue;
             }
@@ -2368,7 +2522,7 @@ function normalizeApiParams(params, apiMode) {
                 const text = normalizeMessageContent(msg.content.filter(part => !part || part.type !== 'tool_use'));
                 if (text) messages.push({ role: 'assistant', content: text });
                 for (const tu of toolUses) {
-                    messages.push({ role: 'assistant', content: null, tool_calls: [{ id: tu.id, type: 'function', function: { name: tu.name, arguments: redactEmbeddedDataUrls(JSON.stringify(tu.input || {})) } }] });
+                    messages.push({ role: 'assistant', content: null, tool_calls: [{ id: tu.id, type: 'function', function: { name: redactToolName(tu.name), arguments: redactEmbeddedDataUrls(JSON.stringify(tu.input || {})) } }] });
                 }
             } else if (msg.role === 'user' && Array.isArray(msg.content) && msg.content.some(part => part && part.type === 'tool_result')) {
                 for (const part of msg.content) {
@@ -2464,8 +2618,19 @@ function toAnthropicResponse(openaiResp) {
             // H2 egress: model→client tool args redacted (same helper as
             // intake). No-op when clean — and clean is the norm, since the
             // model never saw a raw payload (intake-clean context).
-            let input = safeJsonParseObject(tc.function.arguments);
-            try { input = redactStringLeavesDeep(input); } catch (e) { /* keep raw */ }
+            // §10: branch on type BEFORE parsing (mirrors the stream finisher
+            // below). Anthropic `input` must be an object: object → redacted
+            // object; string parsing to an object → parsed+redacted; any other
+            // shape (`"42"`, `"[1,2]"`, arrays, numbers, null) → `{}`.
+            const rawArgs = tc.function && tc.function.arguments;
+            let input;
+            if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) {
+                try { input = redactStringLeavesDeep(rawArgs); } catch (e) { input = {}; }
+            } else if (typeof rawArgs === 'string') {
+                try { input = redactStringLeavesDeep(safeJsonParseObject(redactEmbeddedDataUrls(rawArgs))); } catch (e) { input = {}; }
+            } else {
+                input = {};
+            }
             content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
         }
     } else {
@@ -2516,6 +2681,10 @@ function clearKeepAlive(res) {
 }
 
 function writeSse(res, event, data) {
+    // Choke point for all SSE finishers (§9): a disconnected client must
+    // no-op here instead of throwing ERR_STREAM_WRITE_AFTER_END / double-end
+    // (or emitting async stream errors) mid-flight.
+    if (!res || res.writableEnded || res.destroyed) return;
     if (event) res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
@@ -2582,9 +2751,20 @@ function finishAnthropicStream(res, openaiResp, opts = {}) {
         msg.tool_calls.forEach((tc, i) => {
             writeSse(res, 'content_block_start', { type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: tc.id, name: tc.function.name, input: {} } });
             // H2 egress: complete args string available at finish time — exact redaction.
+            // §10 convergence: the non-stream mapper coerces non-object args
+            // to `{}` (Anthropic `input` must be an object), so the stream
+            // emits `{}` for the same shapes instead of the raw string.
+            // Client-visible change for malformed args (was `"42"`, now `{}`).
             let partial = (tc.function && tc.function.arguments) || '{}';
-            if (typeof partial === 'string') partial = redactEmbeddedDataUrls(partial);
-            else { try { partial = JSON.stringify(redactStringLeavesDeep(partial)); } catch (e) { partial = '{}'; } }
+            if (typeof partial === 'string') {
+                const redacted = redactEmbeddedDataUrls(partial);
+                const parsed = safeJsonParseObject(redacted, null);
+                partial = (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? redacted : '{}';
+            } else if (partial && typeof partial === 'object' && !Array.isArray(partial)) {
+                try { partial = JSON.stringify(redactStringLeavesDeep(partial)); } catch (e) { partial = '{}'; }
+            } else {
+                partial = '{}';
+            }
             writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: partial } });
             writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: i });
         });
@@ -2605,6 +2785,7 @@ function finishAnthropicStream(res, openaiResp, opts = {}) {
         writeSse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: shimStopReason(choice.finish_reason), stop_sequence: null }, usage: message.usage });
     }
     writeSse(res, 'message_stop', { type: 'message_stop' });
+    if (res.writableEnded || res.destroyed) return; // §9: no double-end on dead sockets
     res.end();
 }
 
@@ -2719,6 +2900,7 @@ function finishResponsesStream(res, openaiResp, opts = {}) {
         writeSse(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item });
     }
     writeSse(res, response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', { type: response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', response });
+    if (res.writableEnded || res.destroyed) return; // §9: no double-end on dead sockets
     res.write('data: [DONE]\n\n');
     res.end();
 }
@@ -2787,6 +2969,7 @@ function finishOpenAIStream(res, openaiResp, opts = {}) {
         const finishReason = choice.finish_reason || 'stop';
         res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })}\n\ndata: [DONE]\n\n`);
     }
+    if (res.writableEnded || res.destroyed) return; // §9: no double-end on dead sockets
     res.end();
 }
 
@@ -2868,9 +3051,9 @@ function storeHistory(agentId, prompt, content, toolCall) {
                 // stored sessions + object paths replay here — leaf-redact (no-op
                 // when clean) so envelopes never persist a data-URL payload.
                 try { args = redactStringLeavesDeep(args); } catch (e) { /* keep raw */ }
-                envelopes.push(JSON.stringify({ tool_call: { name: tc.name, arguments: args } }));
+                envelopes.push(JSON.stringify({ tool_call: { name: redactToolName(tc.name), arguments: args } }));
             } catch (e) {
-                envelopes.push(`Assistant called ${tc.name}`);
+                envelopes.push(`Assistant called ${redactToolName(tc.name)}`);
             }
         }
         assistantResponse = envelopes.join('\n');
@@ -2887,6 +3070,31 @@ function storeHistory(agentId, prompt, content, toolCall) {
     persistSessions();
 }
 
+// Media-path containment (C3): absolute image paths mentioned in turns are
+// an authenticated-only existence oracle (existsSync hits get echoed into
+// responses). Confine honoring to a server-side media root — default
+// `<repo>/media`, overridable via `DEEPSEEK_MEDIA_ROOT` — and reject `..`
+// segments plus symlink escapes. Paths outside the root are never probed
+// (no existsSync) and never echoed. User/assistant prose keeps its
+// fail-closed existsSync gate, now confined to the root.
+function getMediaRoot() {
+    return path.resolve(process.env.DEEPSEEK_MEDIA_ROOT || path.join(__dirname, 'media'));
+}
+function isMediaPathAllowed(filePath, root) {
+    if (typeof filePath !== 'string' || !filePath.startsWith('/')) return false;
+    if (filePath.split('/').includes('..')) return false;
+    const base = root === undefined ? getMediaRoot() : root;
+    const resolved = path.resolve(filePath);
+    if (resolved !== base && !resolved.startsWith(base + path.sep)) return false;
+    try {
+        const real = fs.realpathSync(resolved);
+        if (real !== base && !real.startsWith(base + path.sep)) return false;
+    } catch (e) {
+        return false; // missing/unresolvable: not honored either way
+    }
+    return true;
+}
+
 // Extract MEDIA: paths from tool results that contain screenshot paths
 function extractScreenshotPaths(messages) {
     const paths = [];
@@ -2901,7 +3109,7 @@ function extractScreenshotPaths(messages) {
             const pngMatch = text.match(/["'](screenshot_path|path)["']\s*:\s*["']([^"']+\.(?:png|jpg|jpeg|webp|gif))["']/i);
             if (pngMatch) {
                 const filePath = pngMatch[2];
-                if (filePath.startsWith('/') && fs.existsSync(filePath)) {
+                if (isMediaPathAllowed(filePath) && fs.existsSync(filePath)) {
                     paths.push(`MEDIA:${filePath}`);
                 }
             }
@@ -2910,7 +3118,7 @@ function extractScreenshotPaths(messages) {
             if (mediaMatch) {
                 for (const tag of mediaMatch) {
                     const extractedPath = tag.replace(/^MEDIA:/, '');
-                    if (fs.existsSync(extractedPath) && !paths.includes(tag)) {
+                    if (isMediaPathAllowed(extractedPath) && fs.existsSync(extractedPath) && !paths.includes(tag)) {
                         paths.push(tag);
                     }
                 }
@@ -2928,7 +3136,7 @@ function extractScreenshotPaths(messages) {
             let match;
             while ((match = pathRegex.exec(content)) !== null) {
                 const filePath = match[1];
-                if (filePath.startsWith('/') && fs.existsSync(filePath) && !paths.includes(`MEDIA:${filePath}`)) {
+                if (isMediaPathAllowed(filePath) && fs.existsSync(filePath) && !paths.includes(`MEDIA:${filePath}`)) {
                     paths.push(`MEDIA:${filePath}`);
                 }
             }
@@ -2960,12 +3168,15 @@ function buildRecoveryHistoryPrefix(history) {
     const scrubMedia = (text) => String(text || '').replace(/MEDIA:(\S+)/g, (m, p) => {
         // Re-validate at resurrection time: injected screenshot paths may
         // have been moved/deleted since the turn ran. Drop dead references
-        // instead of inviting the model to cite missing files.
-        try { return fs.existsSync(p) ? m : ''; } catch (e) { return ''; }
+        // instead of inviting the model to cite missing files. Confined to
+        // MEDIA_ROOT like intake (C3 mirror): outside paths are dropped
+        // without probing. Data-URL redaction (§3) applies on both sides
+        // below, so stored payloads cannot resurrect into fresh prompts.
+        try { return (isMediaPathAllowed(p) && fs.existsSync(p)) ? m : ''; } catch (e) { return ''; }
     });
     let prefix = '[Previous conversation]\n';
     for (const exchange of history) {
-        prefix += `User: ${scrubMedia(exchange?.user)}\nAssistant: ${scrubMedia(exchange?.assistant)}\n\n`;
+        prefix += `User: ${redactEmbeddedDataUrls(scrubMedia(exchange?.user))}\nAssistant: ${redactEmbeddedDataUrls(scrubMedia(exchange?.assistant))}\n\n`;
     }
     return prefix + '[Continue from here]\n\n';
 }
@@ -3245,9 +3456,9 @@ function formatMessages(messages, tools) {
                     else { try { tcArgs = redactStringLeavesDeep(tcArgs); } catch (e) { /* keep raw */ } }
                     let envelope;
                     try {
-                        envelope = JSON.stringify({ tool_call: { name: (tc && tc.function && tc.function.name) || 'unknown', arguments: tcArgs } });
+                        envelope = JSON.stringify({ tool_call: { name: redactToolName(tc && tc.function && tc.function.name), arguments: tcArgs } });
                     } catch (e) {
-                        envelope = `Assistant called ${(tc && tc.function && tc.function.name) || 'unknown'}`;
+                        envelope = `Assistant called ${redactToolName(tc && tc.function && tc.function.name)}`;
                     }
                     conversation += `Assistant: ${envelope}\n\n`;
                 }
@@ -3265,6 +3476,39 @@ function formatMessages(messages, tools) {
     }
     // The last user message + full conversation context
     return { prompt: conversation.trim(), systemPrompt: systemPrompt.trim() };
+}
+
+// Status visibility (C2b/M1): private fields (accounts, agents, session
+// reuse, ready counts) are shown only to callers presenting the configured
+// proxy key, or when the operator opts in via DEEPSEEK_PUBLIC_STATUS=1.
+// Anonymous probes get minimal liveness ({status,service,watermark} on
+// /health, {ready} on /readyz) with unchanged 200/503 LB semantics.
+// NOTE: this intentionally differs from the reviewer's literal one-liner
+// (`isProxyAuthorized(...)` alone), which is a no-op: with no key configured
+// isProxyAuthorized() returns true for everyone, so the `!PROXY_API_KEY` arm
+// it drops never mattered. The predicate below is what actually closes the
+// keyless off-loopback leak.
+function isStatusVisible(authorization, key) {
+    if (isTruthy(process.env.DEEPSEEK_PUBLIC_STATUS)) return true;
+    const k = key === undefined ? getProxyKey() : key;
+    return Boolean(k) && isProxyAuthorized(authorization, k);
+}
+function buildHealthPayload(authorization, key) {
+    const health = { status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK };
+    if (isStatusVisible(authorization, key)) Object.assign(health, {
+        models: SUPPORTED_MODEL_IDS,
+        unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported),
+        agents: sessions.size,
+        in_flight: inFlight,
+        accounts: accounts.map(accountStatus),
+        config_ready: hasAuthConfig(),
+        session_reuse: { strategy: 'sticky per x-agent-session/user', ttl_minutes: Math.round(SESSION_TTL_MS / 60000), max_messages: MAX_MESSAGE_DEPTH, reset_all: 'POST /reset-session?agent=all' },
+    });
+    return health;
+}
+function buildReadyzPayload(authorization, ready, total, key) {
+    if (!isStatusVisible(authorization, key)) return { ready: ready > 0 };
+    return { ready: ready > 0, ready_accounts: ready, total_accounts: total };
 }
 
 // === HTTP Server ===
@@ -3295,19 +3539,8 @@ const server = http.createServer(async (req, res) => {
 
     // Health check
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-        const includePrivateStatus = !PROXY_API_KEY || isProxyAuthorized(req.headers.authorization);
-        const health = { status: 'ok', service: 'FreeDeepseekAPI', watermark: FORGETMEAI_WATERMARK };
-        if (includePrivateStatus) Object.assign(health, {
-            models: SUPPORTED_MODEL_IDS,
-            unsupported_models: Object.keys(MODEL_CONFIGS).filter(id => !MODEL_CONFIGS[id].supported),
-            agents: sessions.size,
-            in_flight: inFlight,
-            accounts: accounts.map(accountStatus),
-            config_ready: hasAuthConfig(),
-            session_reuse: { strategy: 'sticky per x-agent-session/user', ttl_minutes: Math.round(SESSION_TTL_MS / 60000), max_messages: MAX_MESSAGE_DEPTH, reset_all: 'POST /reset-session?agent=all' },
-        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(health));
+        res.end(JSON.stringify(buildHealthPayload(req.headers.authorization)));
         return;
     }
 
@@ -3317,7 +3550,7 @@ const server = http.createServer(async (req, res) => {
         const now = Date.now();
         const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now).length;
         res.writeHead(ready > 0 ? 200 : 503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ready: ready > 0, ready_accounts: ready, total_accounts: accounts.length }));
+        res.end(JSON.stringify(buildReadyzPayload(req.headers.authorization, ready, accounts.length)));
         return;
     }
 
@@ -3405,7 +3638,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Backpressure: reject rather than fan out unbounded concurrent upstream work.
-    if (inFlight >= MAX_CONCURRENT) {
+    if (checkBackpressure()) {
         console.log(`[DS-API] 503 backpressure: ${inFlight}/${MAX_CONCURRENT} in flight, rejecting ${req.socket.remoteAddress}`);
         res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '2' });
         res.end(JSON.stringify({ error: { message: `Server busy (${inFlight}/${MAX_CONCURRENT} requests in flight). Retry shortly.`, type: 'overloaded' } }));
@@ -3413,17 +3646,78 @@ const server = http.createServer(async (req, res) => {
     }
 
     let body = '';
-    let bodyTooLarge = false;
-    const MAX_BODY_BYTES = 10 * 1024 * 1024;  // chat payloads are small; cap memory before JSON.parse
-    req.on('data', chunk => { body += chunk; if (body.length > MAX_BODY_BYTES) { bodyTooLarge = true; req.destroy(); } });
-    req.on('end', async () => {
-        if (bodyTooLarge) {
-            console.log(`[DS-API] 413 body too large (${body.length} chars) from ${req.socket.remoteAddress}`);
+    let reqBytes = 0;
+    let bodySettled = false;
+    let responded = false;
+    // Release this request's in-flight body charge exactly once. Node fires
+    // BOTH `end` and `close` on normal completion — the flag keeps the global
+    // counter from drifting negative (which would disable the cap).
+    const settleBody = () => {
+        if (bodySettled) return;
+        bodySettled = true;
+        inflightBodyBytes -= reqBytes;
+        if (inflightBodyBytes < 0) inflightBodyBytes = 0;
+    };
+    // Cap replies (§6): single `responded` flag guards every reply site (not
+    // res.headersSent alone — racy vs `close` ordering). res.end FIRST, then
+    // req.destroy() ONLY in the end callback (callback form — a sync destroy
+    // can truncate the flush).
+    const replyBodyTooLarge = () => {
+        if (responded) return;
+        responded = true;
+        console.log(`[DS-API] 413 body too large (${reqBytes} bytes) from ${req.socket.remoteAddress}`);
+        try {
             res.writeHead(413, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: 'Request body too large', type: 'payload_too_large' } }));
+            res.end(JSON.stringify({ error: { message: 'Request body too large', type: 'payload_too_large' } }),
+                () => { try { req.destroy(); } catch (e) { /* already gone */ } });
+        } catch (e) {
+            try { req.destroy(); } catch (_) { /* already gone */ }
+        }
+    };
+    const replyInflightBodyCap = () => {
+        if (responded) return;
+        responded = true;
+        console.log(`[DS-API] 503 global in-flight body cap (${inflightBodyBytes}/${MAX_INFLIGHT_BODY_BYTES} bytes) — rejecting ${req.socket.remoteAddress}`);
+        try {
+            res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '2' });
+            res.end(JSON.stringify({ error: { message: 'Server busy (global upload budget exceeded). Retry shortly.', type: 'overloaded' } }),
+                () => { try { req.destroy(); } catch (e) { /* already gone */ } });
+        } catch (e) {
+            try { req.destroy(); } catch (_) { /* already gone */ }
+        }
+    };
+    req.on('data', chunk => {
+        if (responded) return; // stop accumulating after a cap reply
+        const len = Buffer.byteLength(chunk);
+        reqBytes += len;
+        inflightBodyBytes += len;
+        // Both the per-request 10MB (413) and the global 64MB (503-ish)
+        // checks live in this one handler, both routed through `responded`.
+        if (reqBytes > MAX_BODY_BYTES) { replyBodyTooLarge(); return; }
+        if (inflightBodyBytes > MAX_INFLIGHT_BODY_BYTES) { replyInflightBodyCap(); return; }
+        body += chunk;
+    });
+    req.on('error', (err) => {
+        // Without this listener an 'error' event throws and takes the process
+        // down; the `close` handler below still releases the byte charge.
+        console.log(`[DS-API] request stream error from ${req.socket.remoteAddress}: ${(err && err.message) || err}`);
+    });
+    req.on('close', () => { settleBody(); });
+    req.on('end', async () => {
+        settleBody();
+        if (responded) return; // a cap reply already went out; never touch inFlight
+        // Re-check the gate inside `end` (§7 preferred): the arrival gate
+        // raced the async body, so burst trickled POSTs would otherwise all
+        // slip through. No arrival reservation (that would let slowloris
+        // sockets hold MAX_CONCURRENT forever with no error/abort decrement).
+        if (checkBackpressure()) {
+            console.log(`[DS-API] 503 backpressure at body-end: ${inFlight}/${MAX_CONCURRENT} in flight, rejecting ${req.socket.remoteAddress}`);
+            res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '2' });
+            res.end(JSON.stringify({ error: { message: `Server busy (${inFlight}/${MAX_CONCURRENT} requests in flight). Retry shortly.`, type: 'overloaded' } }));
             return;
         }
         inFlight++;
+        let inFlightCounted = true;
         let clientGone = false;
         res.on('close', () => { clientGone = true; clearKeepAlive(res); });
         const requestStartedAt = Date.now();
@@ -3474,13 +3768,16 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ error: { message: 'No messages provided', type: 'invalid_request' } }));
                 return;
             }
-            // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
+            // Session identity (§1 sanitize+cap, C1 principal binding): the
+            // client key is sanitized (64 chars, strict charset, else '') and
+            // namespaced under the proxy-key principal; keyless deployments
+            // are IP-only (header path disabled). Fallback preserves the old
+            // loopback/external split.
             const remoteAddr = req.socket.remoteAddress || 'unknown';
             const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
+            const principal = principalForRequest(req.headers.authorization);
             const deltaMode = isDeltaPromptMode();
-            let agentId = requestedSession
-                ? String(requestedSession)
-                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
+            let agentId = resolveAgentId({ requestedSession, remoteAddr, authorization: req.headers.authorization, principal });
             // Title Decouple: OpenCode fires an internal title summarizer request
             // at session start (agent=title, small=true, messages start with "Generate a title for this conversation:").
             // Premise adjustment & safety note: OpenCode-internal parameters (agent=title, small=true)
@@ -3503,14 +3800,17 @@ const server = http.createServer(async (req, res) => {
                     }
                     return;
                 }
-                agentId = 'dev-agent:title';
+                agentId = (principal ? principal + ':' : '') + 'dev-agent:title';
             }
 
             // Delta mode: no explicit client session key (opencode sends none),
             // so derive a stable per-conversation chat id from the opener.
             // If routed to 'dev-agent:title' (DEEPSEEK_LOCAL_TITLE=0), skip per-conversation
             // fingerprinting so all title calls truly share the single 'dev-agent:title' session.
-            if (deltaMode && !requestedSession && agentId !== 'dev-agent:title' && Array.isArray(messages) && messages.length > 0) {
+            // isSharedTitleBucket (not ===): C1 principal binding namespaces the bucket
+            // as '<principal>:dev-agent:title'; a sanitized client key can
+            // never contain ':' so only the title override matches this shape.
+            if (deltaMode && !requestedSession && !isSharedTitleBucket(agentId) && Array.isArray(messages) && messages.length > 0) {
                 const turnMessages = messages.filter(m => m && m.role !== 'system');
                 const fp = fingerprintConversation(messages);
                 let candidateId = `${agentId}:${fp}`;
@@ -3547,6 +3847,17 @@ const server = http.createServer(async (req, res) => {
             }
             const agentTag = `[${agentId}]`;
             activeAgentId = agentId;
+
+            // Session cardinality cap (§1): earliest point where the final key
+            // is known (post-parse, post-fingerprint — the key needs the body).
+            // New keys past MAX_SESSIONS get 429; existing keys are unaffected.
+            // Covers both creation sites below (`/new` reset + getOrCreate).
+            if (!sessions.has(agentId) && sessions.size >= MAX_SESSIONS) {
+                console.log(`[DS-API] 429 session cap: ${sessions.size}/${MAX_SESSIONS} sessions, rejecting new key from ${req.socket.remoteAddress}`);
+                res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+                res.end(JSON.stringify({ error: { message: `Too many sessions (${sessions.size}/${MAX_SESSIONS}). Retry shortly.`, type: 'session_limit' } }));
+                return;
+            }
 
             // "/new" command: if the latest user message is exactly "/new" (whitespace-insensitive),
             // reset this agent's DeepSeek session/history instead of forwarding anything to DeepSeek.
@@ -3751,6 +4062,11 @@ const server = http.createServer(async (req, res) => {
             };
 
             // Process streaming response from DeepSeek — returns { content, reasoningContent, messageId, finishReason, modelError, abandoned }
+            // Deferred commit (no rewind): cursor advances only once per
+            // turn, at the success point below. Failures return before the
+            // commit, so the next turn re-sends the last good parent instead
+            // of pinning a poisoned node. parent_message_id branches upstream.
+            let pendingMessageId = null;
             async function readDeepSeekResponse(readable, opts = readOpts) {
                 const resResult = await consumeDeepSeekStream(readable, {
                     onReasoningDone: opts.onReasoningDone,
@@ -3758,19 +4074,14 @@ const server = http.createServer(async (req, res) => {
                 });
                 if (resResult.abandoned) return resResult;
 
-                if (resResult.messageId) {
-                    session.parentMessageId = resResult.messageId;
-                    session.messageCount++;
-                    // Delta mode: record the client transcript as forwarded so
-                    // the next turn can send only the new suffix (idempotent:
-                    // retries and continuations re-record the same state).
-                    if (typeof deltaMode !== 'undefined' && deltaMode && typeof messages !== 'undefined') commitDeltaState(session, messages);
-                    persistSessions();
-                } else {
+                // H1: ALWAYS track the delivering read's id (null when the
+                // read carried none). A conditional assignment would leave a
+                // STALE id from an earlier read in `pendingMessageId`, which
+                // the single commit below would then attach to the wrong
+                // content. Null-id turns commit nothing (§8 deferred commit).
+                pendingMessageId = resResult.messageId || null;
+                if (!pendingMessageId) {
                     console.log(`${agentTag} WARNING: could not extract message_id`);
-                    session.messageCount++;
-                    if (typeof deltaMode !== 'undefined' && deltaMode && typeof messages !== 'undefined') commitDeltaState(session, messages);
-                    persistSessions();
                 }
 
                 return resResult;
@@ -4087,6 +4398,13 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
+            // Single commit point for the turn: only a deliverable turn
+            // advances the cursor. Poisoned/empty/rate-limited turns return
+            // above, leaving parentMessageId/messageCount/delta untouched so
+            // the next turn retries from the last good parent (no rewind
+            // needed — we simply never advanced).
+            commitTurnState(session, pendingMessageId, messages, deltaMode);
+
             // A successful tool call proves the turn complied; any stale guard
             // from an earlier turn must not leak into future classifications.
             // Unconditional clear is safe under concurrency: the worst case is
@@ -4176,7 +4494,10 @@ const server = http.createServer(async (req, res) => {
                 } : {}),
             } }));
         } finally {
-            inFlight--;
+            // Every early return above that never incremented must not
+            // decrement: unconditional inFlight-- drifts the counter negative
+            // on 400/413/503 paths and silently disables the backpressure gate.
+            if (inFlightCounted) inFlight--;
         }
     });
 });
@@ -4236,8 +4557,8 @@ async function showStartupMenu() {
 
 async function main() {
     printBanner();
-    requireProxyApiKey(PROXY_API_KEY, isTruthy(process.env.REQUIRE_PROXY_API_KEY));
-    if (!isLoopbackHost(HOST) && !PROXY_API_KEY) {
+    requireProxyApiKey(getProxyKey(), isTruthy(process.env.REQUIRE_PROXY_API_KEY));
+    if (!isLoopbackHost(HOST) && !getProxyKey()) {
         console.warn(`[DS-API] WARNING: HOST=${HOST} exposes the proxy without authentication. Set PROXY_API_KEY or bind to 127.0.0.1.`);
     }
     const shouldStart = await showStartupMenu();
@@ -4273,7 +4594,7 @@ if (require.main === module) {
     // Graceful shutdown: stop accepting, drain, then exit (force-exit after 10s).
     const shutdown = (sig) => {
         console.log(`[DS-API] ${sig} received — shutting down…`);
-        persistSessions();
+        persistSessionsNow();
         server.close(() => process.exit(0));
         setTimeout(() => process.exit(0), 10000).unref();
     };
@@ -4283,6 +4604,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+    server,
     __test: {
         isAssistantOutputFragment,
         isReasoningFragment,
@@ -4304,6 +4626,28 @@ module.exports = {
         normalizeMessageContent,
         redactImageRef,
         redactEmbeddedDataUrls,
+        redactToolName,
+        sanitizeSessionId,
+        principalForRequest,
+        resolveAgentId,
+        isSharedTitleBucket,
+        MAX_SESSIONS,
+        SESSION_ID_MAX_LENGTH,
+        MAX_BODY_BYTES,
+        MAX_INFLIGHT_BODY_BYTES,
+        MAX_CONCURRENT,
+        checkBackpressure,
+        getInflightBodyBytes,
+        setInflightBodyBytes,
+        getInFlightCount,
+        setInFlightCount,
+        getMediaRoot,
+        isMediaPathAllowed,
+        isStatusVisible,
+        buildHealthPayload,
+        buildReadyzPayload,
+        commitTurnState,
+        getProxyKey,
         redactStringLeavesDeep,
         redactToolArguments,
         normalizeApiParams,
@@ -4337,8 +4681,10 @@ module.exports = {
         detectClientCompaction,
         createSession,
         resetRemoteSession,
+        storeHistory,
         serializeSession,
         persistSessions,
+        persistSessionsNow,
         restoreSessions,
         classifyRepairAttempt,
         recordRepairAttempt,
@@ -4373,6 +4719,7 @@ module.exports = {
         clearKeepAlive,
         emitReasoningPhase,
         consumeDeepSeekStream,
+        writeSse,
         sendAnthropicStream,
         startAnthropicStream,
         finishAnthropicStream,

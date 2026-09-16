@@ -363,6 +363,10 @@ DeepSeek Web does not expose native OpenAI tool calls, so the proxy prompt-emula
 - XML-ish `<tool_call>{...}</tool_call>` wrappers
 - DeepSeek DSML (`<｜DSML｜tool_calls>...`) and the doubled-bar Web variant
 
+Tool names, arguments, and reasoning are redacted on egress as described in
+§6.2 Redaction; malformed (non-object) tool arguments are coerced to `{}` on
+both the streaming and non-streaming Anthropic paths.
+
 ### 3.7 List Active Sessions
 
 ```
@@ -531,6 +535,23 @@ The parser traverses character by character tracking brace depth:
 
 When a session is explicitly reset (via compaction or `/new`), the proxy preserves the **last 15 exchanges** (capped at 10,000 chars). It injects this recovery context only when the client did not already send multi-turn history.
 
+#### Redaction
+
+Embedded `data:` payloads are redacted (`<omitted>`) at intake, at persist
+time, at render time, and in the recovery-history prefix, so a payload can
+neither reach the upstream prompt nor survive in `.sessions.json` / replayed
+history. Tool/function *names* are subject to the same treatment
+(`redactToolName`: data-URL redaction, non-`[A-Za-z0-9._-]` characters folded
+to `_`, 64-char cap); benign names pass through unchanged. Model prose
+`content` is deliberately left raw — the model cannot echo a payload it was
+never shown. Non-`base64` data-URLs (`data:text/plain,`, `data:,`,
+percent-encoded bodies ≥ 64 real chars) and the `base64url` (`-`/`_`)
+alphabet are covered; see §3.6 for the tool-calling surface this protects.
+Note: on the Anthropic paths, malformed tool arguments (strings that do not
+parse to an object, arrays, numbers) are coerced to `{}` identically on the
+streaming and non-streaming mappers (previously the stream emitted the raw
+string, e.g. `"42"`).
+
 ### 6.3 Upstream Expiration & Operator Escape Hatch
 
 If DeepSeek's web chat expires or is invalidated upstream (HTTP 400/404/500):
@@ -580,6 +601,8 @@ fallback_providers: []
 - **x-hif-leim** — custom header from browser  
 - **ds_session_id** — from browser cookie
 - **smidV2** — from browser cookie
+- **DEEPSEEK_MEDIA_ROOT** — server-side directory confining screenshot/`MEDIA:` path honoring (default `<repo>/media`). Absolute image paths outside this root are never probed and never echoed into responses.
+- **DEEPSEEK_PUBLIC_STATUS** — set to `1` to expose full `/health` detail and `/readyz` counts to anonymous probes. Default: private fields require the configured proxy key.
 
 ---
 
