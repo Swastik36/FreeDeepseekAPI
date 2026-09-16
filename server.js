@@ -293,7 +293,10 @@ const MAX_CONCURRENT = Math.max(1, Math.floor(numEnv('DEEPSEEK_MAX_CONCURRENT', 
 // in-flight-body budget (64MB, 503+Retry-After) so concurrent trickled
 // uploads cannot balloon memory. inflightBodyBytes is charged per chunk and
 // released exactly once per request (settled flag guards end+close, which
-// Node fires BOTH of on normal completion).
+// Node fires BOTH of on normal completion). Scope is UPLOAD-IN-FLIGHT ONLY:
+// the charge is released at req `end`, before JSON.parse, so parsed bodies
+// retained during upstream processing are NOT counted here; those are bounded
+// instead by MAX_CONCURRENT concurrent completions × MAX_BODY_BYTES each.
 const MAX_BODY_BYTES = 10 * 1024 * 1024;  // chat payloads are small; cap memory before JSON.parse
 const MAX_INFLIGHT_BODY_BYTES = 64 << 20;
 let inflightBodyBytes = 0;
@@ -3771,10 +3774,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Backpressure: reject rather than fan out unbounded concurrent upstream work.
-    if (checkBackpressure()) {
-        console.log(`[DS-API] 503 backpressure: ${inFlight}/${MAX_CONCURRENT} in flight, rejecting ${req.socket.remoteAddress}`);
+    // Shared 503 writer for both gates (arrival here + body-end re-check): one
+    // status/headers/payload shape by design. Defined before first use (const).
+    const replyBackpressure = () => {
         res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '2' });
         res.end(JSON.stringify({ error: { message: `Server busy (${inFlight}/${MAX_CONCURRENT} requests in flight). Retry shortly.`, type: 'overloaded' } }));
+    };
+    if (checkBackpressure()) {
+        console.log(`[DS-API] 503 backpressure: ${inFlight}/${MAX_CONCURRENT} in flight, rejecting ${req.socket.remoteAddress}`);
+        replyBackpressure();
         return;
     }
 
@@ -3794,31 +3802,27 @@ const server = http.createServer(async (req, res) => {
     // Cap replies (§6): single `responded` flag guards every reply site (not
     // res.headersSent alone — racy vs `close` ordering). res.end FIRST, then
     // req.destroy() ONLY in the end callback (callback form — a sync destroy
-    // can truncate the flush).
-    const replyBodyTooLarge = () => {
+    // can truncate the flush). One parameterized writer keeps the 413 and the
+    // global-budget 503 byte-identical over refactors; only status/headers/
+    // log line/payload differ per call site.
+    const replyCap = (status, headers, logMsg, errType, errMsg) => {
         if (responded) return;
         responded = true;
-        console.log(`[DS-API] 413 body too large (${reqBytes} bytes) from ${req.socket.remoteAddress}`);
+        console.log(logMsg);
         try {
-            res.writeHead(413, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: 'Request body too large', type: 'payload_too_large' } }),
+            res.writeHead(status, headers);
+            res.end(JSON.stringify({ error: { message: errMsg, type: errType } }),
                 () => { try { req.destroy(); } catch (e) { /* already gone */ } });
         } catch (e) {
             try { req.destroy(); } catch (_) { /* already gone */ }
         }
     };
-    const replyInflightBodyCap = () => {
-        if (responded) return;
-        responded = true;
-        console.log(`[DS-API] 503 global in-flight body cap (${inflightBodyBytes}/${MAX_INFLIGHT_BODY_BYTES} bytes) — rejecting ${req.socket.remoteAddress}`);
-        try {
-            res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '2' });
-            res.end(JSON.stringify({ error: { message: 'Server busy (global upload budget exceeded). Retry shortly.', type: 'overloaded' } }),
-                () => { try { req.destroy(); } catch (e) { /* already gone */ } });
-        } catch (e) {
-            try { req.destroy(); } catch (_) { /* already gone */ }
-        }
-    };
+    const replyBodyTooLarge = () => replyCap(413, { 'Content-Type': 'application/json' },
+        `[DS-API] 413 body too large (${reqBytes} bytes) from ${req.socket.remoteAddress}`,
+        'payload_too_large', 'Request body too large');
+    const replyInflightBodyCap = () => replyCap(503, { 'Content-Type': 'application/json', 'Retry-After': '2' },
+        `[DS-API] 503 global in-flight body cap (${inflightBodyBytes}/${MAX_INFLIGHT_BODY_BYTES} bytes) — rejecting ${req.socket.remoteAddress}`,
+        'overloaded', 'Server busy (global upload budget exceeded). Retry shortly.');
     req.on('data', chunk => {
         if (responded) return; // stop accumulating after a cap reply
         const len = Buffer.byteLength(chunk);
@@ -3845,8 +3849,7 @@ const server = http.createServer(async (req, res) => {
         // sockets hold MAX_CONCURRENT forever with no error/abort decrement).
         if (checkBackpressure()) {
             console.log(`[DS-API] 503 backpressure at body-end: ${inFlight}/${MAX_CONCURRENT} in flight, rejecting ${req.socket.remoteAddress}`);
-            res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '2' });
-            res.end(JSON.stringify({ error: { message: `Server busy (${inFlight}/${MAX_CONCURRENT} requests in flight). Retry shortly.`, type: 'overloaded' } }));
+            replyBackpressure();
             return;
         }
         inFlight++;
