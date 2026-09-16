@@ -1061,12 +1061,17 @@ function applyResponsePatchOperations(ops, appendFragments) {
         if (op.p === 'fragments' && op.o === 'APPEND' && op.v !== undefined) {
             appendFragments(op.v);
             applied = true;
+        } else {
+            // Observability: non-APPEND ops are dropped by design (never
+            // observed upstream); log them so a future SET/REPLACE silently
+            // diverging the client becomes visible instead of silent data loss.
+            try { console.log(`[fragments] Ignoring unknown patch op: ${JSON.stringify(op).slice(0, 200)}`); } catch (e) { }
         }
     }
     return applied;
 }
 
-async function consumeDeepSeekStream(readable, { onReasoningDone, isClientGone } = {}) {
+async function consumeDeepSeekStream(readable, { onReasoningDone, onReasoningProgress, isClientGone } = {}) {
     let buffer = '';
     let lastPath = null;
     const fragments = [];
