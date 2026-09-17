@@ -10,11 +10,13 @@
   "scripts": {
     "start": "node server.js",
     "auth": "node scripts/auth.js",
+    "auth:cli": "sh scripts/auth-cli.sh",
     "auth:import": "node scripts/auth_import.js",
+    "auth:probe": "node scripts/probe-account.js",
     "doctor": "node scripts/doctor.js",
     "deepseek:auth": "node scripts/deepseek_chrome_auth.js",
     "client": "node client.js",
-    "test": "node --check server.js && node --check lib/pow.js && node --check scripts/auth.js && node --check scripts/auth_import.js && node --check scripts/doctor.js && node --check scripts/deepseek_chrome_auth.js && node --check scripts/probe_deepseek_models.js && node --check client.js && node --check scripts/live_agentic_smoke_tests.mjs && node --test tests/unit.test.js",
+    "test": "node --check server.js && node --check lib/pow.js && node --check scripts/auth.js && node --check scripts/auth_import.js && node --check scripts/doctor.js && node --check scripts/deepseek_chrome_auth.js && node --check scripts/probe-account.js && node --check scripts/probe_deepseek_models.js && node --check client.js && node --check scripts/live_agentic_smoke_tests.mjs && node --test tests/unit.test.js",
     "test:live": "node scripts/live_agentic_smoke_tests.mjs"
   },
   "keywords": [

@@ -2790,6 +2790,192 @@ test('logging: logToken strips log-forging characters and caps length', () => {
   assert.equal(serverInternals.logToken('x'.repeat(200)).length, 80);
 });
 
+test('tool tags: parseToolTagList splits, trims, drops empties/overlong, caps at 32', () => {
+  assert.deepEqual(serverInternals.parseToolTagList('a|b'), ['a', 'b']);
+  assert.deepEqual(serverInternals.parseToolTagList('  a  ||  |b|'), ['a', 'b']);
+  assert.deepEqual(serverInternals.parseToolTagList(''), []);
+  assert.deepEqual(serverInternals.parseToolTagList('ok|' + 'x'.repeat(200)), ['ok']);
+  const many = Array.from({ length: 40 }, (_, i) => `t${i}`).join('|');
+  assert.equal(serverInternals.parseToolTagList(many).length, 32);
+});
+
+test('tool tags: custom wrappers detect and parse end-to-end', (t) => {
+  serverInternals.setExtraToolTags(['<mytools>'], ['</mytools>']);
+  t.after(() => serverInternals.setExtraToolTags([], []));
+  assert.ok(serverInternals.looksLikeToolCallMarkup('result: <mytools> done'), 'extra start detected');
+  assert.ok(!serverInternals.looksLikeToolCallMarkup('plain prose, no markup'), 'no false positive');
+  const tc = serverInternals.parseToolCall('<mytools>{"name":"read_file","arguments":{"path":"/tmp/a"}}</mytools>');
+  assert.ok(tc, 'custom wrapper parsed');
+  assert.equal(tc.name, 'read_file');
+});
+
+test('tool tags: empty extras change nothing', (t) => {
+  serverInternals.setExtraToolTags([], []);
+  t.after(() => serverInternals.setExtraToolTags([], []));
+  assert.ok(!serverInternals.looksLikeToolCallMarkup('plain prose, no markup'));
+  assert.equal(serverInternals.parseToolCall('plain prose, no markup'), null);
+});
+
+test('tool tags: setter enforces the same caps as env parsing', (t) => {
+  const many = Array.from({ length: 40 }, (_, i) => `<t${i}>`);
+  serverInternals.setExtraToolTags(many, ['x'.repeat(500)]);
+  t.after(() => serverInternals.setExtraToolTags([], []));
+  assert.ok(serverInternals.looksLikeToolCallMarkup('uses <t0> here'), 'kept tag detected');
+  assert.ok(!serverInternals.looksLikeToolCallMarkup('uses <t39> here'), '33rd+ tag dropped');
+});
+
+test('tool tags: ends-alone never detect (no pairing possible)', (t) => {
+  serverInternals.setExtraToolTags([], ['</lonely>']);
+  t.after(() => serverInternals.setExtraToolTags([], []));
+  assert.ok(!serverInternals.looksLikeToolCallMarkup('a stray </lonely> mention'), 'ends inert without starts');
+  assert.equal(serverInternals.parseToolCall('a stray </lonely> mention'), null);
+});
+
+test('tool tags: unpaired start plus bare JSON does not parse', (t) => {
+  serverInternals.setExtraToolTags(['<bare>'], ['</bare>']);
+  t.after(() => serverInternals.setExtraToolTags([], []));
+  // No end tag present -> allowBare off -> bare object must not become a call.
+  assert.equal(serverInternals.parseToolCall('<bare> intro {"name":"sneaky","arguments":{}}'), null);
+});
+
+test('tool tags: malformed DSML short-circuits before custom stage (documented precedence)', (t) => {
+  serverInternals.setExtraToolTags(['<mytools>'], ['</mytools>']);
+  t.after(() => serverInternals.setExtraToolTags([], []));
+  // DSML gate matches "<invoke" and returns null on malformed input — the valid
+  // custom pair below never runs. Deliberate: built-in gate first, custom last.
+  const text = '<invoke broken( <mytools>{"name":"read_file","arguments":{"path":"/tmp/a"}}</mytools>';
+  assert.equal(serverInternals.parseToolCall(text), null);
+});
+
+test('tool tags: fenced parsing wins over custom tags (lowest precedence)', (t) => {  serverInternals.setExtraToolTags(['<mytools>'], ['</mytools>']);
+  t.after(() => serverInternals.setExtraToolTags([], []));
+  const seen = [];
+  const prevLog = console.log;
+  console.log = (...a) => { seen.push(a.join(' ')); };
+  try {
+    const fence = '```json\n{"tool_call":{"name":"read_file","arguments":{"path":"/tmp/a"}}}\n```';
+    const tc = serverInternals.parseToolCall(fence);
+    assert.ok(tc, 'fenced still parses with tags configured');
+    assert.equal(tc.name, 'read_file');
+    assert.ok(!seen.some(l => l.includes('SUCCESS custom')), 'custom stage never fired');
+  } finally {
+    console.log = prevLog;
+  }
+});
+
+test('tool tags: env splitter drops extra sections', () => {
+  assert.deepEqual(serverInternals.parseToolTagEnv('a|b;c|d'), { starts: ['a', 'b'], ends: ['c', 'd'] });
+  assert.deepEqual(serverInternals.parseToolTagEnv('a;b;c'), { starts: ['a'], ends: ['b'] });
+  assert.deepEqual(serverInternals.parseToolTagEnv(''), { starts: [], ends: [] });
+});
+
+test('retry toggle: rateLimitRetryDelayMs floors at 2s, honors Retry-After, caps at 10s', () => {
+  const d = serverInternals.rateLimitRetryDelayMs;
+  assert.equal(d(undefined), 2000);
+  assert.equal(d(null), 2000);
+  assert.equal(d(0), 2000);
+  assert.equal(d('garbage'), 2000);
+  assert.equal(d(-5), 2000);
+  assert.equal(d(5), 5000);
+  assert.equal(d(120), 10000);
+});
+
+test('retry toggle: shouldRetryInPlace wires flag, rate-limit, state, backoff, readiness', () => {
+  const f = serverInternals.shouldRetryInPlace;
+  const base = { flagOn: true, rateLimit: true, migrated: false, gone: false, deadline: false, retryAfterSec: undefined, anyReady: true };
+  assert.equal(f(base), true, 'happy path attempts');
+  assert.equal(f({ ...base, flagOn: false }), false, 'default off never attempts');
+  assert.equal(f({ ...base, rateLimit: false }), false, 'non-rate-limit never attempts');
+  assert.equal(f({ ...base, migrated: true }), false, 'already migrated never attempts');
+  assert.equal(f({ ...base, gone: true }), false);
+  assert.equal(f({ ...base, deadline: true }), false);
+  assert.equal(f({ ...base, retryAfterSec: 600 }), false, 'long backoff goes to migration');
+  assert.equal(f({ ...base, retryAfterSec: 5 }), true, 'brief backoff attempts');
+  assert.equal(f({ ...base, anyReady: false }), false, 'all cooling skips the lift (no upstream leak)');
+});
+
+test('retry toggle: shouldAttemptInPlaceRetry only for unknown/brief backoffs', () => {
+  const f = serverInternals.shouldAttemptInPlaceRetry;
+  assert.equal(f(undefined), true, 'unknown -> optimistic probe');
+  assert.equal(f(null), true);
+  assert.equal(f(''), true);
+  assert.equal(f(0), true);
+  assert.equal(f(5), true);
+  assert.equal(f(10), true, 'cap boundary inclusive');
+  assert.equal(f(11), false, 'long backoff -> migration');
+  assert.equal(f(600), false);
+  assert.equal(f('garbage'), true, 'unparseable -> probe (delay floors)');
+  assert.equal(f(-3), true, 'negative -> probe (delay floors)');
+});
+
+test('retry toggle: inPlaceRateLimitRetry lifts once, restores without extending', async () => {
+  const f = serverInternals.inPlaceRateLimitRetry;
+  assert.deepEqual(await f(null, async () => 'x'), { recovered: false });
+  assert.deepEqual(await f({ cooldownUntil: 0 }, null), { recovered: false });
+  // Success: bypass observed inside the attempt, result passed through.
+  const acct = { id: 'a', cooldownUntil: 600000, failures: 3 };
+  let seenDuringAttempt = -1;
+  const ok = await f(acct, async () => { seenDuringAttempt = acct.cooldownUntil; return { resp: 1 }; });
+  assert.equal(seenDuringAttempt, 0, 'cooldown lifted during attempt');
+  assert.equal(ok.recovered, true);
+  assert.deepEqual(ok.result, { resp: 1 });
+  assert.equal(acct.cooldownUntil, 0, 'success path owns reset from here');
+  assert.equal(acct.failures, 3, 'helper never touches counters');
+  // Failure: exact restore of the whole limiter/scorer snapshot, error preserved.
+  // The thunk mutates like a real markAccountFailure would — a restore that
+  // only covers cooldownUntil (the pre-fix shape) fails this test.
+  const acct2 = { id: 'b', cooldownUntil: 600000, failures: 1, consecutiveFailures: 1, consecutiveTimeouts: 2 };
+  const boom = new Error('upstream 429 again');
+  const bad = await f(acct2, async () => {
+    acct2.failures += 1;
+    acct2.consecutiveFailures = 0;
+    acct2.consecutiveTimeouts = 0;
+    acct2.cooldownUntil = 999999;
+    throw boom;
+  });
+  assert.equal(bad.recovered, false);
+  assert.equal(bad.error, boom, 'second error preserved, not swallowed');
+  assert.equal(acct2.cooldownUntil, 600000, 'no extension for our probe');
+  assert.equal(acct2.failures, 1, 'no double-count');
+  assert.equal(acct2.consecutiveFailures, 1, 'streak untouched');
+  assert.equal(acct2.consecutiveTimeouts, 2, 'timeout streak untouched');
+});
+
+test('retry toggle: anyAccountReady gates the retry on real readiness', () => {
+  const f = serverInternals.anyAccountReady;
+  const now = Date.now();
+  const good = { config: { token: 't', cookie: 'c' }, cooldownUntil: 0 };
+  const cooling = { config: { token: 't', cookie: 'c' }, cooldownUntil: now + 600000 };
+  const noCreds = { config: { token: '', cookie: '' }, cooldownUntil: 0 };
+  assert.equal(f([cooling], now), false, 'all cooling -> skip retry');
+  assert.equal(f([cooling, good], now), true);
+  assert.equal(f([noCreds], now), false, 'credentialless never ready');
+  assert.equal(f([], now), false);
+  assert.equal(f(null, now), false);
+});
+
+test('retry toggle: exhausted-429 message guides backoff + compact, keeps contract', () => {  const msg = serverInternals.rateLimitExhaustedMessage(90);
+  assert.ok(msg.includes('~90s'), 'wait time present');
+  assert.ok(msg.includes('/compact'), 'compact guidance present');
+  assert.ok(!msg.includes('Bearer') && !msg.includes('token='), 'nothing secret-adjacent');
+});
+
+test('probe-account: classifyPowResponse verdicts without slicing', () => {
+  const c = require('../scripts/probe-account.js').classifyPowResponse;
+  assert.deepEqual(c(200, '{"code":0,"data":{"biz_data":{}}}'), { ok: true });
+  assert.deepEqual(c(200, '{"code":0}'), { ok: true });
+  assert.deepEqual(c(200, '{"data":{}}'), { ok: true });
+  assert.deepEqual(c(200, '{"code":40003,"data":null}'), { ok: false, reason: 'pow-missing' });
+  assert.deepEqual(c(200, '{"code":40003,"data":{}}'), { ok: false, reason: 'pow-missing' }, 'error code with data is still dead');
+  assert.deepEqual(c(200, '{"code":5,"data":{"biz_data":{}}}'), { ok: false, reason: 'pow-missing' });
+  assert.deepEqual(c(200, '{"code":"0"}'), { ok: true }, 'string zero counts');
+  assert.deepEqual(c(200, '{"code":null,"data":null}'), { ok: false, reason: 'pow-missing' }, 'null code is not alive');
+  assert.deepEqual(c(200, 'not json{{{'), { ok: false, reason: 'non-json' });
+  assert.deepEqual(c(200, ''), { ok: false, reason: 'non-json' });
+  assert.deepEqual(c(401, '{}'), { ok: false, reason: 'http-401' });
+  assert.equal(c(200, 'x'.repeat(500) + '{"code":0}').ok, false, 'garbage prefix is not ALIVE');
+});
+
 test('smart routing: scoreAccount clamps hostedCount into [0,8]', (t) => {  saveRoutingEnv(t);
   delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
   delete process.env.DEEPSEEK_ROUTING_MODE;

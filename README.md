@@ -407,6 +407,27 @@ DEEPSEEK_ROUTING_HOT_BONUS=2 npm start                  # bonus for the most rec
 DEEPSEEK_ROUTING_HOT_WINDOW_MS=60000 npm start          # how recent "recently successful" means
 ```
 
+Extra tool-call fallback tags (literal substring sentinels, `;` splits starts
+from ends, `|` splits entries — no regexes ever; max 32 tags of 128 chars each,
+extra `;`-sections ignored with a warning; read once at startup, restart to apply):
+
+```bash
+DEEPSEEK_TOOL_TAGS="<mytools>|<tool_begin>;</mytools>|<tool_end>" npm start
+```
+
+Optional same-chat rate-limit retry (default off — fail-fast 429 preserved):
+
+```bash
+DEEPSEEK_RETRY_RATELIMIT=1 npm start  # one 2s wait + in-place retry, only for unknown/brief backoffs
+```
+
+With the retry on, a rate-limited turn waits once (2s, or the upstream
+`Retry-After` up to a 10s cap — longer backoffs go straight to migration), lifts
+the account cooldown for exactly one same-account+chat attempt, and restores it
+without extending on failure. When everything is exhausted the proxy answers
+429 with a backoff + `/compact` guidance message (status and `Retry-After`
+unchanged, so clients keep backing off instead of hammering).
+
 To configure the cooldown:
 
 ```bash
@@ -633,6 +654,13 @@ npm start
 ```
 
 If DeepSeek starts answering `401`, `403`, or asks for a new PoW/session — repeat `npm run auth` and refresh the saved browser session.
+
+For multi-account management (add / renew / delete / check with live probes):
+
+```bash
+npm run auth:cli
+npm run auth:cli -- check all
+```
 
 Local auth files must not end up on GitHub:
 

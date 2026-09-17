@@ -305,6 +305,117 @@ const ROUTING_ESCALATION_COOLDOWN_MS = numEnv('DEEPSEEK_ROUTING_ESCALATION_COOLD
 const ROUTING_FAILURE_HALFLIFE_MS = numEnv('DEEPSEEK_ROUTING_FAILURE_HALFLIFE_MS', 5 * 60 * 1000, 0);
 const ROUTING_HOT_BONUS = numEnv('DEEPSEEK_ROUTING_HOT_BONUS', 2, 0);
 const ROUTING_HOT_WINDOW_MS = numEnv('DEEPSEEK_ROUTING_HOT_WINDOW_MS', 60 * 1000, 0);
+// Optional same-chat rate-limit retry (round-3 G7): DEEPSEEK_RETRY_RATELIMIT=1
+// waits once (bounded, Retry-After honored up to a cap) and retries the turn on
+// the SAME account+chat before migration runs. Default off: fail-fast 429.
+const RETRY_RATELIMIT = isTruthy(process.env.DEEPSEEK_RETRY_RATELIMIT);
+const RATELIMIT_RETRY_BASE_MS = 2000;
+const RATELIMIT_RETRY_MAX_MS = 10000;
+function rateLimitRetryDelayMs(retryAfterSec) {
+    const honored = Math.max(0, Number(retryAfterSec) || 0) * 1000;
+    return Math.min(Math.max(RATELIMIT_RETRY_BASE_MS, honored), RATELIMIT_RETRY_MAX_MS);
+}
+// Shared fail-fast wording (graceful degradation, not a bare error): keeps the
+// 429 status + Retry-After contract integrators back off on, while telling the
+// caller exactly what to do. Smaller post-compact turns burn less quota, which
+// is what protects the accounts — hammering helps nothing: while all accounts
+// cool, retries never reach DeepSeek anyway.
+function rateLimitExhaustedMessage(waitSec) {
+    return `DeepSeek rate limit reached on all accounts. Retry in ~${waitSec}s — sooner just returns 429 again without reaching DeepSeek. Tip: /compact to shrink context first; smaller turns burn less quota.`;
+}
+// In-place retry is only attempted when quick recovery is plausible: unknown
+// Retry-After gets one optimistic probe, brief backoffs (<= cap) are worth the
+// wait, long backoffs go straight to migration (waiting out minutes in-request
+// burns the deadline and the client's patience).
+function shouldAttemptInPlaceRetry(retryAfterSec) {
+    if (retryAfterSec === undefined || retryAfterSec === null || retryAfterSec === '') return true;
+    const secs = Number(retryAfterSec);
+    if (!Number.isFinite(secs) || secs < 0) return true;
+    return secs * 1000 <= RATELIMIT_RETRY_MAX_MS;
+}
+// Full gate for the in-place retry branch, extracted pure so the wiring ("skip
+// when all cooling, skip long backoffs, default off") is unit-testable without
+// fetch mocks. waitMs is computed by retryWaitMs below.
+function shouldRetryInPlace(o = {}) {
+    if (!o.flagOn || !o.rateLimit || o.migrated || o.gone || o.deadline) return false;
+    if (!shouldAttemptInPlaceRetry(o.retryAfterSec)) return false;
+    if (!o.anyReady) return false;
+    return true;
+}
+// Bounded wait: never sleep past the request deadline (H-2 — an unbounded
+// sleep stalls the client, then the attempt is skipped anyway).
+function retryWaitMs(retryAfterSec, remainingMs) {
+    if (!(remainingMs > 0)) return 0;
+    return Math.min(rateLimitRetryDelayMs(retryAfterSec), remainingMs);
+}
+// Readiness pre-filter shared by the retry gate: any credentialed account
+// whose cooldown has lifted. Exported for tests.
+function anyAccountReady(list, nowMs = Date.now()) {
+    return (list || []).some(a => a && a.config && a.config.token && a.config.cookie && (a.cooldownUntil || 0) <= nowMs);
+}
+// Testable core of the in-place retry (no env, timers, or fetch): lifts the
+// cooldown for exactly one attemptTurn() call on the SAME account and fully
+// restores the account's limiter/scorer state (cooldown AND failure counters)
+// if the probe fails. A failed probe therefore records nothing at all: our
+// optimism never deepens the backoff and never inflates the failure score —
+// the original failure's own mark stands alone.
+// Returns { recovered, result?, error? }.
+async function inPlaceRateLimitRetry(account, attemptTurn) {
+    if (!account || typeof attemptTurn !== 'function') return { recovered: false };
+    const saved = {
+        cooldownUntil: Number(account.cooldownUntil) || 0,
+        failures: Number(account.failures) || 0,
+        consecutiveFailures: Number(account.consecutiveFailures) || 0,
+        consecutiveTimeouts: Number(account.consecutiveTimeouts) || 0,
+    };
+    account.cooldownUntil = 0;
+    try {
+        return { recovered: true, result: await attemptTurn() };
+    } catch (retryErr) {
+        account.cooldownUntil = saved.cooldownUntil;
+        account.failures = saved.failures;
+        account.consecutiveFailures = saved.consecutiveFailures;
+        account.consecutiveTimeouts = saved.consecutiveTimeouts;
+        return { recovered: false, error: retryErr };
+    }
+}
+// Operator-configurable extra tool-call sentinels (round-3 G4):
+// DEEPSEEK_TOOL_TAGS="start1|start2;end1|end2". Literal substring matchers
+// (never regexes), consulted by looksLikeToolCallMarkup (detection → drives
+// truncated-markup retries) and parseCustomTagToolCall (extraction). Capped so
+// a bloated env value can't slow the hot path.
+const MAX_TOOL_TAG_LEN = 128;
+const MAX_TOOL_TAGS = 32;
+function parseToolTagList(raw) {
+    return String(raw || '').split('|').map(s => s.trim()).filter(s => s.length > 0 && s.length <= MAX_TOOL_TAG_LEN).slice(0, MAX_TOOL_TAGS);
+}
+function parseToolTagEnv(value) {
+    const parts = String(value || '').split(';');
+    if (parts.length > 2) {
+        console.warn(`[DS-API] DEEPSEEK_TOOL_TAGS has ${parts.length} ';'-sections; using the first two, ignoring the rest.`);
+    }
+    return { starts: parseToolTagList(parts[0] || ''), ends: parseToolTagList(parts[1] || '') };
+}
+const TOOL_TAG_PARTS = parseToolTagEnv(process.env.DEEPSEEK_TOOL_TAGS);
+let TOOL_EXTRA_STARTS = TOOL_TAG_PARTS.starts;
+let TOOL_EXTRA_ENDS = TOOL_TAG_PARTS.ends;
+if (TOOL_EXTRA_STARTS.length > 0 || TOOL_EXTRA_ENDS.length > 0) {
+    console.log(`[DS-API] custom tool tags: ${TOOL_EXTRA_STARTS.length} starts, ${TOOL_EXTRA_ENDS.length} ends`);
+}
+// Test hook (mirrors setInflightBodyBytes pattern): tests swap tag lists.
+// Validated exactly like env input so tests cannot inject shapes prod rejects.
+function setExtraToolTags(starts, ends) {
+    const clean = (arr) => (Array.isArray(arr) ? arr : [])
+        .map(s => String(s ?? '').trim())
+        .filter(s => s.length > 0 && s.length <= MAX_TOOL_TAG_LEN)
+        .slice(0, MAX_TOOL_TAGS);
+    const rawCount = (Array.isArray(starts) ? starts.length : 0) + (Array.isArray(ends) ? ends.length : 0);
+    TOOL_EXTRA_STARTS = clean(starts);
+    TOOL_EXTRA_ENDS = clean(ends);
+    if (TOOL_EXTRA_STARTS.length + TOOL_EXTRA_ENDS.length < rawCount) {
+        console.warn(`[DS-API] custom tool tags truncated to ${MAX_TOOL_TAGS} entries of ${MAX_TOOL_TAG_LEN} chars (input had ${rawCount})`);
+    }
+}
 let DS_CONFIG = {};
 let dsHeaders = {};
 const accounts = [];
@@ -360,7 +471,7 @@ function discoverAuthPaths() {
     if (process.env.DEEPSEEK_AUTH_DIR) {
         try {
             return fs.readdirSync(process.env.DEEPSEEK_AUTH_DIR)
-                .filter(f => f.endsWith('.json'))
+                .filter(f => f.endsWith('.json') && !f.startsWith('.'))
                 .sort()
                 .map(f => path.join(process.env.DEEPSEEK_AUTH_DIR, f));
         } catch (e) {
@@ -456,7 +567,7 @@ function selectAccountForSession(session, sessionKey = '') {
             const waitSec = Math.max(1, Math.ceil((waiting.cooldownUntil - now) / 1000));
             // Tagged so the request handler returns 429 + Retry-After instead of a
             // generic 500 (integrator backoff keys on the status code, not the text).
-            const err = new Error(`All DeepSeek auth accounts are cooling down. Retry in ~${waitSec}s or import a fresh account with npm run auth:import.`);
+            const err = new Error(rateLimitExhaustedMessage(waitSec) + ' Or import a fresh account with npm run auth:import.');
             err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
             throw err;
         }
@@ -2017,7 +2128,61 @@ function looksLikeToolCallMarkup(text) {
     // above MAX_TOOL_MARKUP_CHARS): don't flag it, and especially don't burn
     // a healthy chat with a 502 on content that was merely large (10c).
     if (value.length > MAX_TOOL_MARKUP_CHARS) return false;
-    return /TOOL_CALL:\s*[\w-]+|<\s*tool_call\b|[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b|["'](?:tool_call|tool_calls|function_call)["']\s*:/i.test(value);
+    if (/TOOL_CALL:\s*[\w-]+|<\s*tool_call\b|[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b|["'](?:tool_call|tool_calls|function_call)["']\s*:/i.test(value)) return true;
+    // Operator-configured extra sentinels: literal substring match only.
+    for (const tag of TOOL_EXTRA_STARTS) if (tag && value.includes(tag)) return true;
+    // End tags need configured starts to mean anything (no pairing possible
+    // otherwise), but once starts exist an end tag alone is a truncation-tail
+    // signal worth retrying on — see the paired-region rule in
+    // parseCustomTagToolCall for the stricter extraction side.
+    if (TOOL_EXTRA_STARTS.length > 0) {
+        for (const tag of TOOL_EXTRA_ENDS) if (tag && value.includes(tag)) return true;
+    }
+    return false;
+}
+
+function parseCustomTagToolCall(text) {
+    if (TOOL_EXTRA_STARTS.length === 0) return null;
+    const MAX_CUSTOM_TAG_REGIONS = 4;
+    const MAX_CUSTOM_TAG_REGION_CHARS = 2048;
+    let attempts = 0;
+    let from = 0;
+    while (attempts < MAX_CUSTOM_TAG_REGIONS) {
+        let startTag = '';
+        let startIdx = -1;
+        for (const tag of TOOL_EXTRA_STARTS) {
+            if (!tag) continue;
+            const i = text.indexOf(tag, from);
+            if (i !== -1 && (startIdx === -1 || i < startIdx)) { startIdx = i; startTag = tag; }
+        }
+        if (startIdx === -1) return null;
+        let endIdx = -1;
+        for (const tag of TOOL_EXTRA_ENDS) {
+            if (!tag) continue;
+            const i = text.indexOf(tag, startIdx + startTag.length);
+            if (i !== -1 && (endIdx === -1 || i < endIdx)) endIdx = i;
+        }
+        const regionEnd = endIdx === -1
+            ? Math.min(text.length, startIdx + startTag.length + MAX_CUSTOM_TAG_REGION_CHARS)
+            : endIdx;
+        const inner = text.substring(startIdx + startTag.length, regionEnd).trim();
+        // Bare objects only inside a PAIRED region (end tag found): a lone
+        // start mention plus unrelated later JSON must not become a tool call.
+        // Unpaired regions still try strict explicit envelopes.
+        const tc = parseJsonToolCandidate(inner, 'custom', { allowBare: endIdx !== -1 })
+            || (endIdx !== -1 ? firstCustomJsonCandidate(inner) : null);
+        if (tc) return tc;
+        attempts++;
+        from = startIdx + 1;
+    }
+    return null;
+}
+function firstCustomJsonCandidate(inner) {
+    for (const rawJson of extractBalancedJsonObjects(inner)) {
+        const tc = parseJsonToolCandidate(rawJson, 'custom', { allowBare: true });
+        if (tc) return tc;
+    }
+    return null;
 }
 
 function parseToolCall(text, options = {}) {
@@ -2077,6 +2242,13 @@ function parseToolCall(text, options = {}) {
             console.log(`[parseToolCall] TOOL_CALL:${name} found but no { after it`);
         }
     }
+
+    // Operator-configured custom wrappers (DEEPSEEK_TOOL_TAGS), lowest
+    // precedence: only runs when XML/fenced/legacy found nothing, so explicit
+    // operator tags can never shadow a built-in parse. Misses fall through to
+    // the inline scan below.
+    const customTc = parseCustomTagToolCall(text);
+    if (customTc) return customTc;
 
     // Scan each top-level balanced object once (linear time). Only explicit
     // tool-call envelopes are executable; bare {name, arguments} examples are not.
@@ -4265,24 +4437,61 @@ const server = http.createServer(async (req, res) => {
                 fullConversation
             );
             let initialCall;
+            // Optional same-chat rate-limit retry (DEEPSEEK_RETRY_RATELIMIT=1,
+            // default off): one bounded wait + a single in-place retry on the
+            // SAME account+chat. Returns true with initialCall set on recovery;
+            // false leaves everything for the fail-fast/migration path below.
+            let recoveredInPlace = false;
             try {
                 initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
             } catch (e) {
-                // askDeepSeekStream already cooled the throttled account via
-                // markAccountFailure (brief §3 step 1). Migrate once; a second
-                // 429 (or no ready peer) fails fast exactly as today.
-                if (!isRateLimitError(e) || rateLimitMigrated || clientGone || deadlineHit()) throw e;
-                const decision = resolveRateLimitMigration(session, accounts, rateLimitMigrated);
-                if (!decision.migrateTo) throw e;
-                const move = performRateLimitMigration(session, decision.migrateTo);
-                rateLimitMigrated = true;
-                const migrationBuild = rebuildMigrationFreshPrompt();
-                if (migrationBuild.compacted) {
-                    promptCompacted = true;
-                    markContextCompacted(res);
+                // askDeepSeekStream already cooled the throttled account.
+                // Order: optional in-place retry first (same account+chat),
+                // then migration, then fail-fast - each stage preserves the
+                // freshest error for the next.
+                // All-cooling errors skip the retry entirely: lifting a cooldown
+                // when NO account is ready would send one request upstream that
+                // the exhausted message promises never happens. Migration below
+                // then throws the proper all-cooling 429.
+                const anyReadyNow = anyAccountReady(accounts);
+                const remainingMs = Math.max(0, REQUEST_DEADLINE_MS - (Date.now() - requestStartedAt));
+                const waitMs = retryWaitMs(e.retryAfter, remainingMs);
+                if (shouldRetryInPlace({ flagOn: RETRY_RATELIMIT, rateLimit: isRateLimitError(e), migrated: rateLimitMigrated, gone: clientGone, deadline: deadlineHit(), retryAfterSec: e.retryAfter, anyReady: anyReadyNow })
+                    && waitMs > 0) {
+                    const retryAccount = accounts.find(a => a.id === session.accountId);
+                    if (retryAccount) {
+                        console.log(`${agentTag} rate-limit: one in-place retry on acct:${retryAccount.id} in ${waitMs}ms (lifting cooldown once)`);
+                        await new Promise(r => setTimeout(r, waitMs));
+                    }
+                    if (retryAccount && !clientGone && !deadlineHit()) {
+                        const attempt = await inPlaceRateLimitRetry(retryAccount, () =>
+                            askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt));
+                        if (attempt.recovered) {
+                            initialCall = attempt.result;
+                            recoveredInPlace = true;
+                            console.log(`${agentTag} in-place rate-limit retry recovered the turn`);
+                        } else if (attempt.error) {
+                            const msg = String((attempt.error && attempt.error.message) || attempt.error || '').substring(0, 120);
+                            console.log(`${agentTag} in-place retry failed (${msg}); continuing below`);
+                            e = attempt.error;
+                        }
+                    }
                 }
-                initialCall = await askDeepSeekStream(migrationBuild.prompt, agentId, requestedModel, migrationBuild.prompt);
-                console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): rate-limit`);
+                // Recovered turns skip everything below (initialCall is set).
+                if (!recoveredInPlace) {
+                    if (!isRateLimitError(e) || rateLimitMigrated || clientGone || deadlineHit()) throw e;
+                    const decision = resolveRateLimitMigration(session, accounts, rateLimitMigrated);
+                    if (!decision.migrateTo) throw e;
+                    const move = performRateLimitMigration(session, decision.migrateTo);
+                    rateLimitMigrated = true;
+                    const migrationBuild = rebuildMigrationFreshPrompt();
+                    if (migrationBuild.compacted) {
+                        promptCompacted = true;
+                        markContextCompacted(res);
+                    }
+                    initialCall = await askDeepSeekStream(migrationBuild.prompt, agentId, requestedModel, migrationBuild.prompt);
+                    console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): rate-limit`);
+                }
             }
             let dsResp = initialCall.resp;
             if (initialCall.promptUsed !== fullPrompt) {
@@ -4408,12 +4617,12 @@ const server = http.createServer(async (req, res) => {
                         : 2;
                     console.log(`${agentTag} rate-limit migration exhausted (${rateLimitMigrated ? 'already migrated this turn' : 'no other ready account'}); failing fast 429.`);
                     if (res.headersSent) {
-                        sendStreamError(res, apiMode, { message: `DeepSeek rate limit reached. Retry in ~${waitSec}s.`, type: 'rate_limit_error' });
+                        sendStreamError(res, apiMode, { message: rateLimitExhaustedMessage(waitSec), type: 'rate_limit_error' });
                         return;
                     }
                     res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(waitSec) });
                     res.end(JSON.stringify({ error: {
-                        message: `DeepSeek rate limit reached. Retry in ~${waitSec}s.`,
+                        message: rateLimitExhaustedMessage(waitSec),
                         type: 'rate_limit_error',
                         agent: agentId,
                         failed_session_id: session.id,
@@ -4803,7 +5012,16 @@ const server = http.createServer(async (req, res) => {
             // On timeout, preserve activeSession per no-new-chats invariant (implementor-brief-no-new-chats-2026-09-15).
             // Do NOT reset the remote session. Cooling the account is orthogonal to preserving the chat.
             res.end(JSON.stringify({ error: {
-                message: toClientErrorMessage(e.message),
+                message: (() => {
+                    // All-cooling / exhausted 429s land here (not just the
+                    // in-turn fail-fast above): same enriched wording so every
+                    // 429 carries backoff + /compact guidance. Other errors
+                    // keep the sanitized passthrough.
+                    if (status !== 429) return toClientErrorMessage(e.message);
+                    const ms = parseRetryAfterMs(e.retryAfter);
+                    if (ms == null) return toClientErrorMessage(e.message);
+                    return rateLimitExhaustedMessage(Math.max(1, Math.ceil(ms / 1000)));
+                })(),
                 type: e.type || (timedOut ? 'request_timeout' : 'server_error'),
                 ...(activeSession ? {
                     agent: activeAgentId,
@@ -4973,6 +5191,16 @@ module.exports = {
         normalizeApiParams,
         parseDsmlToolCall,
         looksLikeToolCallMarkup,
+        parseToolTagList,
+        setExtraToolTags,
+        parseToolTagEnv,
+        rateLimitRetryDelayMs,
+        shouldAttemptInPlaceRetry,
+        shouldRetryInPlace,
+        retryWaitMs,
+        inPlaceRateLimitRetry,
+        anyAccountReady,
+        rateLimitExhaustedMessage,
         truncatePromptMiddle,
         hasExplicitConversationHistory,
         buildRecoveryHistoryPrefix,

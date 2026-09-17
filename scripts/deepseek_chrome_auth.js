@@ -319,7 +319,7 @@ async function readPageAuth(cdp) {
         pageState.localStorage || {},
         pageState.sessionStorage || {},
     ];
-    let token = '';
+    let storeToken = '';
     for (const store of stores) {
         for (const key of [
             'userToken',
@@ -328,20 +328,20 @@ async function readPageAuth(cdp) {
             'access_token',
             'accessToken',
         ]) {
-            token = normalizeToken(store[key]);
-            if (token) break;
+            storeToken = normalizeToken(store[key]);
+            if (storeToken) break;
         }
-        if (token) break;
+        if (storeToken) break;
     }
-    if (!token) {
+    if (!storeToken) {
         for (const store of stores) {
             for (const [k, v] of Object.entries(store)) {
                 if (/token/i.test(k)) {
-                    token = normalizeToken(v);
-                    if (token) break;
+                    storeToken = normalizeToken(v);
+                    if (storeToken) break;
                 }
             }
-            if (token) break;
+            if (storeToken) break;
         }
     }
 
@@ -352,22 +352,30 @@ async function readPageAuth(cdp) {
     const cookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
 
     let hif_dliq = '',
-        hif_leim = '';
+        hif_leim = '',
+        headerToken = '';
     for (const ev of cdp.events) {
         const headers = ev.params?.headers || ev.params?.request?.headers;
         if (!headers) continue;
+        // Scope to DeepSeek traffic where the event carries a URL
+        // (requestWillBeSent/responseReceived). Untagged header batches
+        // (responseReceivedExtraInfo) are accepted as page-scoped traffic —
+        // this runs against chat.deepseek.com tabs only (see getPageTarget).
+        const reqUrl = String(ev.params?.request?.url || ev.params?.response?.url || '');
+        const isDeepSeek = reqUrl === '' || reqUrl.includes('deepseek.com');
         for (const [k, v] of Object.entries(headers)) {
             const lk = k.toLowerCase();
             if (lk === 'x-hif-dliq') hif_dliq = String(v);
             if (lk === 'x-hif-leim') hif_leim = String(v);
-            if (
-                lk === 'authorization' &&
-                !token &&
-                /^Bearer\s+/i.test(String(v))
-            )
-                token = String(v).replace(/^Bearer\s+/i, '');
+            // Last match wins: events accumulate chronologically, so a reused
+            // profile's stale pre-login Bearer must not shadow the fresh one.
+            if (isDeepSeek && lk === 'authorization' && /^Bearer\s+/i.test(String(v)))
+                headerToken = String(v).replace(/^Bearer\s+/i, '');
         }
     }
+    // R1-1: the live API Bearer travels in request headers; the stored
+    // userToken has proven dead (40003). Prefer the sniffed header token.
+    const token = headerToken || storeToken;
 
     const wasmUrl =
         (pageState.resources || []).find((u) => /sha3.*\.wasm/.test(u)) ||

@@ -10,7 +10,7 @@ function argHas(args, ...names) { return args.some(a => names.includes(a)); }
 function authPaths() {
   if (process.env.DEEPSEEK_AUTH_DIR) {
     return fs.readdirSync(process.env.DEEPSEEK_AUTH_DIR)
-      .filter(f => f.endsWith('.json'))
+      .filter(f => f.endsWith('.json') && !f.startsWith('.'))
       .sort()
       .map(f => path.join(process.env.DEEPSEEK_AUTH_DIR, f));
   }
