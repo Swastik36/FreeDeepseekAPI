@@ -434,6 +434,14 @@ To configure the cooldown:
 DEEPSEEK_ACCOUNT_COOLDOWN_MS=600000 npm start
 ```
 
+Hourly per-account request quota (anti-mute — upstream quiets accounts that
+sustain hundreds of requests/hour; over-quota accounts sit out like cooling
+ones, all-spent answers 429 with `Retry-After`):
+
+```bash
+DEEPSEEK_HOURLY_QUOTA=60 npm start  # 0 disables; sliding 1h window per account
+```
+
 ---
 
 ## 🔑 Ideas for console auth

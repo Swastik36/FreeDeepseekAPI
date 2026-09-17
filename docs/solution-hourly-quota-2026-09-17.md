@@ -1,6 +1,6 @@
 # Solution — hourly per-account request quota (implementation plan, no code)
 
-Status: plan only. Rank: #2 anti-mute item (round-3 G2).
+Status: IMPLEMENTED 2026-09-17 — see §7 record. Rank: #2 anti-mute item (round-3 G2).
 
 ## 1. What it is (verified facts)
 
@@ -53,3 +53,13 @@ Status: plan only. Rank: #2 anti-mute item (round-3 G2).
 
 ## 5. Rollback
 Unset env (or `0`) + restart. No schema change (in-memory only).
+
+## 7. Implementation record (2026-09-17)
+
+Built as planned (`server.js`: `DEEPSEEK_HOURLY_QUOTA` default 60 / 0 disables,
+sliding-window `requestTimes` ring capped at 2× quota, readiness pre-filter in
+fresh picks + migration + `/readyz`, earliest-release `Retry-After` on
+all-spent, `used_this_hour`/`quota_exhausted` in `accountStatus`; clock starts
+at PoW-challenge success; success reset does NOT clear the window — different
+signal). Tests 234 green. Live verified with quota=2: two turns served, third
+fails fast 429 with `Retry-After`.

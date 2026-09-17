@@ -18,5 +18,7 @@ data/accounts/*.json
 .sessions.json
 # Live DeepSeek auth tokens/cookies (0600) — never commit. Keep the dir.
 accounts/*.json
+# Quarantined (suspended/expired) account files — also secrets, never commit.
+accounts-quarantined-*/*.json
 # Live browser profile (cookies, session state) — never commit.
 .chrome-profile-second/

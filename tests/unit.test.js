@@ -2941,8 +2941,96 @@ test('retry toggle: inPlaceRateLimitRetry lifts once, restores without extending
   assert.equal(acct2.consecutiveTimeouts, 2, 'timeout streak untouched');
 });
 
-test('retry toggle: anyAccountReady gates the retry on real readiness', () => {
-  const f = serverInternals.anyAccountReady;
+test('hourly quota: sliding window counts, prunes, and caps memory', () => {
+  // NOTE: pins default-quota math (DEEPSEEK_HOURLY_QUOTA is a load-time const).
+  const now = Date.now();
+  const acct = { requestTimes: [] };
+  assert.equal(serverInternals.usedThisHour(acct, now), 0);
+  assert.equal(serverInternals.withinQuota(acct, now), true);
+  for (let i = 0; i < 59; i++) serverInternals.recordAccountRequest(acct, now - i * 1000);
+  assert.equal(serverInternals.usedThisHour(acct, now), 59);
+  assert.equal(serverInternals.withinQuota(acct, now), true, '59th request still ready');
+  serverInternals.recordAccountRequest(acct, now);
+  assert.equal(serverInternals.usedThisHour(acct, now), 60);
+  assert.equal(serverInternals.withinQuota(acct, now), false, '60th request spends the default quota');
+  const mixed = { requestTimes: [] };
+  serverInternals.recordAccountRequest(mixed, now - 3600001);
+  assert.equal(serverInternals.usedThisHour(mixed, now), 0, 'older than window ignored');
+  const hog = { requestTimes: [] };
+  for (let i = 0; i < 500; i++) serverInternals.recordAccountRequest(hog, now);
+  assert.ok(hog.requestTimes.length <= 120, `capped at 2x quota, saw ${hog.requestTimes.length}`);
+});
+
+test('hourly quota: over-quota account excluded from fresh picks, all-spent 429s', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+  const now = Date.now();
+  const mk = (id) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0,
+    lastUsedAt: 0, inflight: 0, headers: {}, requestTimes: [],
+  });
+  const spent = mk('q-spent');
+  for (let i = 0; i < 60; i++) serverInternals.recordAccountRequest(spent, now - i * 1000);
+  const fresh = mk('q-fresh');
+  serverInternals.accounts.push(spent, fresh);
+  assert.equal(serverInternals.selectAccountForSession(serverInternals.createSession()).id, 'q-fresh');
+  for (let i = 0; i < 60; i++) serverInternals.recordAccountRequest(fresh, now - i * 1000);
+  assert.throws(
+    () => serverInternals.selectAccountForSession(serverInternals.createSession()),
+    (e) => e && e.status === 429 && e.retryAfter > 0,
+    'all spent fails fast with Retry-After'
+  );
+});
+
+test('hourly quota: sticky live chat fails fast on spent account, chat-less rotates', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+  const now = Date.now();
+  const mk = (id) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0,
+    lastUsedAt: 0, inflight: 0, headers: {}, requestTimes: [],
+  });
+  const spent = mk('q-sticky-spent');
+  for (let i = 0; i < 60; i++) serverInternals.recordAccountRequest(spent, now - i * 1000);
+  const fresh = mk('q-sticky-fresh');
+  serverInternals.accounts.push(spent, fresh);
+  // Live chat pinned to the spent account: 429, chat preserved, no rotation.
+  const live = serverInternals.createSession();
+  live.id = 'remote-chat-x';
+  live.accountId = 'q-sticky-spent';
+  assert.throws(
+    () => serverInternals.selectAccountForSession(live),
+    (e) => e && e.status === 429 && e.retryAfter > 0 && live.accountId === 'q-sticky-spent',
+    'sticky live chat fails fast without rotating'
+  );
+  // Chat-less sticky on the spent account: resets and rotates to the clean one.
+  const chatless = serverInternals.createSession();
+  chatless.id = null;
+  chatless.accountId = 'q-sticky-spent';
+  assert.equal(serverInternals.selectAccountForSession(chatless).id, 'q-sticky-fresh');
+});
+
+test('retry toggle: anyAccountReady gates the retry on real readiness', () => {  const f = serverInternals.anyAccountReady;
   const now = Date.now();
   const good = { config: { token: 't', cookie: 'c' }, cooldownUntil: 0 };
   const cooling = { config: { token: 't', cookie: 'c' }, cooldownUntil: now + 600000 };

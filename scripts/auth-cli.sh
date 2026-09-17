@@ -183,8 +183,35 @@ cmd_renew() {
     TMP_PREFIX=""
     offer_restart
 }
-cmd_delete() {
-    _name=${1:-}
+cmd_rename() {
+    _old=${1:-}
+    if [ -z "$_old" ]; then
+        _old=$(pick_account "rename") || exit $?
+    fi
+    valid_name "$_old" || die "bad name '$_old'"
+    _src=$(name_to_file "$_old")
+    [ -f "$_src" ] || die "no such account: $_old"
+    _new=${2:-}
+    if [ -z "$_new" ]; then _new=$(ask "New name" ""); printf '\n' >&2; fi
+    valid_name "$_new" || die "bad name '$_new': use ^[a-z0-9][a-z0-9_-]{0,31}\$"
+    _dest=$(name_to_file "$_new")
+    [ -e "$_dest" ] && die "$_dest exists — pick another name"
+    mv "$_src" "$_dest"
+    chmod 600 "$_dest"
+    for _b in "$_src".bak "$_src".bak-*; do
+        [ -e "$_b" ] || continue
+        _suffix=$(printf '%s' "$_b" | sed "s|^.*$_old||")
+        mv "$_b" "$AUTH_DIR/$_new$_suffix"
+    done
+    info "renamed: $_old -> $_new"
+    info "new account order (ids are positional — verify DEEPSEEK_PREFERRED_ACCOUNT):"
+    list_accounts | awk '{printf "  account_%d = %s\n", $1, $2}'
+    if [ -n "${DEEPSEEK_PREFERRED_ACCOUNT:-}" ]; then
+        info "note: DEEPSEEK_PREFERRED_ACCOUNT=$DEEPSEEK_PREFERRED_ACCOUNT may now point elsewhere"
+    fi
+    offer_restart
+}
+cmd_delete() {    _name=${1:-}
     if [ -z "$_name" ]; then
         _name=$(pick_account "delete") || exit $?
     fi
@@ -303,10 +330,10 @@ show_menu() {
     info "DeepSeek accounts ($AUTH_DIR)"
     info "  1. Add account     2. Renew account    3. Delete account"
     info "  4. Check accounts  5. Import           6. Doctor"
-    info "  7. Restart proxy   0. Exit"
+    info "  7. Restart proxy   8. Rename account   0. Exit"
 }
 usage() {
-    printf 'usage: %s [add|renew|delete|check|import|doctor|restart] [name] [--force]\n' "$(basename -- "$0")" >&2
+    printf 'usage: %s [add|renew|rename|delete|check|import|doctor|restart] [name] [--force]\n' "$(basename -- "$0")" >&2
     exit 2
 }
 
@@ -332,6 +359,7 @@ main() {
                     5) (cmd_import) || true ;;
                     6) (cmd_doctor) || true ;;
                     7) (restart_service) || true ;;
+                    8) (cmd_rename) || true ;;
                     0|q|Q) break ;;
                     *) info "unknown choice: $_c" ;;
                 esac
@@ -340,6 +368,7 @@ main() {
             ;;
         add) cmd_add "${2:-}" ;;
         renew) cmd_renew "${2:-}" ;;
+        rename) cmd_rename "${2:-}" "${3:-}" ;;
         delete) cmd_delete "${2:-}" ;;
         check) cmd_check "${2:-all}" ;;
         import) cmd_import "${2:-}" ;;

@@ -305,6 +305,37 @@ const ROUTING_ESCALATION_COOLDOWN_MS = numEnv('DEEPSEEK_ROUTING_ESCALATION_COOLD
 const ROUTING_FAILURE_HALFLIFE_MS = numEnv('DEEPSEEK_ROUTING_FAILURE_HALFLIFE_MS', 5 * 60 * 1000, 0);
 const ROUTING_HOT_BONUS = numEnv('DEEPSEEK_ROUTING_HOT_BONUS', 2, 0);
 const ROUTING_HOT_WINDOW_MS = numEnv('DEEPSEEK_ROUTING_HOT_WINDOW_MS', 60 * 1000, 0);
+// Hourly per-account request quota (round-3 G2, anti-mute): ~215 reqs/hour on
+// one account draws a (delayed) mute upstream; default 60 keeps a wide margin
+// ("add accounts, don't raise the value"). Sliding 1h window per account;
+// over-quota accounts sit out exactly like cooling ones; all-spent fails fast
+// 429 with Retry-After. 0 disables.
+const HOURLY_QUOTA = numEnv('DEEPSEEK_HOURLY_QUOTA', 60, 0, 100000);
+const QUOTA_WINDOW_MS = 3600000;
+function recordAccountRequest(account, nowMs = Date.now()) {
+    if (!(HOURLY_QUOTA > 0) || !account) return;
+    if (!Array.isArray(account.requestTimes)) account.requestTimes = [];
+    account.requestTimes.push(nowMs);
+    const cutoff = nowMs - QUOTA_WINDOW_MS;
+    while (account.requestTimes.length > 0 && account.requestTimes[0] < cutoff) account.requestTimes.shift();
+    const cap = 2 * HOURLY_QUOTA;
+    if (account.requestTimes.length > cap) account.requestTimes.splice(0, account.requestTimes.length - cap);
+}
+function usedThisHour(account, nowMs = Date.now()) {
+    const times = account && account.requestTimes;
+    if (!Array.isArray(times) || times.length === 0) return 0;
+    const cutoff = nowMs - QUOTA_WINDOW_MS;
+    let n = 0;
+    for (let i = times.length - 1; i >= 0; i--) {
+        if (times[i] >= cutoff) n++;
+        else break;
+    }
+    return n;
+}
+function withinQuota(account, nowMs = Date.now()) {
+    if (!(HOURLY_QUOTA > 0)) return true;
+    return usedThisHour(account, nowMs) < HOURLY_QUOTA;
+}
 // Optional same-chat rate-limit retry (round-3 G7): DEEPSEEK_RETRY_RATELIMIT=1
 // waits once (bounded, Retry-After honored up to a cap) and retries the turn on
 // the SAME account+chat before migration runs. Default off: fail-fast 429.
@@ -497,7 +528,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
                 // solve throws and the account 500s every request (F16).
                 console.error(`[DS-API] ${id} (${file}) has no wasmUrl; PoW solves will fail until it is imported.`);
             }
-            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0 });
+            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [] });
         } catch (e) {
             console.error(`[DS-API] Could not load auth config ${file}: ${e.message}`);
         }
@@ -524,6 +555,8 @@ function accountStatus(account) {
         failures: account.failures,
         consecutive_timeouts: account.consecutiveTimeouts || 0,
         consecutive_failures: account.consecutiveFailures || 0,
+        used_this_hour: usedThisHour(account),
+        quota_exhausted: HOURLY_QUOTA > 0 && !withinQuota(account),
         inflight: Number(account.inflight) || 0,
         last_used_at: account.lastUsedAt || null,
     };
@@ -532,7 +565,7 @@ function selectAccountForSession(session, sessionKey = '') {
     const now = Date.now();
     if (session.accountId) {
         const sticky = accounts.find(a => a.id === session.accountId);
-        if (sticky && sticky.config.token && sticky.config.cookie && sticky.cooldownUntil <= now) return sticky;
+        const stickyUsable = sticky && sticky.config.token && sticky.config.cookie;
         // A live DeepSeek chat_session belongs to the auth account that created
         // it and cannot be reused under a different account. Rotating here would
         // silently move one opencode conversation across chats AND accounts
@@ -540,10 +573,24 @@ function selectAccountForSession(session, sessionKey = '') {
         // fast with 429 instead so the client backs off and retries on the SAME
         // chat+account once the cooldown lifts. Fresh sessions (no remote chat
         // yet) still rotate freely to a ready account below.
-        const stickyCooling = sticky && sticky.config.token && sticky.config.cookie && sticky.cooldownUntil > now;
+        const stickyCooling = stickyUsable && sticky.cooldownUntil > now;
+        // Quota mirrors cooling: a live chat stays on its account, so an
+        // over-quota sticky fails fast (chat preserved) instead of rotating
+        // (which would split context) or hammering past the quota (which
+        // would defeat the anti-mute purpose). Chat-less stickies fall through
+        // to reset + free rotation below, exactly like cooling ones.
+        const stickyOverQuota = stickyUsable && HOURLY_QUOTA > 0 && !withinQuota(sticky, now);
+        if (stickyUsable && !stickyCooling && !stickyOverQuota) return sticky;
         if (stickyCooling && session.id) {
             const waitSec = Math.max(1, Math.ceil((sticky.cooldownUntil - now) / 1000));
             const err = new Error(`Account ${sticky.id} (owner of this chat) is cooling down. Retry in ~${waitSec}s; chat preserved.`);
+            err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
+            throw err;
+        }
+        if (stickyOverQuota && session.id) {
+            const times = Array.isArray(sticky.requestTimes) ? sticky.requestTimes : [];
+            const waitSec = times.length > 0 ? Math.max(1, Math.ceil((times[0] + QUOTA_WINDOW_MS - now) / 1000)) : 60;
+            const err = new Error(`Account ${sticky.id} (owner of this chat) spent its hourly quota (${HOURLY_QUOTA}/h). Retry in ~${waitSec}s; chat preserved.`);
             err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
             throw err;
         }
@@ -560,11 +607,30 @@ function selectAccountForSession(session, sessionKey = '') {
         resetRemoteSession(session);
         session.accountId = null;
     }
-    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now);
+    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now && withinQuota(a, now));
     if (ready.length === 0) {
         const waiting = accounts.filter(a => a.config.token && a.config.cookie).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
         if (waiting) {
-            const waitSec = Math.max(1, Math.ceil((waiting.cooldownUntil - now) / 1000));
+            // Earliest availability across cooldown AND quota: an account is
+            // back when its cooldown lifts AND its oldest in-window request
+            // ages out. Waiting is tagged 429 + Retry-After as before.
+            let releaseMs = Infinity;
+            for (const a of accounts) {
+                if (!(a.config.token && a.config.cookie)) continue;
+                let rel = a.cooldownUntil;
+                if (HOURLY_QUOTA > 0) {
+                    const times = a.requestTimes;
+                    if (Array.isArray(times) && times.length > 0 && usedThisHour(a, now) >= HOURLY_QUOTA) {
+                        rel = Math.max(rel, times[0] + QUOTA_WINDOW_MS);
+                    }
+                }
+                if (rel < releaseMs) releaseMs = rel;
+            }
+            if (HOURLY_QUOTA > 0) {
+                const capped = accounts.filter(a => a.config.token && a.config.cookie && !withinQuota(a, now)).map(a => a.id);
+                if (capped.length > 0) logDebug(`[DS-API] hourly quota spent, sitting out: ${capped.join(',')} (quota ${HOURLY_QUOTA}/h)`);
+            }
+            const waitSec = Math.max(1, Math.ceil((releaseMs - now) / 1000));
             // Tagged so the request handler returns 429 + Retry-After instead of a
             // generic 500 (integrator backoff keys on the status code, not the text).
             const err = new Error(rateLimitExhaustedMessage(waitSec) + ' Or import a fresh account with npm run auth:import.');
@@ -1483,6 +1549,10 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
         markAccountFailure(account, cr.status, 'pow challenge missing');
         throw new Error('DeepSeek PoW response has no data.biz_data.challenge. Auth may be expired, captcha may be required, or DeepSeek changed Web API. Run npm run doctor, then npm run auth.');
     }
+    // Quota clock starts here: the turn reached upstream (challenge issued),
+    // whether the completion that follows succeeds or not. Earlier failures
+    // (network/auth before this point) cost no quota.
+    recordAccountRequest(account);
     const powT0 = Date.now();
     // A PoW failure is an account-level upstream fault, not a chat fault — but
     // it must not cool the account: a stalled WASM CDN is not a rate limit,
@@ -3727,7 +3797,8 @@ function resolveRateLimitMigration(session, accountList, alreadyMigrated = false
     const others = list.filter(a => a
         && a.id !== (session ? session.accountId : undefined)
         && a.config && a.config.token && a.config.cookie
-        && ((a.cooldownUntil || 0) <= now));
+        && ((a.cooldownUntil || 0) <= now)
+        && withinQuota(a, now));
     if (others.length === 0) return { failFast: true, reason: 'no-ready-account' };
     // Smart routing (brief §2): score-min over the ready peers via the same
     // scorer — never selectFreshAccount, which would re-impose
@@ -3984,7 +4055,7 @@ const server = http.createServer(async (req, res) => {
     // one account can serve right now, so an aggregator/LB won't route to a cold pool.
     if (req.method === 'GET' && url.pathname === '/readyz') {
         const now = Date.now();
-        const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now).length;
+        const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now && withinQuota(a, now)).length;
         res.writeHead(ready > 0 ? 200 : 503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(buildReadyzPayload(req.headers.authorization, ready, accounts.length)));
         return;
@@ -5200,6 +5271,9 @@ module.exports = {
         retryWaitMs,
         inPlaceRateLimitRetry,
         anyAccountReady,
+        recordAccountRequest,
+        usedThisHour,
+        withinQuota,
         rateLimitExhaustedMessage,
         truncatePromptMiddle,
         hasExplicitConversationHistory,
