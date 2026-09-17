@@ -312,29 +312,124 @@ const ROUTING_HOT_WINDOW_MS = numEnv('DEEPSEEK_ROUTING_HOT_WINDOW_MS', 60 * 1000
 // 429 with Retry-After. 0 disables.
 const HOURLY_QUOTA = numEnv('DEEPSEEK_HOURLY_QUOTA', 60, 0, 100000);
 const QUOTA_WINDOW_MS = 3600000;
-function recordAccountRequest(account, nowMs = Date.now()) {
-    if (!(HOURLY_QUOTA > 0) || !account) return;
+// Burst cap (pacing 4a): max turns per sliding 60s window per account.
+// Default 0 = off until Sep-19 traffic measures a real number (candidate 10).
+let BURST_PER_MINUTE = numEnv('DEEPSEEK_BURST_PER_MINUTE', 0, 0, 1000);
+// Test hook (mirrors setExtraToolTags): swaps the burst limit for wiring
+// tests. Validated like the env parse; restored by callers via t.after.
+function setBurstPerMinute(n) {
+    const v = Math.floor(Number(n));
+    BURST_PER_MINUTE = Number.isFinite(v) ? Math.max(0, Math.min(1000, v)) : BURST_PER_MINUTE;
+}
+const BURST_WINDOW_MS = 60000;
+// Ring capacity: fixed floor plus headroom scaled to both knobs, so a high
+// HOURLY_QUOTA stays enforceable (H2 — a fixed 1024 silently uncapped large
+// quotas). Pure part exported for tests.
+function computeRingCap(quota, burst) {
+    return Math.max(1024, 2 * (quota || 0), 2 * (burst || 0));
+}
+function ringCapacity() {
+    return computeRingCap(HOURLY_QUOTA, BURST_PER_MINUTE);
+}
+function recordUpstreamTurn(account, nowMs = Date.now()) {
+    if (!account) return;
     if (!Array.isArray(account.requestTimes)) account.requestTimes = [];
     account.requestTimes.push(nowMs);
+    account.lastUpstreamAt = nowMs;
     const cutoff = nowMs - QUOTA_WINDOW_MS;
-    while (account.requestTimes.length > 0 && account.requestTimes[0] < cutoff) account.requestTimes.shift();
-    const cap = 2 * HOURLY_QUOTA;
+    // Filter-prune, not shift-while-old: front-only eviction assumes ascending
+    // order, which clock skew can break (bounded anyway by the cap below).
+    // Fast path skips the allocation when the head is already fresh.
+    if (account.requestTimes.length > 0 && account.requestTimes[0] < cutoff) {
+        account.requestTimes = account.requestTimes.filter(t => t >= cutoff);
+    }
+    const cap = ringCapacity();
     if (account.requestTimes.length > cap) account.requestTimes.splice(0, account.requestTimes.length - cap);
 }
-function usedThisHour(account, nowMs = Date.now()) {
+function recordAccountRequest(account, nowMs = Date.now()) {
+    // Test/compat wrapper only — production stamp sites must use
+    // recordUpstreamTurn (C1: this gate would silently disable burst under
+    // DEEPSEEK_HOURLY_QUOTA=0).
+    if (!(HOURLY_QUOTA > 0)) return;
+    recordUpstreamTurn(account, nowMs);
+}
+function usedSince(account, windowMs, nowMs = Date.now()) {
     const times = account && account.requestTimes;
     if (!Array.isArray(times) || times.length === 0) return 0;
-    const cutoff = nowMs - QUOTA_WINDOW_MS;
+    const cutoff = nowMs - windowMs;
     let n = 0;
-    for (let i = times.length - 1; i >= 0; i--) {
+    for (let i = 0; i < times.length; i++) {
         if (times[i] >= cutoff) n++;
-        else break;
     }
     return n;
+}
+function usedThisHour(account, nowMs = Date.now()) {
+    return usedSince(account, QUOTA_WINDOW_MS, nowMs);
+}
+function burstUsedThisMinute(account, nowMs = Date.now()) {
+    return usedSince(account, BURST_WINDOW_MS, nowMs);
+}
+// Oldest in-window stamp, order-independent (arrays are chronological in
+// production, but never assume it for release-time math).
+function oldestInWindow(times, cutoff) {
+    let oldest = null;
+    for (let i = 0; i < (times || []).length; i++) {
+        const t = times[i];
+        if (t >= cutoff && (oldest === null || t < oldest)) oldest = t;
+    }
+    return oldest;
 }
 function withinQuota(account, nowMs = Date.now()) {
     if (!(HOURLY_QUOTA > 0)) return true;
     return usedThisHour(account, nowMs) < HOURLY_QUOTA;
+}
+function withinBurst(account, nowMs = Date.now(), limit = BURST_PER_MINUTE) {
+    if (!(limit > 0)) return true;
+    return burstUsedThisMinute(account, nowMs) < limit;
+}
+// Burst twin of the quota sticky-429: returns the 429 error (never throws)
+// when a live chat sits on a burst-spent account, else null. Pure apart from
+// reading its inputs, so the wiring ("fail fast, chat preserved, no mark")
+// is unit-testable. Chat-less stickies get null and rotate freely below.
+function stickyBurstReject(sticky, session, nowMs = Date.now(), limit = BURST_PER_MINUTE) {
+    if (!sticky || !sticky.config || !sticky.config.token || !sticky.config.cookie) return null;
+    if (!(limit > 0)) return null;
+    if (burstUsedThisMinute(sticky, nowMs) < limit) return null;
+    if (!session || !session.id) return null;
+    const oldest = oldestInWindow(sticky.requestTimes, nowMs - BURST_WINDOW_MS);
+    const waitSec = oldest !== null ? Math.max(1, Math.ceil((oldest + BURST_WINDOW_MS - nowMs) / 1000)) : 60;
+    const err = new Error(`Account ${sticky.id} (owner of this chat) hit the burst cap (${limit}/min). Retry in ~${waitSec}s; chat preserved.`);
+    err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
+    return err;
+}
+
+// Earliest per-account availability across all three limiters. Shared by the
+// all-spent branch and the SSE migration-exhausted path so both quote the
+// same Retry-After (H1/M2 — per-site math drifted before).
+function accountReleaseMs(a, nowMs = Date.now()) {
+    let rel = (a && a.cooldownUntil) || 0;
+    if (HOURLY_QUOTA > 0) {
+        const oldest = oldestInWindow(a.requestTimes, nowMs - QUOTA_WINDOW_MS);
+        if (oldest !== null && usedThisHour(a, nowMs) >= HOURLY_QUOTA) {
+rel = Math.max(rel, oldest + QUOTA_WINDOW_MS);
+        }
+    }
+    if (BURST_PER_MINUTE > 0) {
+        const oldest = oldestInWindow(a.requestTimes, nowMs - BURST_WINDOW_MS);
+        if (oldest !== null && burstUsedThisMinute(a, nowMs) >= BURST_PER_MINUTE) {
+rel = Math.max(rel, oldest + BURST_WINDOW_MS);
+        }
+    }
+    return rel;
+}
+function earliestReleaseMs(nowMs = Date.now()) {
+    let best = Infinity;
+    for (const a of accounts) {
+        if (!(a.config.token && a.config.cookie)) continue;
+        const rel = accountReleaseMs(a, nowMs);
+        if (rel < best) best = rel;
+    }
+    return best;
 }
 // Optional same-chat rate-limit retry (round-3 G7): DEEPSEEK_RETRY_RATELIMIT=1
 // waits once (bounded, Retry-After honored up to a cap) and retries the turn on
@@ -379,10 +474,17 @@ function retryWaitMs(retryAfterSec, remainingMs) {
     if (!(remainingMs > 0)) return 0;
     return Math.min(rateLimitRetryDelayMs(retryAfterSec), remainingMs);
 }
-// Readiness pre-filter shared by the retry gate: any credentialed account
-// whose cooldown has lifted. Exported for tests.
+// Single readiness predicate for all four admission sites (select-fresh,
+// migration peers, /readyz, retry gate). One spelling — previously cooldown
+// checks drifted between raw and ||0 forms. Exported for tests.
+function isAccountReady(a, nowMs = Date.now()) {
+    return !!(a && a.config && a.config.token && a.config.cookie
+        && (a.cooldownUntil || 0) <= nowMs && withinQuota(a, nowMs) && withinBurst(a, nowMs));
+}
+// Readiness pre-filter shared by the retry gate: true when at least one
+// account passes the shared predicate. Exported for tests.
 function anyAccountReady(list, nowMs = Date.now()) {
-    return (list || []).some(a => a && a.config && a.config.token && a.config.cookie && (a.cooldownUntil || 0) <= nowMs);
+    return (list || []).some(a => isAccountReady(a, nowMs));
 }
 // Testable core of the in-place retry (no env, timers, or fetch): lifts the
 // cooldown for exactly one attemptTurn() call on the SAME account and fully
@@ -398,15 +500,24 @@ async function inPlaceRateLimitRetry(account, attemptTurn) {
         failures: Number(account.failures) || 0,
         consecutiveFailures: Number(account.consecutiveFailures) || 0,
         consecutiveTimeouts: Number(account.consecutiveTimeouts) || 0,
+        ring: Array.isArray(account.requestTimes) ? account.requestTimes.slice() : null,
+        lastUpstreamAt: Number(account.lastUpstreamAt) || 0,
     };
     account.cooldownUntil = 0;
     try {
         return { recovered: true, result: await attemptTurn() };
     } catch (retryErr) {
+        // Full restore (M1): the probe's own PoW-success stamp must not spend
+        // quota/burst budget either — a failed probe records nothing at all.
+        // Slice-restore (not length-truncate): the stamp path reassigns the
+        // array on prune, so truncating the new array would extend it with
+        // holes instead of restoring contents.
         account.cooldownUntil = saved.cooldownUntil;
         account.failures = saved.failures;
         account.consecutiveFailures = saved.consecutiveFailures;
         account.consecutiveTimeouts = saved.consecutiveTimeouts;
+        if (saved.ring !== null && Array.isArray(account.requestTimes)) account.requestTimes = saved.ring;
+        account.lastUpstreamAt = saved.lastUpstreamAt;
         return { recovered: false, error: retryErr };
     }
 }
@@ -528,7 +639,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
                 // solve throws and the account 500s every request (F16).
                 console.error(`[DS-API] ${id} (${file}) has no wasmUrl; PoW solves will fail until it is imported.`);
             }
-            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [] });
+            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [], lastUpstreamAt: 0 });
         } catch (e) {
             console.error(`[DS-API] Could not load auth config ${file}: ${e.message}`);
         }
@@ -557,6 +668,7 @@ function accountStatus(account) {
         consecutive_failures: account.consecutiveFailures || 0,
         used_this_hour: usedThisHour(account),
         quota_exhausted: HOURLY_QUOTA > 0 && !withinQuota(account),
+        burst_used_1m: burstUsedThisMinute(account),
         inflight: Number(account.inflight) || 0,
         last_used_at: account.lastUsedAt || null,
     };
@@ -580,7 +692,8 @@ function selectAccountForSession(session, sessionKey = '') {
         // would defeat the anti-mute purpose). Chat-less stickies fall through
         // to reset + free rotation below, exactly like cooling ones.
         const stickyOverQuota = stickyUsable && HOURLY_QUOTA > 0 && !withinQuota(sticky, now);
-        if (stickyUsable && !stickyCooling && !stickyOverQuota) return sticky;
+        const stickyOverBurst = stickyUsable && BURST_PER_MINUTE > 0 && !withinBurst(sticky, now);
+        if (stickyUsable && !stickyCooling && !stickyOverQuota && !stickyOverBurst) return sticky;
         if (stickyCooling && session.id) {
             const waitSec = Math.max(1, Math.ceil((sticky.cooldownUntil - now) / 1000));
             const err = new Error(`Account ${sticky.id} (owner of this chat) is cooling down. Retry in ~${waitSec}s; chat preserved.`);
@@ -588,12 +701,15 @@ function selectAccountForSession(session, sessionKey = '') {
             throw err;
         }
         if (stickyOverQuota && session.id) {
-            const times = Array.isArray(sticky.requestTimes) ? sticky.requestTimes : [];
-            const waitSec = times.length > 0 ? Math.max(1, Math.ceil((times[0] + QUOTA_WINDOW_MS - now) / 1000)) : 60;
+            const oldest = oldestInWindow(sticky.requestTimes, now - QUOTA_WINDOW_MS);
+            const waitSec = oldest !== null ? Math.max(1, Math.ceil((oldest + QUOTA_WINDOW_MS - now) / 1000)) : 60;
             const err = new Error(`Account ${sticky.id} (owner of this chat) spent its hourly quota (${HOURLY_QUOTA}/h). Retry in ~${waitSec}s; chat preserved.`);
             err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
             throw err;
         }
+        // Burst mirrors quota exactly (separate knob, separate message).
+        const burstErr = stickyBurstReject(sticky, session, now);
+        if (burstErr) throw burstErr;
         // A DeepSeek chat_session belongs to the auth account that created it.
         // If that account disappeared, lost credentials, or (for a chat-less
         // session) is cooling down, never reuse its session id under a
@@ -607,28 +723,20 @@ function selectAccountForSession(session, sessionKey = '') {
         resetRemoteSession(session);
         session.accountId = null;
     }
-    const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now && withinQuota(a, now));
+    const ready = accounts.filter(a => isAccountReady(a, now));
     if (ready.length === 0) {
         const waiting = accounts.filter(a => a.config.token && a.config.cookie).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
         if (waiting) {
-            // Earliest availability across cooldown AND quota: an account is
-            // back when its cooldown lifts AND its oldest in-window request
-            // ages out. Waiting is tagged 429 + Retry-After as before.
-            let releaseMs = Infinity;
-            for (const a of accounts) {
-                if (!(a.config.token && a.config.cookie)) continue;
-                let rel = a.cooldownUntil;
-                if (HOURLY_QUOTA > 0) {
-                    const times = a.requestTimes;
-                    if (Array.isArray(times) && times.length > 0 && usedThisHour(a, now) >= HOURLY_QUOTA) {
-                        rel = Math.max(rel, times[0] + QUOTA_WINDOW_MS);
-                    }
-                }
-                if (rel < releaseMs) releaseMs = rel;
-            }
+            // Earliest availability across cooldown, quota, AND burst via the
+            // shared earliestReleaseMs helper (H1/M2 — per-site math drifted).
+            const releaseMs = earliestReleaseMs(now);
             if (HOURLY_QUOTA > 0) {
                 const capped = accounts.filter(a => a.config.token && a.config.cookie && !withinQuota(a, now)).map(a => a.id);
                 if (capped.length > 0) logDebug(`[DS-API] hourly quota spent, sitting out: ${capped.join(',')} (quota ${HOURLY_QUOTA}/h)`);
+            }
+            if (BURST_PER_MINUTE > 0) {
+                const capped = accounts.filter(a => a.config.token && a.config.cookie && !withinBurst(a, now)).map(a => a.id);
+                if (capped.length > 0) logDebug(`[DS-API] burst cap spent, sitting out: ${capped.join(',')} (${BURST_PER_MINUTE}/min)`);
             }
             const waitSec = Math.max(1, Math.ceil((releaseMs - now) / 1000));
             // Tagged so the request handler returns 429 + Retry-After instead of a
@@ -1551,8 +1659,10 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     }
     // Quota clock starts here: the turn reached upstream (challenge issued),
     // whether the completion that follows succeeds or not. Earlier failures
-    // (network/auth before this point) cost no quota.
-    recordAccountRequest(account);
+    // (network/auth before this point) cost no quota. Unconditional writer:
+    // burst needs the ring even when quota is off (C1 — the gated wrapper
+    // here would silently disable burst under DEEPSEEK_HOURLY_QUOTA=0).
+    recordUpstreamTurn(account);
     const powT0 = Date.now();
     // A PoW failure is an account-level upstream fault, not a chat fault — but
     // it must not cool the account: a stalled WASM CDN is not a rate limit,
@@ -3796,9 +3906,7 @@ function resolveRateLimitMigration(session, accountList, alreadyMigrated = false
     const list = Array.isArray(accountList) ? accountList : accounts;
     const others = list.filter(a => a
         && a.id !== (session ? session.accountId : undefined)
-        && a.config && a.config.token && a.config.cookie
-        && ((a.cooldownUntil || 0) <= now)
-        && withinQuota(a, now));
+        && isAccountReady(a, now));
     if (others.length === 0) return { failFast: true, reason: 'no-ready-account' };
     // Smart routing (brief §2): score-min over the ready peers via the same
     // scorer — never selectFreshAccount, which would re-impose
@@ -4055,7 +4163,7 @@ const server = http.createServer(async (req, res) => {
     // one account can serve right now, so an aggregator/LB won't route to a cold pool.
     if (req.method === 'GET' && url.pathname === '/readyz') {
         const now = Date.now();
-        const ready = accounts.filter(a => a.config.token && a.config.cookie && a.cooldownUntil <= now && withinQuota(a, now)).length;
+        const ready = accounts.filter(a => isAccountReady(a, now)).length;
         res.writeHead(ready > 0 ? 200 : 503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(buildReadyzPayload(req.headers.authorization, ready, accounts.length)));
         return;
@@ -4683,8 +4791,11 @@ const server = http.createServer(async (req, res) => {
                 coolAccountForRateLimit(throttled, modelError);
                 const decision = resolveRateLimitMigration(session, accounts, rateLimitMigrated);
                 if (rateLimitMigrated || !decision.migrateTo) {
-                    const waitSec = throttled && throttled.cooldownUntil > Date.now()
-                        ? Math.max(1, Math.ceil((throttled.cooldownUntil - Date.now()) / 1000))
+                    // Shared earliest-release math (M2): quota/burst-spent peers
+                    // count, not just the throttled account's cooldown.
+                    const rel = earliestReleaseMs();
+                    const waitSec = Number.isFinite(rel)
+                        ? Math.max(1, Math.ceil((rel - Date.now()) / 1000))
                         : 2;
                     console.log(`${agentTag} rate-limit migration exhausted (${rateLimitMigrated ? 'already migrated this turn' : 'no other ready account'}); failing fast 429.`);
                     if (res.headersSent) {
@@ -5264,6 +5375,8 @@ module.exports = {
         looksLikeToolCallMarkup,
         parseToolTagList,
         setExtraToolTags,
+        setBurstPerMinute,
+        computeRingCap,
         parseToolTagEnv,
         rateLimitRetryDelayMs,
         shouldAttemptInPlaceRetry,
@@ -5272,8 +5385,16 @@ module.exports = {
         inPlaceRateLimitRetry,
         anyAccountReady,
         recordAccountRequest,
+        recordUpstreamTurn,
+        usedSince,
         usedThisHour,
+        oldestInWindow,
         withinQuota,
+        burstUsedThisMinute,
+        withinBurst,
+        stickyBurstReject,
+        accountReleaseMs,
+        earliestReleaseMs,
         rateLimitExhaustedMessage,
         truncatePromptMiddle,
         hasExplicitConversationHistory,
@@ -5328,6 +5449,7 @@ module.exports = {
         scoreBase,
         effectiveFailures,
         scoreBreakdown,
+        isAccountReady,
         logToken,
         countActiveHosted,
         accountStatus,

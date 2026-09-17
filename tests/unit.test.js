@@ -2910,6 +2910,7 @@ test('retry toggle: shouldAttemptInPlaceRetry only for unknown/brief backoffs', 
 
 test('retry toggle: inPlaceRateLimitRetry lifts once, restores without extending', async () => {
   const f = serverInternals.inPlaceRateLimitRetry;
+  const now = Date.now();
   assert.deepEqual(await f(null, async () => 'x'), { recovered: false });
   assert.deepEqual(await f({ cooldownUntil: 0 }, null), { recovered: false });
   // Success: bypass observed inside the attempt, result passed through.
@@ -2923,14 +2924,17 @@ test('retry toggle: inPlaceRateLimitRetry lifts once, restores without extending
   assert.equal(acct.failures, 3, 'helper never touches counters');
   // Failure: exact restore of the whole limiter/scorer snapshot, error preserved.
   // The thunk mutates like a real markAccountFailure would — a restore that
-  // only covers cooldownUntil (the pre-fix shape) fails this test.
-  const acct2 = { id: 'b', cooldownUntil: 600000, failures: 1, consecutiveFailures: 1, consecutiveTimeouts: 2 };
+  // only covers cooldownUntil (the pre-fix shape) fails this test. Ring stamps
+  // and lastUpstreamAt roll back too: a failed probe records nothing at all.
+  const acct2 = { id: 'b', cooldownUntil: 600000, failures: 1, consecutiveFailures: 1, consecutiveTimeouts: 2, requestTimes: [now - 5000], lastUpstreamAt: now - 9000 };
   const boom = new Error('upstream 429 again');
   const bad = await f(acct2, async () => {
     acct2.failures += 1;
     acct2.consecutiveFailures = 0;
     acct2.consecutiveTimeouts = 0;
     acct2.cooldownUntil = 999999;
+    acct2.requestTimes.push(Date.now());
+    acct2.lastUpstreamAt = Date.now();
     throw boom;
   });
   assert.equal(bad.recovered, false);
@@ -2939,6 +2943,19 @@ test('retry toggle: inPlaceRateLimitRetry lifts once, restores without extending
   assert.equal(acct2.failures, 1, 'no double-count');
   assert.equal(acct2.consecutiveFailures, 1, 'streak untouched');
   assert.equal(acct2.consecutiveTimeouts, 2, 'timeout streak untouched');
+  assert.deepEqual(acct2.requestTimes, [now - 5000], 'probe stamp rolled back');
+  assert.equal(acct2.lastUpstreamAt, now - 9000, 'probe clock rolled back');
+  // Prune-path: the writer reassigns (not mutates) when the head is stale —
+  // length-truncate would extend holes; slice-restore replaces wholesale.
+  const acct3 = { id: 'c', cooldownUntil: 0, failures: 0, consecutiveFailures: 0, consecutiveTimeouts: 0, requestTimes: [now - 5000], lastUpstreamAt: now - 9000 };
+  const bad3 = await f(acct3, async () => {
+    acct3.requestTimes = [now - 4000000, now - 1000, Date.now()];
+    acct3.lastUpstreamAt = Date.now();
+    throw boom;
+  });
+  assert.equal(bad3.recovered, false);
+  assert.deepEqual(acct3.requestTimes, [now - 5000], 'replaced array restored by value');
+  assert.equal(acct3.lastUpstreamAt, now - 9000);
 });
 
 test('hourly quota: sliding window counts, prunes, and caps memory', () => {
@@ -2957,8 +2974,18 @@ test('hourly quota: sliding window counts, prunes, and caps memory', () => {
   serverInternals.recordAccountRequest(mixed, now - 3600001);
   assert.equal(serverInternals.usedThisHour(mixed, now), 0, 'older than window ignored');
   const hog = { requestTimes: [] };
-  for (let i = 0; i < 500; i++) serverInternals.recordAccountRequest(hog, now);
-  assert.ok(hog.requestTimes.length <= 120, `capped at 2x quota, saw ${hog.requestTimes.length}`);
+  for (let i = 0; i < 1100; i++) serverInternals.recordUpstreamTurn(hog, now);
+  assert.ok(hog.requestTimes.length <= 1024, `capped at fixed ring bound, saw ${hog.requestTimes.length}`);
+  // Unconditional writer also stamps lastUpstreamAt (pacer's future clock).
+  const stamped = {};
+  serverInternals.recordUpstreamTurn(stamped, now - 5);
+  assert.equal(stamped.lastUpstreamAt, now - 5);
+  // Out-of-order stamps (never produced live, but cheap to be robust): count
+  // everything in-window and release on the true oldest, not position [0].
+  const messy = { requestTimes: [now - 1000, now - 2000, now - 4000000] };
+  assert.equal(serverInternals.usedThisHour(messy, now), 2);
+  assert.equal(serverInternals.oldestInWindow(messy.requestTimes, now - 3600000), now - 2000);
+  assert.equal(serverInternals.oldestInWindow([], now - 3600000), null);
 });
 
 test('hourly quota: over-quota account excluded from fresh picks, all-spent 429s', (t) => {
@@ -3030,7 +3057,193 @@ test('hourly quota: sticky live chat fails fast on spent account, chat-less rota
   assert.equal(serverInternals.selectAccountForSession(chatless).id, 'q-sticky-fresh');
 });
 
-test('retry toggle: anyAccountReady gates the retry on real readiness', () => {  const f = serverInternals.anyAccountReady;
+test('burst cap: window counts, explicit limit gates, default off is inert', () => {
+  // NOTE: BURST_PER_MINUTE defaults 0 (off until measured) — these tests pass
+  // explicit limits, mirroring how the select path will call once enabled.
+  const now = Date.now();
+  const acct = { requestTimes: [] };
+  assert.equal(serverInternals.burstUsedThisMinute(acct, now), 0);
+  assert.equal(serverInternals.withinBurst(acct, now), true, 'default off ignores even floods');
+  for (let i = 0; i < 100; i++) serverInternals.recordUpstreamTurn(acct, now);
+  assert.equal(serverInternals.withinBurst(acct, now), true, 'still inert when off');
+  assert.equal(serverInternals.burstUsedThisMinute(acct, now), 100);
+  assert.equal(serverInternals.withinBurst(acct, now, 10), false, '100 >= explicit 10');
+  const fresh = { requestTimes: [] };
+  for (let i = 0; i < 9; i++) serverInternals.recordUpstreamTurn(fresh, now - i * 1000);
+  assert.equal(serverInternals.withinBurst(fresh, now, 10), true, '9 < 10 ready');
+  serverInternals.recordUpstreamTurn(fresh, now);
+  assert.equal(serverInternals.withinBurst(fresh, now, 10), false, '10th spends it');
+  const stale = { requestTimes: [now - 61000, now - 1000] };
+  assert.equal(serverInternals.burstUsedThisMinute(stale, now), 1, '61s-old entry aged out');
+});
+
+test('burst cap: sticky reject is a pure 429 with untouched scorer state', () => {
+  const now = Date.now();
+  const mk = (id) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: 0, failures: 2, consecutiveTimeouts: 0, consecutiveFailures: 0,
+    requestTimes: [],
+  });
+  const busy = mk('b-busy');
+  for (let i = 0; i < 10; i++) serverInternals.recordUpstreamTurn(busy, now - i * 1000);
+  const live = { id: null, accountId: 'b-busy' };
+  live.id = 'remote-chat-b';
+  const err = serverInternals.stickyBurstReject(busy, live, now, 10);
+  assert.ok(err, 'live chat on burst-spent account rejects');
+  assert.equal(err.status, 429);
+  assert.ok(err.retryAfter > 0 && err.retryAfter <= 60, `retryAfter in window, saw ${err.retryAfter}`);
+  assert.equal(err.type, 'rate_limit');
+  assert.equal(live.accountId, 'b-busy', 'no rotation');
+  assert.equal(busy.failures, 2, 'no-mark: failures untouched');
+  assert.equal(busy.cooldownUntil, 0, 'no-mark: no cooldown imposed');
+  assert.equal(serverInternals.stickyBurstReject(busy, { id: null, accountId: 'b-busy' }, now, 10), null, 'chat-less rotates freely');
+  assert.equal(serverInternals.stickyBurstReject(busy, live, now, 0), null, 'limit 0 disables');
+  assert.equal(serverInternals.stickyBurstReject(busy, live, now, 10).message.includes('/min'), true, 'message names the limit');
+  const clean = mk('b-clean');
+  assert.equal(serverInternals.stickyBurstReject(clean, live, now, 10), null, 'clean account passes');
+});
+
+test('burst cap: ring capacity scales with knobs, setter validates', (t) => {
+  assert.equal(serverInternals.computeRingCap(60, 0), 1024, 'floor dominates defaults');
+  assert.equal(serverInternals.computeRingCap(100000, 0), 200000, 'high quota stays enforceable');
+  assert.equal(serverInternals.computeRingCap(0, 1000), 2000, 'burst scales too');
+  serverInternals.setBurstPerMinute(7);
+  t.after(() => serverInternals.setBurstPerMinute(0));
+  assert.equal(serverInternals.withinBurst({ requestTimes: [] }, Date.now()), true);
+  const busy = { requestTimes: [] };
+  const now = Date.now();
+  for (let i = 0; i < 7; i++) busy.requestTimes.push(now - i * 1000);
+  assert.equal(serverInternals.withinBurst(busy, now), false, 'setter took effect');
+  serverInternals.setBurstPerMinute('garbage');
+  assert.equal(serverInternals.withinBurst(busy, now), false, 'invalid input keeps prior value');
+  serverInternals.setBurstPerMinute(-5);
+  assert.equal(serverInternals.withinBurst({ requestTimes: [] }, Date.now()), true);
+  serverInternals.setBurstPerMinute(0);
+  assert.equal(serverInternals.withinBurst(busy, now), true, 'restored to default-off');
+});
+
+test('burst cap: select/migration/readyz wiring honors the limit', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  serverInternals.setBurstPerMinute(2);
+  t.after(() => serverInternals.setBurstPerMinute(0));
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+  const now = Date.now();
+  const mk = (id) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: 0, failures: 4, consecutiveTimeouts: 0, consecutiveFailures: 0,
+    lastUsedAt: 0, inflight: 0, headers: {}, requestTimes: [],
+  });
+  const spent = mk('w-spent');
+  for (let i = 0; i < 2; i++) serverInternals.recordUpstreamTurn(spent, now - i * 1000);
+  const freshAcct = mk('w-fresh');
+  serverInternals.accounts.push(spent, freshAcct);
+  // Fresh pick excludes the burst-spent account.
+  assert.equal(serverInternals.selectAccountForSession(serverInternals.createSession()).id, 'w-fresh');
+  // Sticky live chat fails fast AND leaves scorer state byte-identical.
+  const live = serverInternals.createSession();
+  live.id = 'remote-chat-w';
+  live.accountId = 'w-spent';
+  const before = { failures: spent.failures, cooldownUntil: spent.cooldownUntil, times: spent.requestTimes.length };
+  assert.throws(
+    () => serverInternals.selectAccountForSession(live),
+    (e) => e && e.status === 429 && e.retryAfter > 0 && live.accountId === 'w-spent',
+    'sticky burst-spent fails fast without rotating'
+  );
+  assert.deepEqual(
+    { failures: spent.failures, cooldownUntil: spent.cooldownUntil, times: spent.requestTimes.length },
+    { failures: before.failures, cooldownUntil: before.cooldownUntil, times: before.times },
+    'burst reject marks nothing'
+  );
+  // Chat-less sticky rotates freely.
+  const chatless = serverInternals.createSession();
+  chatless.id = null;
+  chatless.accountId = 'w-spent';
+  assert.equal(serverInternals.selectAccountForSession(chatless).id, 'w-fresh');
+  // Migration skips burst-spent peers.
+  const migSession = serverInternals.createSession();
+  migSession.id = 'remote-chat-m';
+  migSession.accountId = 'w-spent';
+  const decision = serverInternals.resolveRateLimitMigration(migSession, serverInternals.accounts, false);
+  assert.equal(decision.migrateTo, 'w-fresh', 'migration avoids burst-spent peer');
+});
+
+test('burst cap: all-burst-spent Retry-After is minute-scale, release math shared', (t) => {
+  saveRoutingEnv(t);
+  delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
+  delete process.env.DEEPSEEK_ROUTING_MODE;
+  serverInternals.setBurstPerMinute(2);
+  t.after(() => serverInternals.setBurstPerMinute(0));
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+  const now = Date.now();
+  const mk = (id) => ({
+    id, config: { token: `t-${id}`, cookie: `c-${id}` },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0,
+    lastUsedAt: 0, inflight: 0, headers: {}, requestTimes: [],
+  });
+  const a = mk('v-a');
+  const b = mk('v-b');
+  for (let i = 0; i < 2; i++) {
+    serverInternals.recordUpstreamTurn(a, now - i * 1000);
+    serverInternals.recordUpstreamTurn(b, now - i * 1000);
+  }
+  serverInternals.accounts.push(a, b);
+  assert.throws(
+    () => serverInternals.selectAccountForSession(serverInternals.createSession()),
+    (e) => e && e.status === 429 && e.retryAfter > 30 && e.retryAfter <= 60,
+    'all burst-spent quotes minute-scale release, not 1s'
+  );
+  // Direct release-math cases: cooldown-only / quota-bound / burst-bound / max.
+  // NOTE: each fixture gets its own requestTimes array — {...base} would share
+  // it by reference and cross-contaminate the cases below.
+  const rel = serverInternals.accountReleaseMs;
+  const base = () => ({ cooldownUntil: 0, config: { token: 't', cookie: 'c' }, requestTimes: [] });
+  assert.equal(rel(base(), now), 0, 'clean account releases now');
+  assert.equal(rel({ ...base(), cooldownUntil: now + 5000 }, now), now + 5000, 'cooldown-only');
+  const quotaBound = base();
+  for (let i = 0; i < 60; i++) quotaBound.requestTimes.push(now - i * 1000);
+  assert.equal(rel(quotaBound, now), now - 59000 + 3600000, 'quota-bound releases at oldest+1h');
+  const burstBound = base();
+  for (let i = 0; i < 2; i++) burstBound.requestTimes.push(now - i * 1000);
+  serverInternals.setBurstPerMinute(2);
+  try {
+    assert.equal(rel(burstBound, now), now - 1000 + 60000, 'burst-bound releases at oldest+60s');
+    const triple = { ...base(), cooldownUntil: now + 5000, requestTimes: quotaBound.requestTimes.slice() };
+    for (let i = 0; i < 2; i++) triple.requestTimes.push(now - i * 1000);
+    assert.equal(rel(triple, now), now - 59000 + 3600000, 'max-of-all wins (quota outlasts burst+cooldown)');
+  } finally {
+    serverInternals.setBurstPerMinute(0);
+  }
+});
+
+test('burst cap: isAccountReady is the single predicate behind all four gates', () => {
+  const f = serverInternals.isAccountReady;
+  const now = Date.now();
+  const good = { config: { token: 't', cookie: 'c' }, cooldownUntil: 0 };
+  assert.equal(f(good, now), true);
+  assert.equal(f({ ...good, cooldownUntil: now + 1000 }, now), false, 'cooling excluded');
+  assert.equal(f({ config: { token: '', cookie: 'c' }, cooldownUntil: 0 }, now), false, 'no creds excluded');
+  assert.equal(f(null, now), false);
+  assert.equal(f(undefined, now), false);
+});
+
+test('retry toggle: anyAccountReady gates the retry on real readiness', () => {
+  const f = serverInternals.anyAccountReady;
   const now = Date.now();
   const good = { config: { token: 't', cookie: 'c' }, cooldownUntil: 0 };
   const cooling = { config: { token: 't', cookie: 'c' }, cooldownUntil: now + 600000 };
@@ -3040,9 +3253,22 @@ test('retry toggle: anyAccountReady gates the retry on real readiness', () => { 
   assert.equal(f([noCreds], now), false, 'credentialless never ready');
   assert.equal(f([], now), false);
   assert.equal(f(null, now), false);
+  const quotaSpent = { config: { token: 't', cookie: 'c' }, cooldownUntil: 0, requestTimes: [] };
+  for (let i = 0; i < 60; i++) quotaSpent.requestTimes.push(now - i * 1000);
+  assert.equal(f([quotaSpent], now), false, 'quota-spent is not retry-ready');
+  assert.equal(f([quotaSpent, good], now), true, 'one clean peer suffices');
+  serverInternals.setBurstPerMinute(2);
+  try {
+    const burstSpent = { config: { token: 't', cookie: 'c' }, cooldownUntil: 0, requestTimes: [now - 1000, now - 2000] };
+    assert.equal(f([burstSpent], now), false, 'burst-spent is not retry-ready');
+    assert.equal(f([burstSpent, good], now), true, 'one clean peer suffices (burst leg)');
+  } finally {
+    serverInternals.setBurstPerMinute(0);
+  }
 });
 
-test('retry toggle: exhausted-429 message guides backoff + compact, keeps contract', () => {  const msg = serverInternals.rateLimitExhaustedMessage(90);
+test('retry toggle: exhausted-429 message guides backoff + compact, keeps contract', () => {
+  const msg = serverInternals.rateLimitExhaustedMessage(90);
   assert.ok(msg.includes('~90s'), 'wait time present');
   assert.ok(msg.includes('/compact'), 'compact guidance present');
   assert.ok(!msg.includes('Bearer') && !msg.includes('token='), 'nothing secret-adjacent');

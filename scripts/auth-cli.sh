@@ -18,8 +18,8 @@ cleanup() {
     # secrets — but shred anyway. The .*.$suffix glob also sweeps staging left
     # by crashes from the brief .tmp.json-named revision (2026-09-17).
     if [ -n "$TMP_PREFIX" ]; then
-        shred -u "$TMP_PREFIX".tmp "$TMP_PREFIX".hdrs "$TMP_PREFIX".stage 2>/dev/null \
-            || rm -f "$TMP_PREFIX".tmp "$TMP_PREFIX".hdrs "$TMP_PREFIX".stage 2>/dev/null \
+        shred -u "$TMP_PREFIX".tmp "$TMP_PREFIX".hdrs "$TMP_PREFIX".stage "$TMP_PREFIX".restore-list 2>/dev/null \
+            || rm -f "$TMP_PREFIX".tmp "$TMP_PREFIX".hdrs "$TMP_PREFIX".stage "$TMP_PREFIX".restore-list 2>/dev/null \
             || true
     fi
     shred -u "$AUTH_DIR"/.*.tmp.json "$AUTH_DIR"/.*.stage.json 2>/dev/null \
@@ -183,6 +183,63 @@ cmd_renew() {
     TMP_PREFIX=""
     offer_restart
 }
+restore_count() {
+    _i=0
+    for _d in "$REPO_ROOT"/accounts-quarantined-*; do
+        [ -d "$_d" ] || continue
+        [ -L "$_d" ] && continue
+        for _f in "$_d"/*.json; do
+            [ -e "$_f" ] || continue
+            [ -L "$_f" ] && continue
+            case $_f in *.bak|*.bak-*) continue;; esac
+            _i=$((_i + 1))
+            printf '%d %s\n' "$_i" "$_f"
+        done
+    done
+}
+cmd_restore() {
+    info "Quarantined accounts (probed read-only; moved back only if ALIVE):"
+    # Single snapshot for display AND pick (M-R1): re-globbing after the
+    # operator types would let a concurrent dir change remap numbers.
+    TMP_PREFIX="$AUTH_DIR/.restore-$$"
+    umask 077
+    : > "$TMP_PREFIX.restore-list"
+    chmod 600 "$TMP_PREFIX.restore-list"
+    restore_count > "$TMP_PREFIX.restore-list"
+    cat "$TMP_PREFIX.restore-list" >&2
+    _total=$(wc -l < "$TMP_PREFIX.restore-list" | tr -d ' ')
+    if [ "$_total" -eq 0 ]; then info "none quarantined"; rm -f "$TMP_PREFIX.restore-list"; TMP_PREFIX=""; return 0; fi
+    printf 'Number to restore (q to cancel): ' >&2
+    IFS= read -r _n || true
+    case $_n in q|Q|"") return 0;; esac
+    case $_n in *[!0-9]*|"") die "not a number: $_n";; esac
+    _src=$(sed -n "${_n}p" "$TMP_PREFIX.restore-list" | awk '{sub(/^[0-9]+ /,""); print}')
+    if [ -n "${_src:-}" ] && [ -e "$_src" ]; then :; else rm -f "$TMP_PREFIX.restore-list"; TMP_PREFIX=""; die "no such number: $_n"; fi
+    _base=$(basename "$_src" .json)
+    valid_name "$_base" || die "quarantined name '$_base' is not a valid account name — rename the file first"
+    _dest=$(name_to_file "$_base")
+    [ -e "$_dest" ] && die "$_dest already live — renew it instead"
+    printf 'Restore %s from %s? [y/N]: ' "$_base" "$_src" >&2
+    IFS= read -r _ok || true
+    case $_ok in [Yy]|[Yy][Ee][Ss]) ;; *) info "cancelled — nothing moved"; return 0;; esac
+    info "Probing quarantined file (no changes yet)..."
+    if ! probe_file "$_src"; then
+        info "still dead — left quarantined"
+        return 1
+    fi
+    mv "$_src" "$_dest"
+    chmod 600 "$_dest"
+    for _b in "$_src".bak "$_src".bak-*; do
+        [ -e "$_b" ] || continue
+        _suffix=$(printf '%s' "$_b" | sed "s|^.*$_base||")
+        mv "$_b" "$AUTH_DIR/$_base$_suffix"
+    done
+    info "restored: $_base -> accounts/"
+    info "note: account_N ids are positional — verify DEEPSEEK_PREFERRED_ACCOUNT still points where intended"
+    rm -f "$TMP_PREFIX.restore-list"
+    TMP_PREFIX=""
+    offer_restart
+}
 cmd_rename() {
     _old=${1:-}
     if [ -z "$_old" ]; then
@@ -330,10 +387,11 @@ show_menu() {
     info "DeepSeek accounts ($AUTH_DIR)"
     info "  1. Add account     2. Renew account    3. Delete account"
     info "  4. Check accounts  5. Import           6. Doctor"
-    info "  7. Restart proxy   8. Rename account   0. Exit"
+    info "  7. Restart proxy   8. Rename account   9. Restore quarantined"
+    info "  0. Exit"
 }
 usage() {
-    printf 'usage: %s [add|renew|rename|delete|check|import|doctor|restart] [name] [--force]\n' "$(basename -- "$0")" >&2
+    printf 'usage: %s [add|renew|rename|restore|delete|check|import|doctor|restart] [name] [--force]\n' "$(basename -- "$0")" >&2
     exit 2
 }
 
@@ -360,6 +418,7 @@ main() {
                     6) (cmd_doctor) || true ;;
                     7) (restart_service) || true ;;
                     8) (cmd_rename) || true ;;
+                    9) (cmd_restore) || true ;;
                     0|q|Q) break ;;
                     *) info "unknown choice: $_c" ;;
                 esac
@@ -369,6 +428,7 @@ main() {
         add) cmd_add "${2:-}" ;;
         renew) cmd_renew "${2:-}" ;;
         rename) cmd_rename "${2:-}" "${3:-}" ;;
+        restore) cmd_restore ;;
         delete) cmd_delete "${2:-}" ;;
         check) cmd_check "${2:-all}" ;;
         import) cmd_import "${2:-}" ;;

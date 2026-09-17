@@ -442,6 +442,13 @@ ones, all-spent answers 429 with `Retry-After`):
 DEEPSEEK_HOURLY_QUOTA=60 npm start  # 0 disables; sliding 1h window per account
 ```
 
+Burst cap (anti-velocity — most turns per sliding 60s window; rejects fast
+429 without touching scorer state; off until measured):
+
+```bash
+DEEPSEEK_BURST_PER_MINUTE=0 npm start  # 0 disables; candidate 10 post-measurement
+```
+
 ---
 
 ## 🔑 Ideas for console auth

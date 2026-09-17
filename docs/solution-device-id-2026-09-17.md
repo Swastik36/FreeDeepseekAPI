@@ -1,36 +1,46 @@
-# Solution — per-account `device_id` support (implementation plan, no code)
+# Solution — machine `device_id` support (implementation plan, no code)
 
-Status: plan only. Rank: #1 anti-ban item (round-3 G1).
+Status: plan only, REVISED 2026-09-17 (round-3 G1). Revision: single
+machine-wide id attached to every account — from one laptop, per-account
+captures would reproduce the same fingerprint four times (theater). The value
+is fixing the missing-fingerprint class (nothing sent at all today), not fake
+diversity. Rank: anti-ban item.
 
 ## 1. What it is (verified facts)
 
 - DeepSeek's Shumei risk SDK fingerprints the device (`device_id`, per
-  browser/machine). Rust project (`NIyueeE/ds-free-api` README + `pool.rs`
-  sharing-warning): missing fingerprint → `biz_code=11 RISK_DEVICE_DETECTED`
-  login rejection; **sharing one id across accounts increases mute-correlation
-  risk** — capture one id per account (one browser profile each).
+  browser/machine). Rust project: missing fingerprint → `biz_code=11
+  RISK_DEVICE_DETECTED` login rejection (`client.rs`, `config.example.toml`).
+- On the per-account question their own docs contradict (README:83 reuse-OK vs
+  `config.example` + pool warning strict). Resolution adopted here: from ONE
+  laptop, per-account captures reproduce the same fingerprint — so we capture
+  ONCE per machine and attach the same id everywhere. No theater, no spoofing
+  (faked ids are documented to trip `RISK_DEVICE_DETECTED` worse than reuse).
 - Their login payload: `{email?|mobile?, password, area_code?, device_id,
   os}` (`ds_core/src/accounts/client.rs:101`). Python mints a fresh random id
   **per login event only** (login `proxy.py:2418`, relogin `:3073`; chat turns
-  reuse the saved headers) — not per-request churn. We follow Rust: **stable
-  per-account id**, since our sessions are long-lived cookies, not fresh logins.
+  reuse the saved headers) — not per-request churn. We follow the stable-id
+  school (Rust), not the churn school (Python): one real id, everywhere,
+  matching our long-lived sessions.
 - Capture (their documented method, no automation needed): open
   `chat.deepseek.com/sign_in` in Chrome → DevTools Network → `users/login`
   payload → copy `device_id`; or console `SMSdk.getDeviceId()`.
 
-## 2. Our-side design
+## 2. Our-side design (single machine id — see header)
 
-- **Storage**: optional `device_id` string inside each `accounts/*.json`
-  (alongside token/cookie). Optional = old files load unchanged (round-3
-  constraint 1). `auth_import.js normalizeAuth` passes it through;
-  `validateAuth` does NOT require it (warn only).
-- **Capture UX**: new `auth-cli.sh` step after login (solution-auth-cli §3.1):
-  "paste device_id (ENTER to skip)" + print the 4-step capture guide. Also
-  accept `DEEPSEEK_DEVICE_ID` env for the headers-paste import path. Store with
-  the account file at `0600`.
-- **Sharing guard**: at server load, group accounts by `device_id`; log a
-  warning per shared id (mirror their pool warning text, adapted). No hard
-  failure — shared id still loads.
+- **Storage**: one optional `device_id` per `accounts/*.json` file (same value
+  everywhere in practice; per-file so a future second machine can differ).
+  Optional = old files load unchanged (round-3 constraint 1).
+  `auth_import.js normalizeAuth` passes it through; `validateAuth` does NOT
+  require it (warn only).
+- **Capture UX**: new `auth-cli.sh` step after the FIRST login only
+  ("paste machine device_id (ENTER to skip)" + the 3-step guide); Renew
+  pre-fills from the existing file and asks only if empty. Also accept
+  `DEEPSEEK_DEVICE_ID` env for the headers-paste import path. Store `0600`.
+- **No sharing guard** (deliberately dropped): sharing is the design, not a
+  smell, on one machine — a warning would fire on the intended configuration.
+  If a second machine ever joins the pool, differing ids are expected and
+  also fine; no warning either way.
 - **Usage**: send as an extra signal where the web API accepts it. Exact header/
   payload placement is **UNVERIFIED — capture required before coding**. A prior
   draft claimed `x-device-id` was observed in a 2026-09-16 browser capture;
@@ -42,10 +52,9 @@ Status: plan only. Rank: #1 anti-ban item (round-3 G1).
   `users/login` payload. Our proxy sends neither today (`buildBaseHeaders`,
   `server.js:342`, has no such header). Do not code placement until the new
   capture lands in-tree (redacted) or this section is updated with its path.
-- **Rotation policy**: stable per account; re-capture only on Renew (prompt,
-  prefilled with existing). Never auto-mint random ids (anti-correlation >
-  anti-clustering for our long-lived sessions; document the tradeoff vs the
-  Python approach).
+- **Rotation policy**: stable machine id; re-capture only if logins start
+  failing with `RISK_DEVICE_DETECTED` (fingerprint drift), never on a schedule.
+  Never auto-mint random ids.
 
 ## 3. Server changes (for the implementer)
 
@@ -53,14 +62,14 @@ Status: plan only. Rank: #1 anti-ban item (round-3 G1).
    warn-if-missing.
 2. `buildBaseHeaders` (`server.js:342`): include the stored id in the verified
    placement (header and/or payload — TBD by capture).
-3. Load-time sharing warning in `loadDeepSeekConfig` (same shape as their pool
-   warning; ids truncated to 12 chars in logs — never full values).
+3. Load-time presence log (one line listing which accounts carry an id —
+   ids truncated to 12 chars, never full values).
 4. `accountStatus` additive field `has_device_id: bool` (observability).
-5. Tests: passthrough/validation unit tests; sharing-warning test with fake
+5. Tests: passthrough/validation unit tests; presence-log test with fake
    accounts; no live-device assertions.
 
 ## 4. Verification
 - `npm test` green; manual: add id to one account → restart → confirm header
-  present via debug log (lengths only) → live completion OK → sharing warning
-  fires with two accounts on one id in a scratch dir.
+  present via debug log (lengths only) → live completion OK → presence log
+  lists the id-carrying accounts (truncated).
 - Rollback: delete the key from the file (optional field; loader ignores absence).

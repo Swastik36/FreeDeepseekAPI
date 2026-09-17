@@ -20,6 +20,7 @@ verdict, and which solution doc carries the implementation plan.
 | G11 | Single binary / zero-dep | Rust binary / Node zero-dep | pip venv | already zero-dep | n/a (parity) |
 | G12 | Registration automation | no | yes (`registrar.py`) | no | **SKIP explicitly** — ban-farm-shaped, mainland-blocked, captcha-prone |
 | G13 | Hourly model refresh cadence | n/a | hourly | n/a | covered by G3 |
+| G14 | Velocity shaping (min-gap pacing + burst cap) | no pacing; most-idle rotation only | no pacing (per-request iOS churn instead) | **Missing** — quota caps volume, nothing shapes gaps | **STEAL the problem, ORIGINAL design** → `solution-pacing` (burst 4a first, pacer 4b deferred, all defaults 0) |
 
 ## Where we lead (do not regress)
 
@@ -58,6 +59,8 @@ re-derive anchors mechanically (`grep -n`) or replace them with symbolic
 
 1. `solution-auth-cli` (unlocks everything: probe lib, Bearer-first extraction,
    file conventions) 2. `solution-device-id` (anti-ban, needs CLI capture step)
-3. `solution-hourly-quota` (anti-mute, pure server) 4. `solution-model-discovery`
-5. `solution-tool-tags` 6. `solution-scoped-autologin` 7. `solution-file-upload`
-   (+G6 fallback) 8. `solution-retry-toggle` (smallest, last).
+3. `solution-hourly-quota` (anti-mute volume, pure server) 4. `solution-pacing`
+   (anti-velocity: min-gap + burst cap — original work, pairs with quota)
+5. `solution-model-discovery`
+6. `solution-tool-tags` 7. `solution-scoped-autologin` 8. `solution-file-upload`
+   (+G6 fallback) 9. `solution-retry-toggle` (smallest, last).
