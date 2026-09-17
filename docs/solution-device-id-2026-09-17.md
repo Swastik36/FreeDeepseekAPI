@@ -1,10 +1,9 @@
-# Solution — machine `device_id` support (implementation plan, no code)
+# Solution — machine `device_id` support (IMPLEMENTED 2026-09-17, see §5)
 
-Status: plan only, REVISED 2026-09-17 (round-3 G1). Revision: single
-machine-wide id attached to every account — from one laptop, per-account
-captures would reproduce the same fingerprint four times (theater). The value
-is fixing the missing-fingerprint class (nothing sent at all today), not fake
-diversity. Rank: anti-ban item.
+Status: implemented — `normalizeAuth` passthrough, `x-device-id` header when
+configured, load presence log (truncated), `has_device_id` status, CLI prompt
+in add/renew. All three live accounts carry the machine id; each proven with
+an isolated live turn. Rank: anti-ban item.
 
 ## 1. What it is (verified facts)
 
@@ -73,3 +72,16 @@ diversity. Rank: anti-ban item.
   present via debug log (lengths only) → live completion OK → presence log
   lists the id-carrying accounts (truncated).
 - Rollback: delete the key from the file (optional field; loader ignores absence).
+
+## 5. Implementation record (2026-09-17)
+
+SMSdk absent on chat pages (risk script loads only around login challenges),
+so capture used `localStorage deepseek-device-id:chat` (36-char UUID) — the
+same value seen as `x-device-id` in live browser traffic. Installed into all
+live accounts; captures shredded. Verified per-account with true isolation
+(single file in dir + restart + turn): bharat, prakash, fresh all serve live
+turns with the header. Incidents during verification: a wedged remote chat
+returning empties (fixed by session reset, unrelated to the header) and a
+unit-file-vs-manager-env lesson — `systemctl set-environment` NEVER overrides
+the unit's own `Environment=` lines; preferred-account switches must edit
+`~/.config/systemd/user/freedeepseek.service`. `npm test` 243 green.

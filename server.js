@@ -603,6 +603,7 @@ function buildBaseHeaders(config = DS_CONFIG) {
         "Authorization": `Bearer ${config.token || ''}`,
         "x-hif-dliq": config.hif_dliq || '',
         "x-hif-leim": config.hif_leim || '',
+        ...(typeof config.device_id === 'string' && /^[A-Za-z0-9_.:~/-]{1,128}$/.test(config.device_id) ? { "x-device-id": config.device_id } : {}),
         "Origin": "https://chat.deepseek.com",
         "Referer": "https://chat.deepseek.com/",
         "Cookie": config.cookie || '',
@@ -648,6 +649,9 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
     dsHeaders = accounts[0]?.headers || buildBaseHeaders({});
     if (accounts.length > 0) {
         console.log(`[DS-API] Loaded ${accounts.length} auth account(s): ${accounts.map(a => a.id).join(', ')}`);
+        for (const a of accounts) {
+            if (a.config.device_id) logDebug(`[DS-API] ${a.id} carries device_id ${String(a.config.device_id).slice(0, 12)}...`);
+        }
         return true;
     }
     if (fatal) {
@@ -669,6 +673,7 @@ function accountStatus(account) {
         used_this_hour: usedThisHour(account),
         quota_exhausted: HOURLY_QUOTA > 0 && !withinQuota(account),
         burst_used_1m: burstUsedThisMinute(account),
+        has_device_id: Boolean(account.config.device_id),
         inflight: Number(account.inflight) || 0,
         last_used_at: account.lastUsedAt || null,
     };
@@ -5445,6 +5450,7 @@ module.exports = {
         selectAccountForSession,
         selectFreshAccount,
         selectFreshAccountDetail,
+        buildBaseHeaders,
         scoreAccount,
         scoreBase,
         effectiveFailures,

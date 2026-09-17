@@ -45,6 +45,11 @@ function normalizeCookieInput(input) {
 function normalizeAuth(input, extra = {}) {
   const token = String(input.token || input.access_token || input.accessToken || input.auth_token || extra.token || process.env.DEEPSEEK_TOKEN || '').trim().replace(/^Bearer\s+/i, '');
   const cookie = normalizeCookieInput(input) || extra.cookie || '';
+  // device_id shares the server's charset contract (L6-R1): drop (don't store)
+  // anything the proxy would refuse to send, so files never hold known-bad ids.
+  const rawDeviceId = input.device_id ?? input.deviceId ?? extra.device_id ?? process.env.DEEPSEEK_DEVICE_ID ?? '';
+  const deviceId = (typeof rawDeviceId === 'string' && /^[A-Za-z0-9_.:~/-]{1,128}$/.test(rawDeviceId.trim())) ? rawDeviceId.trim() : '';
+  if (rawDeviceId !== '' && rawDeviceId !== undefined && !deviceId) console.warn('[auth:import] device_id rejected (type/charset/length) — continuing without it');
   const auth = {
     token,
     hif_dliq: String(input.hif_dliq || input['x-hif-dliq'] || extra.hif_dliq || ''),
@@ -52,6 +57,7 @@ function normalizeAuth(input, extra = {}) {
     cookie,
     wasmUrl: String(input.wasmUrl || input.wasm_url || extra.wasmUrl || DEFAULT_WASM),
   };
+  if (deviceId) auth.device_id = deviceId;
   return auth;
 }
 function validateAuth(auth) {

@@ -4,7 +4,7 @@ Status: burst cap (4a) IMPLEMENTED 2026-09-17; min-gap pacer (4b) DEFERRED for
 measurement with all knobs default 0. (`server.js`: `DEEPSEEK_BURST_PER_MINUTE`
 default 0, `recordUpstreamTurn` unconditional writer + `usedSince` readers,
 `withinBurst`/`stickyBurstReject` (pure, tested), readiness filters +
-sticky-429 + `burst_used_1m` status; tests 241 green; live-fired with limit 3
+sticky-429 + `burst_used_1m` status; tests 243 green as of 2026-09-17; live-fired with limit 3
 (post early-return fix): fresh picks exclude spent accounts, sticky live chat
 fails fast 429, all-cooling falls back to the enriched generic 429.)
 

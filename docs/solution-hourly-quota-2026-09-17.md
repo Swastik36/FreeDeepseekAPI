@@ -61,5 +61,5 @@ sliding-window `requestTimes` ring capped at 2× quota, readiness pre-filter in
 fresh picks + migration + `/readyz`, earliest-release `Retry-After` on
 all-spent, `used_this_hour`/`quota_exhausted` in `accountStatus`; clock starts
 at PoW-challenge success; success reset does NOT clear the window — different
-signal). Tests 241 green. Live verified with quota=2: two turns served, third
+signal). Tests 243 green as of 2026-09-17. Live verified with quota=2: two turns served, third
 fails fast 429 with `Retry-After`.

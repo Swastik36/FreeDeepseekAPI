@@ -2637,6 +2637,37 @@ test('smart routing: accountStatus exposes inflight as a number', () => {
   assert.equal(legacy.inflight, 0);
 });
 
+test('device-id: headers carry x-device-id only when configured', () => {
+  const withId = serverInternals.buildBaseHeaders({ token: 't', cookie: 'c', device_id: 'dev-123' });
+  assert.equal(withId['x-device-id'], 'dev-123');
+  const withoutId = serverInternals.buildBaseHeaders({ token: 't', cookie: 'c' });
+  assert.ok(!('x-device-id' in withoutId), 'absent without id — old files unaffected');
+  const evil = serverInternals.buildBaseHeaders({ token: 't', cookie: 'c', device_id: 'a\r\nInjected: x' });
+  assert.ok(!('x-device-id' in evil), 'CRLF value omitted, not sent');
+  const num = serverInternals.buildBaseHeaders({ token: 't', cookie: 'c', device_id: 12345 });
+  assert.ok(!('x-device-id' in num), 'non-string id omitted');
+  const long = serverInternals.buildBaseHeaders({ token: 't', cookie: 'c', device_id: 'a'.repeat(129) });
+  assert.ok(!('x-device-id' in long), '129-char id omitted');
+  for (const bad of [true, null, ['x'], { id: 'x' }]) {
+    const h = serverInternals.buildBaseHeaders({ token: 't', cookie: 'c', device_id: bad });
+    assert.ok(!('x-device-id' in h), `non-string ${JSON.stringify(bad)} omitted`);
+  }
+  const st = serverInternals.accountStatus({ id: 'x', config: { token: 't', cookie: 'c', device_id: 'd' }, cooldownUntil: 0, failures: 0 });
+  assert.equal(st.has_device_id, true);
+  const st2 = serverInternals.accountStatus({ id: 'y', config: { token: 't', cookie: 'c' }, cooldownUntil: 0, failures: 0 });
+  assert.equal(st2.has_device_id, false);
+});
+
+test('device-id: auth_import passes device_id through, never requires it', () => {
+  const { normalizeAuth, validateAuth } = require('../scripts/auth_import.js');
+  const a = normalizeAuth({ token: 't', cookie: 'c=1', device_id: 'dev-1' });
+  assert.equal(a.device_id, 'dev-1');
+  assert.deepEqual(validateAuth(a), []);
+  const b = normalizeAuth({ token: 't', cookie: 'c=1' });
+  assert.ok(!('device_id' in b), 'absent stays absent');
+  assert.deepEqual(validateAuth(b), [], 'still valid without id');
+});
+
 test('smart routing: jitter is bounded — tied inputs only ever pick among the tied accounts', (t) => {
   saveRoutingEnv(t);
   delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;

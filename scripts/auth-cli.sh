@@ -98,8 +98,41 @@ probe_or_die() {
         die "$2"
     fi
 }
-node_has_token() {
-    # node_has_token <json> -> 0 if file parses and has non-empty token
+valid_device_id() {
+    # valid_device_id <value> — single shared charset/length gate (L7-R2):
+    # capture prompt, seed copy, and any future smoke test use one definition.
+    # Empty is invalid here (callers handle skip separately).
+    case $1 in "") return 1;; esac
+    case $1 in *[!A-Za-z0-9_.:~/-]*) return 1;; esac
+    [ "${#1}" -gt 128 ] && return 1
+    return 0
+}
+maybe_add_device_id() {
+    # maybe_add_device_id <json> — one prompt, merged into the staged file.
+    # Value travels via env (same-user-only), never argv — same rule as tokens.
+    # Empty answer keeps any id already staged (renew pre-seeds, see below).
+    _tries=0
+    while [ $_tries -lt 3 ]; do
+        _d=$(ask "Machine device_id (browser localStorage key deepseek-device-id:chat; ENTER to skip)" "")
+        printf '\n' >&2
+        [ -z "$_d" ] && return 0
+        if valid_device_id "$_d"; then break; fi
+        info "rejected: allowed chars are A-Z a-z 0-9 _ . : ~ / - (max 128)"
+        _tries=$((_tries + 1))
+    done
+    # Post-loop re-validation (M6-R1): the 3rd rejection exits the loop with an
+    # invalid non-empty value — never persist what was just rejected.
+    if ! valid_device_id "$_d"; then info "giving up on device_id — leaving staged file unchanged"; return 0; fi
+    DEEPSEEK_DEVICE_ID="$_d" node -e 'const fs=require("fs");const p=process.argv[1];const j=JSON.parse(fs.readFileSync(p,"utf8"));const v=String(process.env.DEEPSEEK_DEVICE_ID||"").trim();if(v){j.device_id=v}else{delete j.device_id}fs.writeFileSync(p,JSON.stringify(j,null,2));fs.chmodSync(p,0o600);' "$1"
+    info "device_id recorded"
+}
+seed_device_id() {
+    # seed_device_id <live.json> <staging.json> — carry the machine id across
+    # renewals (M5-R1). Validates like capture (L7-R1): a hand-corrupted live id
+    # is skipped, never propagated — seeded-absent behaves exactly like no id.
+    node -e 'const fs=require("fs");const l=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const id=l&&l.device_id;if(typeof id!=="string"||!/^[A-Za-z0-9_.:~/-]{1,128}$/.test(id))return;const p=process.argv[2];const s=JSON.parse(fs.readFileSync(p,"utf8"));s.device_id=id;fs.writeFileSync(p,JSON.stringify(s,null,2));fs.chmodSync(p,0o600);' "$1" "$2" 2>/dev/null || true
+}
+node_has_token() {    # node_has_token <json> -> 0 if file parses and has non-empty token
     node -e 'try{const a=require("fs").readFileSync(process.argv[1],"utf8");const j=JSON.parse(a);process.exit(j&&j.token?0:1)}catch(e){process.exit(1)}' "$1" 2>/dev/null
 }
 install_staged() {
@@ -155,6 +188,7 @@ cmd_add() {
     if [ $_c -ne 0 ]; then
         die "login incomplete (exit $_c) — nothing written"
     fi
+    maybe_add_device_id "$TMP_PREFIX.tmp"
     info "Probing fresh credentials..."
     probe_or_die "$TMP_PREFIX.tmp" "probe says DEAD — staging kept out of live files; retry Add when logged in"
     install_staged "$TMP_PREFIX.tmp" "$_dest"
@@ -177,6 +211,8 @@ cmd_renew() {
     if [ $_c -ne 0 ]; then
         die "login incomplete (exit $_c) — '$_name' left untouched"
     fi
+    seed_device_id "$_dest" "$TMP_PREFIX.tmp"
+    maybe_add_device_id "$TMP_PREFIX.tmp"
     info "Probing fresh credentials..."
     probe_or_die "$TMP_PREFIX.tmp" "probe says DEAD — '$_name' left untouched"
     install_staged "$TMP_PREFIX.tmp" "$_dest"
@@ -231,8 +267,11 @@ cmd_restore() {
     chmod 600 "$_dest"
     for _b in "$_src".bak "$_src".bak-*; do
         [ -e "$_b" ] || continue
-        _suffix=$(printf '%s' "$_b" | sed "s|^.*$_base||")
-        mv "$_b" "$AUTH_DIR/$_base$_suffix"
+        _suffix=${_b##*.json}
+        case $_suffix in .* ) ;; *) _suffix=".bak";; esac
+        _bdest="$AUTH_DIR/$_base$_suffix"
+        if [ -e "$_bdest" ]; then info "warning: keeping existing $_bdest, left ${_b} in quarantine"; continue; fi
+        mv "$_b" "$_bdest"
     done
     info "restored: $_base -> accounts/"
     info "note: account_N ids are positional — verify DEEPSEEK_PREFERRED_ACCOUNT still points where intended"
@@ -257,8 +296,11 @@ cmd_rename() {
     chmod 600 "$_dest"
     for _b in "$_src".bak "$_src".bak-*; do
         [ -e "$_b" ] || continue
-        _suffix=$(printf '%s' "$_b" | sed "s|^.*$_old||")
-        mv "$_b" "$AUTH_DIR/$_new$_suffix"
+        _suffix=${_b##*.json}
+        case $_suffix in .* ) ;; *) _suffix=".bak";; esac
+        _bdest="$AUTH_DIR/$_new$_suffix"
+        if [ -e "$_bdest" ]; then info "warning: keeping existing $_bdest, left ${_b} behind"; continue; fi
+        mv "$_b" "$_bdest"
     done
     info "renamed: $_old -> $_new"
     info "new account order (ids are positional — verify DEEPSEEK_PREFERRED_ACCOUNT):"
