@@ -1081,8 +1081,8 @@ function maybeTriggerAmbientTelemetry(account, now = Date.now(), fetchImpl = fet
     });
 }
 // Turn-Aware Delta Pacing (Pillar 5)
-const AGENT_TURN_GAP_MS = numEnv('DEEPSEEK_AGENT_TURN_GAP_MS', 0, 0);
-const TURN_JITTER_MS = numEnv('DEEPSEEK_TURN_JITTER_MS', 0, 0);
+const AGENT_TURN_GAP_MS = numEnv('DEEPSEEK_AGENT_TURN_GAP_MS', 3000, 0);
+const TURN_JITTER_MS = numEnv('DEEPSEEK_TURN_JITTER_MS', 1000, 0);
 const MIN_USABLE_UPSTREAM_MS = numEnv('DEEPSEEK_MIN_USABLE_UPSTREAM_MS', 10000, 1000);
 
 function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {

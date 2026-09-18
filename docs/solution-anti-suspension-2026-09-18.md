@@ -30,7 +30,7 @@ A blunt, flat 2–5 second sleep on every turn is unacceptable:
 - It degrades interactive human turns with artificial latency.
 - It redundantly stalls turns where local execution was already slow (e.g. running builds or test suites taking 3–10s).
 - It injects 30–50 seconds of dead idle time into every standard 10-turn coding task.
-- Any delay mechanism must be **turn-aware**, **delta-based**, and **default-off (`0`)** until validated in production.
+- Any delay mechanism must be **turn-aware** and **delta-based**: only agent-loop turns ever wait, human turns are always instant.
 
 ---
 
@@ -403,12 +403,12 @@ This guarantees that both the JSON error message and the HTTP `Retry-After` head
 
 ## 3. Configuration Knobs & Defaults
 
-All new knobs default to `0` / off:
+All new knobs default to safe values (pacing on: 3s gap + 1s jitter on agent-loop turns only; telemetry off):
 
 | Knob | Default | Validation / Clamp | Description |
 |---|---|---|---|
-| `DEEPSEEK_AGENT_TURN_GAP_MS` | `0` (Off) | integer $\ge 0$ | Target minimum gap between consecutive agent loop turns on an account |
-| `DEEPSEEK_TURN_JITTER_MS` | `0` (Off) | integer $\ge 0$ | Maximum uniform random jitter added to agent gap (uniform on $[0, \text{jitterMs}]$) |
+| `DEEPSEEK_AGENT_TURN_GAP_MS` | `3000` (3s) | integer $\ge 0$ | Target minimum gap between consecutive agent loop turns on an account (`0` disables) |
+| `DEEPSEEK_TURN_JITTER_MS` | `1000` (1s) | integer $\ge 0$ | Maximum uniform random jitter added to agent gap (uniform on $[0, \text{jitterMs}]$) |
 | `DEEPSEEK_MIN_USABLE_UPSTREAM_MS` | `10000` (10s) | integer $\ge 1000$ | Minimum required time remaining before request deadline to permit pacing sleep |
 | `DEEPSEEK_AMBIENT_TELEMETRY` | `0` (Off) | `0` or `1` | Enables background `/api/v0/users/current` telemetry pings |
 | `DEEPSEEK_TELEMETRY_INTERVAL_MS` | `900000` (15m) | integer $\ge 60000$ | Minimum interval between ambient telemetry pings per account |
