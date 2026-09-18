@@ -2,7 +2,7 @@
 
 Status: IMPLEMENTED 2026-09-17, REWORKED same day after adversarial review
 (`server.js`: `parseToolTagList`, `TOOL_EXTRA_STARTS/ENDS`, `looksLike` wiring,
-`parseCustomTagToolCall` stage, `setExtraToolTags` test hook; tests 232 green;
+`parseCustomTagToolCall` stage, `setExtraToolTags` test hook. Suite green (count lives in CI output);
 live IMPL-OK/REWORK-OK).
 Design deviations from plan: extraction stage added (plan only specified
 sentinels) — required, else extras were detection-only; DSML-gate wiring

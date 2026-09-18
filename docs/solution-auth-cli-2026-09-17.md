@@ -148,4 +148,4 @@ staging files (not `rm`); `process.exit` codes numeric (no string coercion).
 Tests: `classifyPowResponse` fixtures in `tests/unit.test.js`; `probe-account.js`
 in the `node --check` chain. Verified: scratch check-all/one/delete-refusal, pty
 menu against live accounts (fresh ALIVE, dead ones DEAD), name-boundary matrix
-(1/32 accept, 33+ reject, uppercase/space reject), bashism scan clean. `npm test` 232 green.
+(1/32 accept, 33+ reject, uppercase/space reject), bashism scan clean. Suite green (count lives in CI output, not here).

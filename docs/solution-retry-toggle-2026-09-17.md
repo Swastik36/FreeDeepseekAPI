@@ -5,7 +5,7 @@ Status: IMPLEMENTED 2026-09-17, REWORKED same day after adversarial review
 Retry-After honored, 10s cap), `shouldAttemptInPlaceRetry` (unknown/brief
 backoffs only), `inPlaceRateLimitRetry` (cooldown lift + exact restore, error
 preserved), enriched fail-fast 429s with backoff + `/compact` guidance;
-default off = byte-identical fail-fast path; tests 232 green; live REWORK-OK).
+default off = byte-identical fail-fast path; live REWORK-OK. Suite green (count lives in CI output).
 Rework (review C1/C2/M1): v1 retried through `selectAccountForSession` and
 could never reach the same chat (sticky-cool throw) or account (chat-less
 rotate), double-penalized failures, and swallowed the second error. v2 lifts

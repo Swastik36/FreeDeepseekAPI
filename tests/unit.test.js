@@ -2656,6 +2656,11 @@ test('device-id: headers carry x-device-id only when configured', () => {
   assert.equal(st.has_device_id, true);
   const st2 = serverInternals.accountStatus({ id: 'y', config: { token: 't', cookie: 'c' }, cooldownUntil: 0, failures: 0 });
   assert.equal(st2.has_device_id, false);
+  assert.equal(st.ewma_latency_ms, 0, 'fresh account latency reads 0 (unknown)');
+  assert.equal(st2.ewma_latency_ms, 0);
+  // Success-only staleness (M-1): a timing-out account keeps its last good
+  // value through the outage by design — failures never write this field
+  // (single write site, success path). Display-only, never scored.
 });
 
 test('device-id: auth_import passes device_id through, never requires it', () => {
@@ -2666,6 +2671,49 @@ test('device-id: auth_import passes device_id through, never requires it', () =>
   const b = normalizeAuth({ token: 't', cookie: 'c=1' });
   assert.ok(!('device_id' in b), 'absent stays absent');
   assert.deepEqual(validateAuth(b), [], 'still valid without id');
+});
+
+test('model discovery: parser reads verified shape, rejects the rest', () => {
+  const p = serverInternals.parseModelDiscovery;
+  const good = { code: 0, data: { biz_code: 0, biz_data: { settings: { model_configs: { id: 1, value: [
+    { model_type: 'default', name: 'x', enabled: true, switchable: true },
+    { model_type: 'expert', name: 'y', enabled: false, switchable: false },
+  ] } } } } };
+  const parsed = p(good);
+  assert.ok(parsed, 'verified shape parses');
+  assert.deepEqual(parsed.types.map(t => [t.model_type, t.enabled, t.switchable]),
+    [['default', true, true], ['expert', false, false]]);
+  assert.ok(parsed.fetchedAt > 0);
+  assert.equal(p(null), null);
+  assert.equal(p({}), null);
+  assert.equal(p({ code: 0, data: { biz_code: 1, biz_msg: 'SETTINGS_NOT_FOUND', biz_data: null } }), null, 'soft-miss shape');
+  assert.equal(p({ code: 0, data: { biz_data: { settings: {} } } }), null, 'missing table');
+  assert.equal(p({ code: 0, data: { biz_data: { settings: { model_configs: { id: 1 } } } } }), null, 'missing value array');
+  assert.equal(p({ code: 0, data: { biz_data: { settings: { model_configs: [] } } } }), null, 'bare list rejected');
+  const tabled = { id: 1, value: [{ model_type: 'x', enabled: true, switchable: true }] };
+  assert.ok(p({ code: 0, data: { biz_code: 0, biz_data: { settings: { model_configs: tabled } } } }), 'zero envelopes accept');
+  assert.equal(p({ code: 500, data: { biz_code: 0, biz_data: { settings: { model_configs: tabled } } } }), null, 'error code with table rejected (H-1)');
+  assert.equal(p({ code: 0, data: { biz_code: 5, biz_data: { settings: { model_configs: tabled } } } }), null, 'nonzero biz_code with table rejected (H-1)');
+  assert.ok(p({ code: 0, data: { biz_code: '0', biz_data: { settings: { model_configs: tabled } } } }), 'string-zero biz_code accepted (harmonized)');
+  assert.deepEqual(
+    p({ code: 0, data: { biz_data: { settings: { model_configs: { id: 1, value: [
+      { model_type: 'x', enabled: 1, switchable: 'yes' },
+    ] } } } } }).types,
+    [{ model_type: 'x', name: '', enabled: false, switchable: false }],
+    'truthy-non-true is NOT enabled (strict === true)'
+  );
+});
+
+test('latency tracking: EWMA seeds then smooths with alpha 0.3', () => {
+  const f = serverInternals.nextEwmaLatency;
+  assert.equal(f(0, 1000), 1000, 'first sample seeds');
+  assert.equal(f(undefined, 2000), 2000);
+  assert.equal(f(1000, 2000), 1300, '0.7*1000+0.3*2000');
+  assert.equal(f(1300, 1300), 1300, 'steady state holds');
+  assert.equal(f(-5, 1000), 1000, 'garbage prev reseeds');
+  assert.equal(f(1000, -50), 700, 'negative sample floors at 0: 0.7*1000');
+  assert.equal(f(NaN, 1000), 1000, 'NaN prev reseeds');
+  assert.equal(f(1000, NaN), 700, 'NaN sample floors at 0: 0.7*1000');
 });
 
 test('smart routing: jitter is bounded — tied inputs only ever pick among the tied accounts', (t) => {
@@ -3271,6 +3319,8 @@ test('burst cap: isAccountReady is the single predicate behind all four gates', 
   assert.equal(f({ config: { token: '', cookie: 'c' }, cooldownUntil: 0 }, now), false, 'no creds excluded');
   assert.equal(f(null, now), false);
   assert.equal(f(undefined, now), false);
+  const noCooldown = { config: { token: 't', cookie: 'c' } };
+  assert.equal(f(noCooldown, now), true, 'missing cooldown reads as ready (fail-open, constructor always sets it)');
 });
 
 test('retry toggle: anyAccountReady gates the retry on real readiness', () => {

@@ -1,51 +1,60 @@
-# Solution — dynamic model discovery (implementation plan, no code)
+# Solution — dynamic model discovery (IMPLEMENTED 2026-09-17)
 
-Status: plan only (round-3 G3).
+Status: implemented — poller, strict parser, health exposure; advisory-only
+by construction (no alias mutation anywhere). Live: startup poll logged 3 types,
+`/health` shows the table.
 
-## 1. What it is (verified facts)
+## 1. What it is (verified facts, 2026-09-17 live probes)
 
-- Python (`proxy.py:2936 _discover_models` with `did=uuid4()` at `:2959`,
-  hourly `refresh_models` at `:3206`): authed
-  `GET client/settings?scope=model` at startup + hourly → parses `model_configs`
-  → base/thinking/search variants. (Their snippet confirmed in round-2.)
-- Our probe 2026-09-17: the endpoint needs a **live `did`** — stale did returns
-  `SETTINGS_NOT_FOUND` (`biz_code=1`). Discovery must use a working account's
-  credentials AND a fresh device id (ties into `solution-device-id`).
-- Cautionary datum: Rust hardcoded `model_types=["default"]` because THEIR
-  settings read showed expert/vision `enabled:false` — but OUR live probe the
-  same month returned `EXPERT-OK` on the web path. Discovery must be
-  **advisory, never destructive** (see §3).
+- Endpoint: authed `GET client/settings?did=<any>&scope=model`. Proven by
+  A/B/A/B testing same-credentials: **the `did` value is irrelevant**
+  (random UUID works); the gate is the **`x-client-*` header group**
+  (platform/version/locale/bundle-id/timezone). Minimal headers → perpetual
+  `biz_code: 1 SETTINGS_NOT_FOUND`; full browser-like headers → `biz_code: 0`.
+  Fly143's `did=uuid4` approach works for them only because they also send
+  client headers — the did itself was never the trick.
+- Parser path (verified shape): `data.biz_data.settings.model_configs` =
+  `{id, value: [{model_type, name, enabled, switchable, ...}]}` — NOT a bare
+  list at `biz_data` level (an early probe misread this; the A/B runs pinned it).
+- Live values 2026-09-17: `default` enabled+switchable; `expert`/`vision`
+  disabled+unswitchable — matching the Rust README. PARADOX (do not resolve by
+  demotion): `deepseek-expert` completions still succeed through our proxy
+  (`EXPERT-OK` live). Upstream flags ≠ serving reality; discovery stays advisory.
+- Failure mode is soft: `biz_code != 0` or unparseable → keep last-good table,
+  debug-log per event (no warn-once path in the tree). Discovery must never
+  break serving.
 
 ## 2. Our-side design
 
-- Poller: on startup + hourly (`setInterval`, unref'd so it never holds the
-  process open; skip while no healthy account exists), using the preferred
-  account's token+cookie. Timeout 15s, failures swallowed with a debug log
-  (discovery must never break serving).
-- Parser: read `data.biz_data.model_configs[]` → `{model_type, enabled,
-  switchable, name?}`. Unknown shapes → keep current table, warn once.
-- Policy (advisory):
-  - Newly-seen `enabled:true` model_type → log + surface in `/health`
-    (`discovered_models`), do NOT auto-expose until an operator maps it
-    (prevents surprise alias routing).
-  - Currently-exposed alias whose type flips to `enabled:false` → log a
-    **warning** + `/health` flag (`model_disabled_upstream`), keep serving
-    (our live evidence beats their README; demotion is a human decision).
-  - Cache last-good snapshot in memory; restart re-polls.
-- No new knobs except `DEEPSEEK_MODEL_DISCOVERY=1|0` (default 1) and
-  `DEEPSEEK_MODEL_DISCOVERY_MS` (default 3600000, min 300000). Off = today's
-  hardcoded table, zero behavior change.
+- Poller: on startup + hourly (`setInterval` unref'd; both call sites
+  `.catch(()=>{})` so a throw can never become an unhandled rejection).
+  Account choice reuses the shared `isAccountReady` predicate (preferred first,
+  else first ready) — no healthy account means skip tick, keep last-good.
+  Timeout 15s, all failures swallowed to debug log: discovery can never break
+  serving, by construction (single `try`, guarded call sites).
+- Parser path (tree truth): `data.biz_data.settings.model_configs` =
+  `{id, value: [{model_type, name, enabled, switchable}]}`. `enabled`/
+  `switchable` use strict `=== true` (truthy-non-true reads as off).
+- Policy (advisory — implemented as log + surface ONLY): the discovered table
+  lands in `/health` `discovered_models` (visibility-gated like accounts).
+  There are deliberately NO `model_disabled_upstream` flags, flip warnings, or
+  warn-once paths in the tree — surfacing without alerting, until an operator
+  asks for more.
+- Knobs: `DEEPSEEK_MODEL_DISCOVERY` (`!== '0'` = on, default on) and
+  `DEEPSEEK_MODEL_DISCOVERY_MS` (default 3600000, min 300000). Off = no poller,
+  zero behavior change.
 
 ## 3. Explicit non-goals
 Auto-adding/removing aliases; trusting `switchable:false` as failure (their
 expert conclusion is disputed by our live test); blocking startup on discovery.
 
 ## 4. Tests & verification
-- Unit: parser fixtures (their shape, our observed shape, garbage, null
-  `biz_data`) → table/flags; advisory-only assertion (exposed set unchanged).
-- Live: run with discovery on, confirm `/health` shows `discovered_models`
-  matching the live `default` (+`expert` while it answers), then force-check by
-  comparing against a manual capture.
+- Unit (`tests`: model discovery block): verified shape parses to typed table;
+  null/`{}`/wrong-level/bare-list/missing-`value` → null; error envelopes with
+  tables at either level (`code`/`biz_code` nonzero) → null; codes accept
+  numeric `0` and string `'0'`; truthy-non-true `enabled`/`switchable` read as
+  off; no test asserts flags/warnings because the tree deliberately has none.
+- Live: startup poll logged 3 types; `/health` shows the table.
 
 ## 5. Rollback
 `DEEPSEEK_MODEL_DISCOVERY=0` + restart. No schema change.

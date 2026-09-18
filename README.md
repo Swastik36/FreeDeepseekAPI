@@ -449,6 +449,13 @@ Burst cap (anti-velocity — most turns per sliding 60s window; rejects fast
 DEEPSEEK_BURST_PER_MINUTE=0 npm start  # 0 disables; candidate 10 post-measurement
 ```
 
+Model discovery (advisory — hourly poll of upstream model flags into `/health`;
+never adds/removes aliases):
+
+```bash
+DEEPSEEK_MODEL_DISCOVERY=1 npm start   # 0 disables
+```
+
 ---
 
 ## 🔑 Ideas for console auth

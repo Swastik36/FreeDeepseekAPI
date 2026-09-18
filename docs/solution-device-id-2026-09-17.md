@@ -84,4 +84,4 @@ turns with the header. Incidents during verification: a wedged remote chat
 returning empties (fixed by session reset, unrelated to the header) and a
 unit-file-vs-manager-env lesson — `systemctl set-environment` NEVER overrides
 the unit's own `Environment=` lines; preferred-account switches must edit
-`~/.config/systemd/user/freedeepseek.service`. `npm test` 243 green.
+`~/.config/systemd/user/freedeepseek.service`. Suite green (count lives in CI output).

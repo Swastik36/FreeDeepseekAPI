@@ -474,9 +474,20 @@ function retryWaitMs(retryAfterSec, remainingMs) {
     if (!(remainingMs > 0)) return 0;
     return Math.min(rateLimitRetryDelayMs(retryAfterSec), remainingMs);
 }
+// Latency EWMA step (display-only): alpha 0.3 reacts within ~3 turns while
+// staying readable. Pure for tests; first sample seeds directly.
+function nextEwmaLatency(prevMs, sampleMs) {
+    const prev = Number(prevMs) || 0;
+    const sample = Math.max(0, Number(sampleMs) || 0);
+    if (!(prev > 0)) return Math.round(sample);
+    return Math.round(0.7 * prev + 0.3 * sample);
+}
 // Single readiness predicate for all four admission sites (select-fresh,
-// migration peers, /readyz, retry gate). One spelling — previously cooldown
-// checks drifted between raw and ||0 forms. Exported for tests.
+// migration peers, /readyz, retry gate). The (x || 0) cooldown form admits
+// missing-field accounts as ready where the old raw form excluded them —
+// deliberate: the constructor always sets a numeric cooldownUntil, so only
+// hand-built objects differ, and fail-open beats TypeError-crash there.
+// Exported for tests.
 function isAccountReady(a, nowMs = Date.now()) {
     return !!(a && a.config && a.config.token && a.config.cookie
         && (a.cooldownUntil || 0) <= nowMs && withinQuota(a, nowMs) && withinBurst(a, nowMs));
@@ -640,7 +651,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
                 // solve throws and the account 500s every request (F16).
                 console.error(`[DS-API] ${id} (${file}) has no wasmUrl; PoW solves will fail until it is imported.`);
             }
-            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [], lastUpstreamAt: 0 });
+            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [], lastUpstreamAt: 0, ewmaLatencyMs: 0 });
         } catch (e) {
             console.error(`[DS-API] Could not load auth config ${file}: ${e.message}`);
         }
@@ -674,9 +685,79 @@ function accountStatus(account) {
         quota_exhausted: HOURLY_QUOTA > 0 && !withinQuota(account),
         burst_used_1m: burstUsedThisMinute(account),
         has_device_id: Boolean(account.config.device_id),
+        ewma_latency_ms: Math.round(Number(account.ewmaLatencyMs) || 0),
         inflight: Number(account.inflight) || 0,
         last_used_at: account.lastUsedAt || null,
     };
+}
+// Dynamic model discovery (round-3 G3): hourly advisory poll of
+// client/settings?scope=model. Advisory ONLY — never adds/removes aliases;
+// surfaces upstream flag flips in /health for operators. Verified 2026-09-17:
+// the did value is irrelevant (random UUID works); the x-client-* header group
+// is the actual gate (minimal headers -> perpetual SETTINGS_NOT_FOUND).
+const MODEL_DISCOVERY_ON = process.env.DEEPSEEK_MODEL_DISCOVERY !== '0';
+const MODEL_DISCOVERY_MS = numEnv('DEEPSEEK_MODEL_DISCOVERY_MS', 3600000, 300000);
+let discoveredModels = { types: [], fetchedAt: 0 };
+function parseModelDiscovery(body) {
+    try {
+        // Envelope gate (H-1): a table-shaped biz_data inside an error
+        // envelope (e.g. stale cache on biz_code != 0) must not parse as live.
+        if (!body || typeof body !== 'object') return null;
+        if (body.code !== undefined && body.code !== 0 && body.code !== '0') return null;
+        const data = body.data;
+        if (!data || typeof data !== 'object') return null;
+        if (data.biz_code !== undefined && data.biz_code !== 0 && data.biz_code !== '0') return null;
+        const mc = data.biz_data && data.biz_data.settings
+            && data.biz_data.settings.model_configs;
+        const vals = mc && Array.isArray(mc.value) ? mc.value : null;
+        if (!vals) return null;
+        return {
+            types: vals.map(m => ({
+                model_type: String((m && m.model_type) || ''),
+                name: String((m && m.name) || ''),
+                enabled: (m && m.enabled) === true,
+                switchable: (m && m.switchable) === true,
+            })),
+            fetchedAt: Date.now(),
+        };
+    } catch {
+        return null;
+    }
+}
+async function refreshDiscoveredModels() {
+    if (!MODEL_DISCOVERY_ON) return;
+    try {
+        const now = Date.now();
+        const preferred = (process.env.DEEPSEEK_PREFERRED_ACCOUNT || '').trim();
+        // Shared readiness predicate (M8-R1): same admission as every other
+        // gate, and any throw here must stay inside the try — an unhandled
+        // rejection would take the whole process down hourly.
+        const ready = accounts.filter(a => isAccountReady(a, now));
+        const account = (preferred && ready.find(a => a.id === preferred)) || ready[0];
+        if (!account) return;
+        const res = await dsFetch(
+            `https://chat.deepseek.com/api/v0/client/settings?did=${crypto.randomUUID()}&scope=model`,
+            { headers: account.headers },
+            15000
+        );
+        const parsed = parseModelDiscovery(await res.json().catch(() => null));
+        // Empty table keeps last-good too (H-2): assigning it would wipe the
+        // display to indistinguishable-from-never-fetched. HTTP status logged
+        // (never the body) so auth failures surface instead of vanishing (M-5).
+        if (!parsed || parsed.types.length === 0) {
+            logDebug(`[DS-API] model discovery: HTTP ${res.status}, empty/unparseable response, keeping last-good table`);
+            return;
+        }
+        discoveredModels = parsed;
+        logDebug(`[DS-API] model discovery: ${parsed.types.length} types (${parsed.types.map(t => `${t.model_type}:${t.enabled ? 'on' : 'off'}`).join(', ')})`);
+    } catch (e) {
+        logDebug(`[DS-API] model discovery failed (${String((e && e.message) || e).slice(0, 100)}); keeping last-good table`);
+    }
+}
+function startModelDiscovery() {
+    if (!MODEL_DISCOVERY_ON) return;
+    refreshDiscoveredModels().catch(() => {});
+    setInterval(() => { refreshDiscoveredModels().catch(() => {}); }, MODEL_DISCOVERY_MS).unref();
 }
 function selectAccountForSession(session, sessionKey = '') {
     const now = Date.now();
@@ -1624,6 +1705,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     const account = selectAccountForSession(session, agentId);
     const dsHeaders = account.headers;
     account.lastUsedAt = Date.now();
+    const askTurnStartedAt = Date.now();
     // Per-account load signal (brief §2): incremented when an upstream call
     // starts for this account, decremented in `finally` when it settles.
     // A leaked counter permanently blackholes the account under scoring, so
@@ -1753,6 +1835,10 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     account.consecutiveFailures = 0;
     account.consecutiveTimeouts = 0;
     account.lastSuccessAt = Date.now();
+    // Latency EWMA (display-only, never scored): alpha 0.3 reacts within ~3
+    // turns while staying readable. Failures never touch it.
+    const turnMs = Date.now() - askTurnStartedAt;
+    account.ewmaLatencyMs = nextEwmaLatency(account.ewmaLatencyMs, turnMs);
     return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: recoveredFreshSession };
     } catch (e) {
         if (isTimeoutError(e) || e.name === 'AbortError' || /timeout|abort/i.test(e.message || '')) {
@@ -4122,6 +4208,7 @@ function buildHealthPayload(authorization, key) {
         in_flight: inFlight,
         accounts: accounts.map(accountStatus),
         config_ready: hasAuthConfig(),
+        discovered_models: discoveredModels.types.length > 0 ? discoveredModels : undefined,
         session_reuse: { strategy: 'sticky per x-agent-session/user', ttl_minutes: Math.round(SESSION_TTL_MS / 60000), max_messages: MAX_MESSAGE_DEPTH, reset_all: 'POST /reset-session?agent=all' },
     });
     return health;
@@ -5298,6 +5385,8 @@ async function main() {
     restoreSessions();
     // Periodically evict idle sessions (unref'd so it never keeps the process alive).
     setInterval(sweepIdleSessions, 10 * 60 * 1000).unref();
+    // Hourly advisory model discovery (unref'd; never breaks serving).
+    startModelDiscovery();
     server.listen(PORT, HOST, () => {
         console.log(`[DS-API] Server on http://${HOST}:${PORT} (multi-agent sessions enabled)`);
         console.log(`[DS-API] ${formatWatermark()}`);
@@ -5456,6 +5545,8 @@ module.exports = {
         effectiveFailures,
         scoreBreakdown,
         isAccountReady,
+        nextEwmaLatency,
+        parseModelDiscovery,
         logToken,
         countActiveHosted,
         accountStatus,
