@@ -651,7 +651,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
                 // solve throws and the account 500s every request (F16).
                 console.error(`[DS-API] ${id} (${file}) has no wasmUrl; PoW solves will fail until it is imported.`);
             }
-            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [], lastUpstreamAt: 0, ewmaLatencyMs: 0 });
+            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [], lastUpstreamAt: 0, ewmaLatencyMs: 0, multiToolBatchCount: 0, batchSizeCounts: {} });
         } catch (e) {
             console.error(`[DS-API] Could not load auth config ${file}: ${e.message}`);
         }
@@ -688,6 +688,8 @@ function accountStatus(account) {
         ewma_latency_ms: Math.round(Number(account.ewmaLatencyMs) || 0),
         inflight: Number(account.inflight) || 0,
         last_used_at: account.lastUsedAt || null,
+        multi_tool_batches: account.multiToolBatchCount || 0,
+        batch_size_distribution: account.batchSizeCounts || {},
     };
 }
 // Dynamic model discovery (round-3 G3): hourly advisory poll of
@@ -2005,7 +2007,7 @@ function formatToolDefinitions(tools) {
     text += 'FORBIDDEN: fences, <tool_call> XML, DSML, TOOL_CALL:, bare shell, fake [Tool Result]. Old formats parse for compat \u2014 do NOT generate them.\n';
     text += 'Gateway runs the tool, returns [Tool Result] next message. Tools run on the proxy host \u2014 NOT on DeepSeek. args MUST be a JSON object, compact, max 8 tools/turn (independent/parallel-safe only; do NOT batch mutations touching the same target), name must exist below.\n';
     text += 'PREF: read/edit/grep > bash/cat/grep/find; MCP-FS only for batch (multi-read/write, ls, info, move).\n';
-    text += 'BATCH DISCIPLINE: at most 6 tool batches per task; 1 batch = one turn with max 8 tool calls. Plan multi-step work to fit: batch independent calls together, then answer from results. Do not re-batch the same calls and do not split one batch across turns.\n';
+    text += 'BATCH DISCIPLINE: at most 6 tool batches per task; 1 batch = one turn with max 8 tool calls. When inspecting code (read/grep/find), emit all independent calls in the SAME turn (up to 8 calls); single-call turns are reserved for when a subsequent argument strictly depends on prior tool output. Do not batch mutations on the same target. Plan multi-step work to fit: batch independent calls together, then answer from results.\n';
     const localShell = localShellName();
     if (localShell) text += `SHELL: operator console shell is ${localShell} (Linux). Any command sent via a shell tool MUST be ${localShell}-compatible — no bash-isms ([[ ]], <(), export FOO=bar, source x.sh, function f()); use ${localShell} equivalents. When in doubt prefer read/edit/grep tools over shell.\n`;
     text += 'Ex: {"tool_call":{"name":"bash","arguments":{"command":"ls -la"}}}\n';
@@ -5059,6 +5061,12 @@ const server = http.createServer(async (req, res) => {
                 if (multiCalls && multiCalls.length > 0 && multiCalls.every(tc => allowedToolNames.has(tc.name))) {
                     console.log(`${agentTag} Model emitted ${multiCalls.length} valid tool call(s) in turn: ${multiCalls.map(tc => tc.name).join(', ')}`);
                     toolCall = multiCalls.length === 1 ? multiCalls[0] : multiCalls;
+                    if (multiCalls.length > 1 && initialCall?.account) {
+                        initialCall.account.multiToolBatchCount = (initialCall.account.multiToolBatchCount || 0) + 1;
+                        if (!initialCall.account.batchSizeCounts) initialCall.account.batchSizeCounts = {};
+                        const szKey = String(multiCalls.length);
+                        initialCall.account.batchSizeCounts[szKey] = (initialCall.account.batchSizeCounts[szKey] || 0) + 1;
+                    }
                 } else {
                     if (hasLeftoverToolEnvelopes(fullContent)) {
                         console.log(`${agentTag} Model emitted multiple tool envelopes but some are disallowed or malformed; attempting format repair instead of silently narrowing.`);

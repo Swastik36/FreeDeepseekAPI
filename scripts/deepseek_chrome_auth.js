@@ -377,12 +377,18 @@ async function readPageAuth(cdp) {
     // userToken has proven dead (40003). Prefer the sniffed header token.
     const token = headerToken || storeToken;
 
+    const rawDeviceId = pageState.localStorage ? pageState.localStorage['deepseek-device-id:chat'] : null;
+    const device_id = (typeof rawDeviceId === 'string' && /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(rawDeviceId))
+        ? rawDeviceId
+        : null;
+
     const wasmUrl =
         (pageState.resources || []).find((u) => /sha3.*\.wasm/.test(u)) ||
         'https://fe-static.deepseek.com/chat/static/sha3_wasm_bg.7b9ca65ddd.wasm';
     return {
         token,
         cookie,
+        device_id,
         hif_dliq,
         hif_leim,
         wasmUrl,
