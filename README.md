@@ -449,6 +449,27 @@ Burst cap (anti-velocity — most turns per sliding 60s window; rejects fast
 DEEPSEEK_BURST_PER_MINUTE=0 npm start  # 0 disables; candidate 10 post-measurement
 ```
 
+Turn-aware pacing (anti-velocity — enforces a minimum gap between consecutive
+agent-loop turns on one account; human turns are never delayed). The pacer
+sleeps only while enough request-deadline budget remains; otherwise it answers
+429 with `Retry-After` and preserves the chat. Defaults are ON — set the gap to
+`0` to disable:
+
+```bash
+DEEPSEEK_AGENT_TURN_GAP_MS=6000 npm start       # target minimum gap between agent turns (0 disables)
+DEEPSEEK_TURN_JITTER_MS=2000 npm start          # uniform random jitter added to the gap
+DEEPSEEK_MIN_USABLE_UPSTREAM_MS=10000 npm start # min deadline budget required to sleep instead of reject
+```
+
+Ambient telemetry (advisory — periodic `GET /api/v0/users/current` per account
+so the login shows normal browser route presence; off by default, fire-and-forget,
+401 is logged but never cools the account):
+
+```bash
+DEEPSEEK_AMBIENT_TELEMETRY=1 npm start          # 0 disables
+DEEPSEEK_TELEMETRY_INTERVAL_MS=900000 npm start # minimum interval between pings (default 15m)
+```
+
 Model discovery (advisory — hourly poll of upstream model flags into `/health`;
 never adds/removes aliases):
 
