@@ -651,7 +651,7 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
                 // solve throws and the account 500s every request (F16).
                 console.error(`[DS-API] ${id} (${file}) has no wasmUrl; PoW solves will fail until it is imported.`);
             }
-            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [], lastUpstreamAt: 0, ewmaLatencyMs: 0, multiToolBatchCount: 0, batchSizeCounts: {} });
+            accounts.push({ id, file, config, headers: buildBaseHeaders(config), cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, consecutiveFailures: 0, lastFailureAt: 0, lastSuccessAt: 0, lastUsedAt: 0, inflight: 0, requestTimes: [], lastUpstreamAt: 0, ewmaLatencyMs: 0, lastTelemetryAt: 0, lastTelemetryStatus: null, lastDispatchedAt: 0, multiToolBatchCount: 0, batchSizeCounts: {} });
         } catch (e) {
             console.error(`[DS-API] Could not load auth config ${file}: ${e.message}`);
         }
@@ -688,6 +688,9 @@ function accountStatus(account) {
         ewma_latency_ms: Math.round(Number(account.ewmaLatencyMs) || 0),
         inflight: Number(account.inflight) || 0,
         last_used_at: account.lastUsedAt || null,
+        last_telemetry_at: account.lastTelemetryAt || null,
+        last_telemetry_status: account.lastTelemetryStatus || null,
+        last_dispatched_at: account.lastDispatchedAt || null,
         multi_tool_batches: account.multiToolBatchCount || 0,
         batch_size_distribution: account.batchSizeCounts || {},
     };
@@ -1005,6 +1008,130 @@ function selectFreshAccountDetail(ready, sessionKey = '') {
 function selectFreshAccount(ready) {
     return selectFreshAccountDetail(ready).account;
 }
+// Compaction-triggered rotation (Pillar 3)
+function selectCompactionTargetAccount(session, now = Date.now()) {
+    let candidates = accounts.filter(a => a && a.id !== session.accountId && isAccountReady(a, now));
+    if (candidates.length === 0) return session.accountId;
+
+    // Prefer healthy peers (consecutiveFailures === 0) if available to avoid rotating to a stricken peer
+    const healthy = candidates.filter(a => (a.consecutiveFailures || 0) === 0);
+    if (healthy.length > 0) candidates = healthy;
+
+    // Least-used in the past hour wins; tie-break on oldest lastUsedAt
+    candidates.sort((a, b) => {
+        const usedA = usedSince(a, QUOTA_WINDOW_MS, now);
+        const usedB = usedSince(b, QUOTA_WINDOW_MS, now);
+        if (usedA !== usedB) return usedA - usedB;
+        return (a.lastUsedAt || 0) - (b.lastUsedAt || 0);
+    });
+    return candidates[0].id;
+}
+function performCompactionRotation(session, targetAccountId) {
+    const oldAccountId = session.accountId;
+    const failure = resetRemoteSession(session, false); // Clears session.id, parentMessageId, delta continuity (defer persist to end)
+    delete failure.accountId;
+    session.accountId = targetAccountId;
+    // Fresh chat on fresh account gets a clean repair budget
+    session.repairHash = null;
+    session.repairAt = 0;
+    session.repairCount = 0;
+    persistSessions();
+    return {
+        ...failure,
+        oldAccountId,
+        newAccountId: targetAccountId,
+    };
+}
+// Lazy Piggybacked Ambient Telemetry (Pillar 4)
+const TELEMETRY_INTERVAL_MS = numEnv('DEEPSEEK_TELEMETRY_INTERVAL_MS', 900000, 60000); // 15m default, 1m min
+const DEFAULT_BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
+
+function buildTelemetryHeaders(account) {
+    const headers = {
+        'Authorization': `Bearer ${account.config.token}`,
+        'Cookie': account.config.cookie,
+        'User-Agent': account.headers?.['User-Agent'] || DEFAULT_BROWSER_UA,
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://chat.deepseek.com/',
+    };
+    if (account.config.device_id) {
+        headers['x-device-id'] = account.config.device_id;
+    }
+    return headers;
+}
+
+function maybeTriggerAmbientTelemetry(account, now = Date.now(), fetchImpl = fetch) {
+    if (!account?.config?.token) return;
+    const isTelemetryOn = String(process.env.DEEPSEEK_AMBIENT_TELEMETRY || '0').trim() === '1';
+    if (!isTelemetryOn && fetchImpl === fetch) return;
+    if ((now - (account.lastTelemetryAt || 0)) < TELEMETRY_INTERVAL_MS) return;
+
+    account.lastTelemetryAt = now;
+    fetchImpl('https://chat.deepseek.com/api/v0/users/current', {
+        method: 'GET',
+        headers: buildTelemetryHeaders(account),
+        signal: AbortSignal.timeout(15000),
+    }).then(res => {
+        account.lastTelemetryStatus = res.status;
+        if (res.status === 401) {
+            logDebug(`[telemetry:${account.id}] upstream returned 401 on /users/current`);
+        }
+    }).catch(err => {
+        logDebug(`[telemetry:${account.id}] ping failed: ${err.message}`);
+    });
+}
+// Turn-Aware Delta Pacing (Pillar 5)
+const AGENT_TURN_GAP_MS = numEnv('DEEPSEEK_AGENT_TURN_GAP_MS', 0, 0);
+const TURN_JITTER_MS = numEnv('DEEPSEEK_TURN_JITTER_MS', 0, 0);
+const MIN_USABLE_UPSTREAM_MS = numEnv('DEEPSEEK_MIN_USABLE_UPSTREAM_MS', 10000, 1000);
+
+function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {
+    if (isSharedTitleBucket(agentId) || isTitleGenerationRequest(messages)) {
+        return true;
+    }
+    if (compactionReset !== null) return true;
+
+    if (!Array.isArray(messages) || messages.length === 0) return true; // Fail closed
+    const lastMsg = messages[messages.length - 1];
+    if (!lastMsg) return true;
+    if (lastMsg.role === 'tool') return true;
+    if (typeof lastMsg.content === 'string' && lastMsg.content.includes('[Tool Result]')) return true;
+
+    if (lastMsg.role === 'user') return false; // Genuine human turn
+    return true; // Fail closed for unknown shapes
+}
+
+function calculateRequiredDelay(elapsedMs, targetGapMs, jitterMs, rand = Math.random) {
+    if (targetGapMs <= 0) return 0;
+    const jitter = jitterMs > 0 ? Math.floor(rand() * (jitterMs + 1)) : 0;
+    const target = targetGapMs + jitter;
+    return Math.max(0, target - elapsedMs);
+}
+
+function resolvePacingAction({
+    elapsedMs,
+    targetGapMs = AGENT_TURN_GAP_MS,
+    jitterMs = TURN_JITTER_MS,
+    remainingMs,
+    minUsableMs = MIN_USABLE_UPSTREAM_MS,
+    rand = Math.random,
+}) {
+    if (targetGapMs <= 0) return { action: 'proceed', delayMs: 0 };
+    const delayMs = calculateRequiredDelay(elapsedMs, targetGapMs, jitterMs, rand);
+    if (delayMs <= 0) return { action: 'proceed', delayMs: 0 };
+
+    if (remainingMs - delayMs < minUsableMs) {
+        const waitSec = Math.max(1, Math.ceil(delayMs / 1000));
+        const err = new Error(`Turn turnaround pacing delay (${delayMs}ms) exceeds usable upstream deadline (~${Math.floor(remainingMs)}ms remaining, ${minUsableMs}ms needed). Retry in ~${waitSec}s; chat preserved.`);
+        err.status = 429;
+        err.retryAfter = waitSec;
+        err.type = 'rate_limit';
+        err.isPacingReject = true;
+        return { action: 'reject', delayMs, waitSec, error: err };
+    }
+
+    return { action: 'wait', delayMs };
+}
 // Parse a Retry-After header value into a cooldown duration in ms, or null if
 // absent/unparseable. Supports both forms: delta-seconds (e.g. "120") and an
 // HTTP-date (e.g. "Wed, 21 Oct 2025 07:28:00 GMT"). Clamped to >= 1s.
@@ -1112,7 +1239,7 @@ function createSession() {
     };
 }
 
-function resetRemoteSession(session) {
+function resetRemoteSession(session, persist = true) {
     const failed = {
         failedSessionId: session.id,
         failedMessageCount: session.messageCount,
@@ -1136,7 +1263,7 @@ function resetRemoteSession(session) {
     // restarts via serializeSession — staleness is enforced by
     // classifyRepairAttempt's window on use, so a stale restored guard simply
     // reads as a fresh turn.
-    persistSessions();
+    if (persist) persistSessions();
     return failed;
 }
 
@@ -1700,7 +1827,13 @@ function resolveModelConfig(model) {
 function isKnownModel(model) { return Object.prototype.hasOwnProperty.call(MODEL_CONFIGS, String(model || '').toLowerCase()); }
 function isSupportedModel(model) { return resolveModelConfig(model).supported === true; }
 
-async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', freshSessionPrompt = prompt) {
+async function askDeepSeekStream(
+    prompt,
+    agentId,
+    model = 'deepseek-default',
+    freshSessionPrompt = prompt,
+    { isClientGone = () => false, requestStartedAt = Date.now(), isAgentLoop = false } = {}
+) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
     const hadRemoteSession = Boolean(session.id);
@@ -1708,6 +1841,35 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     const dsHeaders = account.headers;
     account.lastUsedAt = Date.now();
     const askTurnStartedAt = Date.now();
+
+    // Ambient telemetry check (fire-and-forget, non-blocking)
+    maybeTriggerAmbientTelemetry(account, askTurnStartedAt);
+
+    // Turn-aware delta pacing gate (Pillar 5)
+    if (AGENT_TURN_GAP_MS > 0 && isAgentLoop) {
+        const now = Date.now();
+        const elapsedMs = account.lastDispatchedAt ? (now - account.lastDispatchedAt) : Infinity;
+        const remainingMs = REQUEST_DEADLINE_MS - (now - requestStartedAt);
+        const pacing = resolvePacingAction({ elapsedMs, remainingMs });
+        if (pacing.action === 'reject') {
+            throw pacing.error;
+        }
+        if (pacing.action === 'wait' && pacing.delayMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, pacing.delayMs));
+            if (isClientGone()) {
+                throw new Error('Client disconnected during pacing interval');
+            }
+            if ((Date.now() - requestStartedAt) > REQUEST_DEADLINE_MS) {
+                const err = new Error('Request deadline expired during pacing interval. Retry in ~1s; chat preserved.');
+                err.status = 429;
+                err.retryAfter = 1;
+                err.type = 'rate_limit';
+                err.isPacingReject = true;
+                throw err;
+            }
+        }
+    }
+
     // Per-account load signal (brief §2): incremented when an upstream call
     // starts for this account, decremented in `finally` when it settles.
     // A leaked counter permanently blackholes the account under scoring, so
@@ -1752,6 +1914,7 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default', fr
     // burst needs the ring even when quota is off (C1 — the gated wrapper
     // here would silently disable burst under DEEPSEEK_HOURLY_QUOTA=0).
     recordUpstreamTurn(account);
+    account.lastDispatchedAt = Date.now();
     const powT0 = Date.now();
     // A PoW failure is an account-level upstream fault, not a chat fault — but
     // it must not cool the account: a stalled WASM CDN is not a rate limit,
@@ -4617,8 +4780,13 @@ const server = http.createServer(async (req, res) => {
             // tools block plus the compaction summary instead.
             let compactionReset = null;
             if (deltaMode && detectClientCompaction(messages, session)) {
-                compactionReset = resetRemoteSession(session);
-                console.log(`${agentTag} Client compaction detected (old chat ${compactionReset.failedSessionId} had ${compactionReset.failedMessageCount} msgs); starting fresh chat with tools + summary.`);
+                const compactionNow = Date.now();
+                const targetAccountId = selectCompactionTargetAccount(session, compactionNow);
+                compactionReset = performCompactionRotation(session, targetAccountId);
+                const targetAccount = accounts.find(a => a && a.id === targetAccountId);
+                const targetUsed = targetAccount ? usedSince(targetAccount, QUOTA_WINDOW_MS, compactionNow) : 0;
+                const quotaDisplay = HOURLY_QUOTA > 0 ? `target used: ${targetUsed}/${HOURLY_QUOTA}/h` : `target used: ${targetUsed}/h (unmetered)`;
+                console.log(`${agentTag} Client compaction detected (old chat ${compactionReset.failedSessionId} had ${compactionReset.failedMessageCount} msgs); rotated account ${compactionReset.oldAccountId} -> ${compactionReset.newAccountId} (${quotaDisplay}); seeding fresh chat.`);
             }
 
             // Delta mode: an established remote chat already holds the system
@@ -4715,8 +4883,13 @@ const server = http.createServer(async (req, res) => {
             // SAME account+chat. Returns true with initialCall set on recovery;
             // false leaves everything for the fail-fast/migration path below.
             let recoveredInPlace = false;
+            const isAgent = isAgentLoopTurn({ messages, agentId, compactionReset });
             try {
-                initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt);
+                initialCall = await askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt, {
+                    isClientGone: () => clientGone,
+                    requestStartedAt,
+                    isAgentLoop: isAgent,
+                });
             } catch (e) {
                 // askDeepSeekStream already cooled the throttled account.
                 // Order: optional in-place retry first (same account+chat),
@@ -4729,7 +4902,7 @@ const server = http.createServer(async (req, res) => {
                 const anyReadyNow = anyAccountReady(accounts);
                 const remainingMs = Math.max(0, REQUEST_DEADLINE_MS - (Date.now() - requestStartedAt));
                 const waitMs = retryWaitMs(e.retryAfter, remainingMs);
-                if (shouldRetryInPlace({ flagOn: RETRY_RATELIMIT, rateLimit: isRateLimitError(e), migrated: rateLimitMigrated, gone: clientGone, deadline: deadlineHit(), retryAfterSec: e.retryAfter, anyReady: anyReadyNow })
+                if (shouldRetryInPlace({ flagOn: RETRY_RATELIMIT, rateLimit: isRateLimitError(e) && !e?.isPacingReject, migrated: rateLimitMigrated, gone: clientGone, deadline: deadlineHit(), retryAfterSec: e.retryAfter, anyReady: anyReadyNow })
                     && waitMs > 0) {
                     const retryAccount = accounts.find(a => a.id === session.accountId);
                     if (retryAccount) {
@@ -4738,7 +4911,11 @@ const server = http.createServer(async (req, res) => {
                     }
                     if (retryAccount && !clientGone && !deadlineHit()) {
                         const attempt = await inPlaceRateLimitRetry(retryAccount, () =>
-                            askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt));
+                            askDeepSeekStream(fullPrompt, agentId, requestedModel, freshPromptBuild.prompt, {
+                                isClientGone: () => clientGone,
+                                requestStartedAt,
+                                isAgentLoop: true,
+                            }));
                         if (attempt.recovered) {
                             initialCall = attempt.result;
                             recoveredInPlace = true;
@@ -4752,7 +4929,7 @@ const server = http.createServer(async (req, res) => {
                 }
                 // Recovered turns skip everything below (initialCall is set).
                 if (!recoveredInPlace) {
-                    if (!isRateLimitError(e) || rateLimitMigrated || clientGone || deadlineHit()) throw e;
+                    if (!isRateLimitError(e) || e?.isPacingReject || rateLimitMigrated || clientGone || deadlineHit()) throw e;
                     const decision = resolveRateLimitMigration(session, accounts, rateLimitMigrated);
                     if (!decision.migrateTo) throw e;
                     const move = performRateLimitMigration(session, decision.migrateTo);
@@ -4762,7 +4939,11 @@ const server = http.createServer(async (req, res) => {
                         promptCompacted = true;
                         markContextCompacted(res);
                     }
-                    initialCall = await askDeepSeekStream(migrationBuild.prompt, agentId, requestedModel, migrationBuild.prompt);
+                    initialCall = await askDeepSeekStream(migrationBuild.prompt, agentId, requestedModel, migrationBuild.prompt, {
+                        isClientGone: () => clientGone,
+                        requestStartedAt,
+                        isAgentLoop: true,
+                    });
                     console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): rate-limit`);
                 }
             }
@@ -4916,7 +5097,11 @@ const server = http.createServer(async (req, res) => {
                     markContextCompacted(res);
                 }
                 fullPrompt = migrationBuild.prompt;
-                initialCall = await askDeepSeekStream(migrationBuild.prompt, agentId, requestedModel, migrationBuild.prompt);
+                initialCall = await askDeepSeekStream(migrationBuild.prompt, agentId, requestedModel, migrationBuild.prompt, {
+                    isClientGone: () => clientGone,
+                    requestStartedAt,
+                    isAgentLoop: true,
+                });
                 console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): rate-limit`);
                 dsResp = initialCall.resp;
                 thinkPump.reset(); // BEFORE the read: new remote chat; the dead attempt's prefix must not suppress the fresh attempt
@@ -4959,7 +5144,11 @@ const server = http.createServer(async (req, res) => {
                 console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Retrying in-place in same chat...`);
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
-                const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel);
+                const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel, retryPrompt, {
+                    isClientGone: () => clientGone,
+                    requestStartedAt,
+                    isAgentLoop: true,
+                });
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryState = normalizeRetryResponse(retryResult);
                 fullPrompt = retryPrompt;
@@ -5028,7 +5217,12 @@ const server = http.createServer(async (req, res) => {
                     'continue',
                     agentId,
                     requestedModel,
-                    continuationRecoveryPrompt
+                    continuationRecoveryPrompt,
+                    {
+                        isClientGone: () => clientGone,
+                        requestStartedAt,
+                        isAgentLoop: true,
+                    }
                 );
                 const { resp: contResp, account: contAccount } = continuationCall;
                 // A cross-account continuation is valid only when the call
@@ -5114,7 +5308,11 @@ const server = http.createServer(async (req, res) => {
                     // follows; the capped path logs and returns with no sleep.
                     await new Promise(r => setTimeout(r, 1000));
                     recordRepairAttempt(session, repairHash);
-                    const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt);
+                    const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt, {
+                        isClientGone: () => clientGone,
+                        requestStartedAt,
+                        isAgentLoop: true,
+                    });
                     if (session.id !== retryChatId) {
                         console.log(`${agentTag} Strict retry landed on a new chat ${session.id} (was ${retryChatId}); full tools+context were resent.`);
                     }
@@ -5136,7 +5334,11 @@ const server = http.createServer(async (req, res) => {
                     const retryUnparseable = Boolean(retryContent2 && retryContent2.trim() && retryIsBrokenMarkup);
                     if (retryUnparseable && !repair.repeat && session.id === retryChatId && !clientGone && !deadlineHit()) {
                         console.log(`${agentTag} Strict retry: attempt 1 still malformed; escalating to attempt 2 in same chat.`);
-                        const { resp: retryResp3 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt);
+                        const { resp: retryResp3 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt, {
+                            isClientGone: () => clientGone,
+                            requestStartedAt,
+                            isAgentLoop: true,
+                        });
                         if (session.id !== retryChatId) {
                             console.log(`${agentTag} Strict retry landed on a new chat ${session.id} (was ${retryChatId}); full tools+context were resent.`);
                         }
@@ -5299,7 +5501,7 @@ const server = http.createServer(async (req, res) => {
                     // in-turn fail-fast above): same enriched wording so every
                     // 429 carries backoff + /compact guidance. Other errors
                     // keep the sanitized passthrough.
-                    if (status !== 429) return toClientErrorMessage(e.message);
+                    if (status !== 429 || e?.isPacingReject) return toClientErrorMessage(e.message);
                     const ms = parseRetryAfterMs(e.retryAfter);
                     if (ms == null) return toClientErrorMessage(e.message);
                     return rateLimitExhaustedMessage(Math.max(1, Math.ceil(ms / 1000)));
@@ -5526,6 +5728,17 @@ module.exports = {
         detectClientCompaction,
         createSession,
         resetRemoteSession,
+        selectCompactionTargetAccount,
+        performCompactionRotation,
+        TELEMETRY_INTERVAL_MS,
+        buildTelemetryHeaders,
+        maybeTriggerAmbientTelemetry,
+        AGENT_TURN_GAP_MS,
+        TURN_JITTER_MS,
+        MIN_USABLE_UPSTREAM_MS,
+        isAgentLoopTurn,
+        calculateRequiredDelay,
+        resolvePacingAction,
         storeHistory,
         serializeSession,
         persistSessions,

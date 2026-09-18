@@ -170,21 +170,27 @@ if (deltaMode && detectClientCompaction(messages, session)) {
     const compactionNow = Date.now();
     const targetAccountId = selectCompactionTargetAccount(session, compactionNow);
     compactionReset = performCompactionRotation(session, targetAccountId);
-    const quotaDisplay = HOURLY_QUOTA > 0 ? `quota: ${HOURLY_QUOTA}/h` : 'quota: unmetered';
-    console.log(`${agentTag} Client compaction: rotated chat ${compactionReset.failedSessionId} (${compactionReset.oldAccountId} -> ${compactionReset.newAccountId}, ${quotaDisplay}); seeding fresh chat.`);
+    const targetAccount = accounts.find(a => a && a.id === targetAccountId);
+    const targetUsed = targetAccount ? usedSince(targetAccount, QUOTA_WINDOW_MS, compactionNow) : 0;
+    const quotaDisplay = HOURLY_QUOTA > 0 ? `target used: ${targetUsed}/${HOURLY_QUOTA}/h` : `target used: ${targetUsed}/h (unmetered)`;
+    console.log(`${agentTag} Client compaction detected (old chat ${compactionReset.failedSessionId} had ${compactionReset.failedMessageCount} msgs); rotated account ${compactionReset.oldAccountId} -> ${compactionReset.newAccountId} (${quotaDisplay}); seeding fresh chat.`);
 }
 ```
 
 #### Selection Algorithm & Fresh Budget Reset
-`selectCompactionTargetAccount` selects the candidate account among all ready peers with the lowest utilization in the past hour via `usedSince(a, QUOTA_WINDOW_MS, now)`, tie-breaking on the oldest `lastUsedAt`.
+`selectCompactionTargetAccount` selects the candidate account among all ready peers with the lowest utilization in the past hour via `usedSince(a, QUOTA_WINDOW_MS, now)`, tie-breaking on the oldest `lastUsedAt`. Healthy peers (`consecutiveFailures === 0`) are preferred when available to avoid rotating to a stricken peer.
 
 When rotating to a new account, the new chat is a fresh conversation context and must receive a **fresh repair budget** (clearing `repairCount` and `repairHash`) so it is not prematurely capped due to prior failures on the old account:
 
 ```javascript
-// Top-level, adjacent to routing helpers (immediately following selectFreshAccount at line 1005)
+// Top-level, following selectFreshAccount (lines 1009-1044)
 function selectCompactionTargetAccount(session, now = Date.now()) {
-    const candidates = accounts.filter(a => a && a.id !== session.accountId && isAccountReady(a, now));
+    let candidates = accounts.filter(a => a && a.id !== session.accountId && isAccountReady(a, now));
     if (candidates.length === 0) return session.accountId;
+
+    // Prefer healthy peers (consecutiveFailures === 0) if available to avoid rotating to a stricken peer
+    const healthy = candidates.filter(a => (a.consecutiveFailures || 0) === 0);
+    if (healthy.length > 0) candidates = healthy;
 
     // Least-used in the past hour wins; tie-break on oldest lastUsedAt
     candidates.sort((a, b) => {
@@ -198,9 +204,10 @@ function selectCompactionTargetAccount(session, now = Date.now()) {
 
 function performCompactionRotation(session, targetAccountId) {
     const oldAccountId = session.accountId;
-    const failure = resetRemoteSession(session); // Clears session.id, parentMessageId, delta continuity
+    const failure = resetRemoteSession(session, false); // Clears session.id, parentMessageId, delta continuity (defer persist to end)
+    delete failure.accountId;
     session.accountId = targetAccountId;
-    // Reset repair guard to provide fresh repair budget on new account
+    // Fresh chat on fresh account gets a clean repair budget
     session.repairHash = null;
     session.repairAt = 0;
     session.repairCount = 0;
@@ -220,11 +227,11 @@ function performCompactionRotation(session, targetAccountId) {
 #### Objective
 Ensure accounts exhibit regular browser route presence in DeepSeek internal logs via periodic reads of `/api/v0/users/current`, without adding request latency.
 
-#### Choke Point Placement & Execution Ordering (`server.js:1705`)
+#### Choke Point Placement & Execution Ordering (`server.js:1846`)
 Hooked at the single `askDeepSeekStream` choke point immediately after `selectAccountForSession(session, agentId)`. This covers 100% of upstream calls (fresh picks, sticky turns, and compaction rotations alike).
 
 **Execution Order at Choke Point**:
-1. `maybeTriggerAmbientTelemetry(account, Date.now());` (fire-and-forget, non-blocking promise).
+1. `maybeTriggerAmbientTelemetry(account, askTurnStartedAt);` (fire-and-forget, non-blocking promise).
 2. Delta pacing delay calculation and sleep gate (evaluated before incrementing `account.inflight`).
 
 #### Permitted Headers & Literal Fallback
@@ -277,15 +284,15 @@ async function askDeepSeekStream(
 ```
 
 At the HTTP handler call sites:
-- **Turn 1 Initial Call (`server.js:4717`)**:
+- **Turn 1 Initial Call (`server.js:4888`)**:
   `const isAgent = isAgentLoopTurn({ messages, agentId, compactionReset });`
   Passes `{ isClientGone: () => clientGone, requestStartedAt, isAgentLoop: isAgent }`.
-- **Retries, Migrations & Continuations (`server.js:4739, 4763, 4917, 4960, 5025, 5109, 5131`)**:
+- **Retries, Migrations & Continuations (`server.js:4910, 4933, 5097, 5144, 5218, 5303, 5325`)**:
   Passes `{ isClientGone: () => clientGone, requestStartedAt, isAgentLoop: true }`.
 
-#### Hardened Turn Classifier
+#### Hardened Turn Classifier & Decision Engine
 ```javascript
-// Top-level, adjacent to routing helpers (immediately following selectFreshAccount at line 1005)
+// Top-level, following telemetry helpers (lines 1083-1134)
 function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {
     // 1. Explicit title generation requests via shared title bucket helper
     if (isSharedTitleBucket(agentId) || isTitleGenerationRequest(messages)) {
@@ -310,7 +317,7 @@ function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {
 }
 ```
 
-#### Delay Calculation & Jitter Math
+#### Delay Calculation, Jitter Math & Decision Resolution
 - **Distribution**: Discrete uniform integer on $[0, \text{jitterMs}]$ inclusive: $\lfloor \text{rand}() \times (\text{jitterMs} + 1) \rfloor$.
 - **Random Source**: Defaults to `Math.random`, injectable `rand` parameter for deterministic testing.
 ```javascript
@@ -320,10 +327,35 @@ function calculateRequiredDelay(elapsedMs, targetGapMs, jitterMs, rand = Math.ra
     const target = targetGapMs + jitter;
     return Math.max(0, target - elapsedMs);
 }
+
+function resolvePacingAction({
+    elapsedMs,
+    targetGapMs = AGENT_TURN_GAP_MS,
+    jitterMs = TURN_JITTER_MS,
+    remainingMs,
+    minUsableMs = MIN_USABLE_UPSTREAM_MS,
+    rand = Math.random,
+}) {
+    if (targetGapMs <= 0) return { action: 'proceed', delayMs: 0 };
+    const delayMs = calculateRequiredDelay(elapsedMs, targetGapMs, jitterMs, rand);
+    if (delayMs <= 0) return { action: 'proceed', delayMs: 0 };
+
+    if (remainingMs - delayMs < minUsableMs) {
+        const waitSec = Math.max(1, Math.ceil(delayMs / 1000));
+        const err = new Error(`Turn turnaround pacing delay (${delayMs}ms) exceeds usable upstream deadline (~${Math.floor(remainingMs)}ms remaining, ${minUsableMs}ms needed). Retry in ~${waitSec}s; chat preserved.`);
+        err.status = 429;
+        err.retryAfter = waitSec;
+        err.type = 'rate_limit';
+        err.isPacingReject = true;
+        return { action: 'reject', delayMs, waitSec, error: err };
+    }
+
+    return { action: 'wait', delayMs };
+}
 ```
 
 #### Dispatch Stamping Semantics (`account.lastDispatchedAt`)
-- **Stamping Site**: Scoped strictly to the `recordUpstreamTurn(account)` callsite at [`server.js:1752`](file:///home/swastik/FreeDeepseekAPI/server.js#L1752):
+- **Stamping Site**: Scoped strictly to the `recordUpstreamTurn(account)` callsite at [`server.js:1917`](file:///home/swastik/FreeDeepseekAPI/server.js#L1916-L1918):
   ```javascript
   recordUpstreamTurn(account);
   account.lastDispatchedAt = Date.now();
@@ -335,7 +367,7 @@ function calculateRequiredDelay(elapsedMs, targetGapMs, jitterMs, rand = Math.ra
 #### Migration-Site Exemption (Zero Predicate Surgery)
 The shared security predicate `isRateLimitError` remains completely untouched. The exemption is scoped exclusively to the call sites:
 
-1. **In-place Retry Gate (`server.js:4730`)**:
+1. **In-place Retry Gate (`server.js:4905`)**:
    ```javascript
    shouldRetryInPlace({
        flagOn: RETRY_RATELIMIT,
@@ -343,25 +375,25 @@ The shared security predicate `isRateLimitError` remains completely untouched. T
        // ...
    })
    ```
-2. **Rate Limit Migration Gate (`server.js:4753`)**:
+2. **Rate Limit Migration Gate (`server.js:4932`)**:
    ```javascript
    if (!isRateLimitError(e) || e?.isPacingReject || rateLimitMigrated || clientGone || deadlineHit()) throw e;
    ```
 
-#### Outer Catch Message & Retry-After Consistency (`server.js:5281-5298`)
-When pacing delay exceeds the usable deadline, it throws:
+#### Outer Catch Message & Retry-After Consistency (`server.js:5504`)
+When pacing delay exceeds the usable deadline or expires during the pacing interval, it throws:
 ```javascript
-const waitSec = Math.max(1, Math.ceil(requiredDelay / 1000));
-const err = new Error(`Turn turnaround pacing delay (${requiredDelay}ms) exceeds usable upstream deadline (~${Math.floor(remainingMs)}ms remaining, ${MIN_USABLE_UPSTREAM_MS}ms needed). Retry in ~${waitSec}s; chat preserved.`);
+const waitSec = Math.max(1, Math.ceil(delayMs / 1000));
+const err = new Error(`Turn turnaround pacing delay (${delayMs}ms) exceeds usable upstream deadline (~${Math.floor(remainingMs)}ms remaining, ${MIN_USABLE_UPSTREAM_MS}ms needed). Retry in ~${waitSec}s; chat preserved.`);
 err.status = 429;
 err.retryAfter = waitSec;
 err.type = 'rate_limit';
 err.isPacingReject = true;
 throw err;
 ```
-In the outer HTTP error handler (`server.js:5281-5298`):
+In the outer HTTP error handler (`server.js:5504`):
 1. **Header**: `status === 429 && e.retryAfter` parses `waitSec` via `parseRetryAfterMs(e.retryAfter)` $\rightarrow$ sets `headers['Retry-After'] = String(waitSec)`.
-2. **Message**: `server.js:5294` is updated to exempt pacing rejects from `rateLimitExhaustedMessage`:
+2. **Message**: `server.js:5504` is updated to exempt pacing rejects from `rateLimitExhaustedMessage`:
    ```javascript
    if (status !== 429 || e?.isPacingReject) return toClientErrorMessage(e.message);
    ```

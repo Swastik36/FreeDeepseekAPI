@@ -303,6 +303,12 @@ function normalizeToken(raw) {
         );
     return String(raw).trim();
 }
+function validateDeviceId(rawDeviceId) {
+    return (typeof rawDeviceId === 'string' && /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(rawDeviceId))
+        ? rawDeviceId
+        : null;
+}
+
 async function readPageAuth(cdp) {
     const evalRes = await cdp.send('Runtime.evaluate', {
         expression: `(() => {
@@ -354,7 +360,7 @@ async function readPageAuth(cdp) {
     let hif_dliq = '',
         hif_leim = '',
         headerToken = '';
-    for (const ev of cdp.events) {
+    for (const ev of (cdp.events || [])) {
         const headers = ev.params?.headers || ev.params?.request?.headers;
         if (!headers) continue;
         // Scope to DeepSeek traffic where the event carries a URL
@@ -378,9 +384,7 @@ async function readPageAuth(cdp) {
     const token = headerToken || storeToken;
 
     const rawDeviceId = pageState.localStorage ? pageState.localStorage['deepseek-device-id:chat'] : null;
-    const device_id = (typeof rawDeviceId === 'string' && /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(rawDeviceId))
-        ? rawDeviceId
-        : null;
+    const device_id = validateDeviceId(rawDeviceId);
 
     const wasmUrl =
         (pageState.resources || []).find((u) => /sha3.*\.wasm/.test(u)) ||
@@ -388,7 +392,7 @@ async function readPageAuth(cdp) {
     return {
         token,
         cookie,
-        device_id,
+        ...(device_id ? { device_id } : {}),
         hif_dliq,
         hif_leim,
         wasmUrl,
@@ -418,8 +422,18 @@ function persistAuthResult(outPath, persisted) {
             /* best effort */
         }
     }
+    const toWrite = { ...persisted };
+    // Validate incoming device_id; if invalid or missing, fall back to valid existing device_id
+    const incomingValid = validateDeviceId(toWrite.device_id);
+    const existingValid = existing && validateDeviceId(existing.device_id);
+    const finalDeviceId = incomingValid || existingValid || null;
+    if (finalDeviceId) {
+        toWrite.device_id = finalDeviceId;
+    } else {
+        delete toWrite.device_id;
+    }
     const tmp = `${outPath}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(persisted, null, 2), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify(toWrite, null, 2), { mode: 0o600 });
     if (process.platform !== 'win32') {
         try {
             fs.chmodSync(tmp, 0o600);
@@ -428,6 +442,7 @@ function persistAuthResult(outPath, persisted) {
         }
     }
     fs.renameSync(tmp, outPath);
+    return toWrite;
 }
 
 // Guard rule (§12): a run counts as successful only with a non-null auth
@@ -538,20 +553,23 @@ async function main() {
         return;
     }
     const { href, cookiesCount, ...persisted } = auth;
-    persistAuthResult(outPath, persisted);
+    const finalPersisted = persistAuthResult(outPath, persisted);
     console.log(`[auth] Saved: ${outPath}`);
     console.log(`[auth] page: ${href || 'unknown'}`);
     console.log(
-        `[auth] token: ${persisted.token ? 'OK (' + persisted.token.length + ' chars)' : 'MISSING'}`,
+        `[auth] token: ${finalPersisted.token ? 'OK (' + finalPersisted.token.length + ' chars)' : 'MISSING'}`,
     );
     console.log(
-        `[auth] cookie: ${persisted.cookie ? 'OK (' + cookiesCount + ' cookies)' : 'MISSING'}`,
+        `[auth] cookie: ${finalPersisted.cookie ? 'OK (' + cookiesCount + ' cookies)' : 'MISSING'}`,
     );
     console.log(
-        `[auth] hif headers: ${persisted.hif_dliq || persisted.hif_leim ? 'captured' : 'not captured/optional'}`,
+        `[auth] device_id: ${finalPersisted.device_id ? 'OK (' + finalPersisted.device_id.length + ' chars)' : 'MISSING (optional)'}`,
+    );
+    console.log(
+        `[auth] hif headers: ${finalPersisted.hif_dliq || finalPersisted.hif_leim ? 'captured' : 'not captured/optional'}`,
     );
     cdp.close();
-    if (!persisted.token || !persisted.cookie) process.exitCode = 2;
+    if (!finalPersisted.token || !finalPersisted.cookie) process.exitCode = 2;
 }
 if (require.main === module) {
     main().catch((e) => {
@@ -560,4 +578,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { persistAuthResult, validatePageAuth };
+module.exports = { persistAuthResult, validatePageAuth, validateDeviceId, readPageAuth };
