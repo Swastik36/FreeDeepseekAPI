@@ -20,5 +20,11 @@ data/accounts/*.json
 accounts/*.json
 # Quarantined (suspended/expired) account files — also secrets, never commit.
 accounts-quarantined-*/*.json
+# Credential backups the auth CLI writes — same secrets as the .json files.
+accounts/*.bak
+accounts/*.bak-*
+accounts-quarantined-*/*.bak
+accounts-quarantined-*/*.bak-*
+data/accounts/*.bak
 # Live browser profile (cookies, session state) — never commit.
 .chrome-profile-second/

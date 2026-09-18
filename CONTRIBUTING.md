@@ -41,8 +41,8 @@ files, JSON validity, and (online) PoW endpoint reachability.
 
 ## Tests
 
-`npm test` runs `node --check` over the entry points and then both test files
-with the built-in `node:test` runner.
+`npm test` runs `node --check` over the main entry points and scripts, then both
+test files with the built-in `node:test` runner.
 
 Rules that are easy to get wrong:
 
@@ -60,7 +60,8 @@ Rules that are easy to get wrong:
 ## Adding a configuration knob
 
 1. Read it with `numEnv(name, default, min, max)` so invalid values warn and
-   fall back instead of poisoning runtime behavior. Always pass a real `max`.
+   fall back instead of poisoning runtime behavior. Pass a real `max` when the
+   value has a safe ceiling; if you omit it, say why in a comment.
 2. Document it in `README.md` next to the related knobs.
 3. Add a test that pins the default and at least one boundary.
 4. Keep the default conservative; behavior-changing defaults need a reason in
@@ -74,6 +75,9 @@ Auth material is live access to a DeepSeek account. Never commit it.
   `accounts-quarantined-*/*.json`, `.sessions.json`, `.env`, or any browser
   profile directory (`.chrome-profile-*`, `.chrome-for-testing-profile-*`).
   These are covered by `.gitignore`; do not force-add them.
+- The `accounts/` rules cover the `*.json` files **and** their `.bak`/`.bak-*`
+  siblings — the auth CLI writes those backups and they hold the same secrets.
+  If you add a new secret-bearing path, ignore its backups in the same change.
 - Store auth files with `0600` permissions.
 - Do not log tokens, cookies, or session ids. Use the existing redaction and
   `logToken` helpers.
@@ -85,7 +89,7 @@ Auth material is live access to a DeepSeek account. Never commit it.
 - Zero runtime dependencies. Standard Node APIs only.
 - Minimal diffs. Match the surrounding house patterns rather than introducing
   new abstractions.
-- Back up before large edits (`cp server.js /tmp/server.js.bak.$(date +%s)`).
+- Back up before large edits (for example `cp server.js /tmp/server.js.bak`).
 - Keep comments about *why*, not *what*; this codebase relies on them to avoid
   regressing hard-won fixes.
 - Run `npm test` before opening a pull request. A change that fails the syntax
