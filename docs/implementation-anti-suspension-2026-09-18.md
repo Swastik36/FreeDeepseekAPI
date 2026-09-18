@@ -277,8 +277,8 @@ function maybeTriggerAmbientTelemetry(account, now = Date.now(), fetchImpl = fet
 **Placement**: Top-level, following telemetry helpers (lines 1083-1134)
 
 ```javascript
-const AGENT_TURN_GAP_MS = numEnv('DEEPSEEK_AGENT_TURN_GAP_MS', 3000, 0);
-const TURN_JITTER_MS = numEnv('DEEPSEEK_TURN_JITTER_MS', 1000, 0);
+const AGENT_TURN_GAP_MS = numEnv('DEEPSEEK_AGENT_TURN_GAP_MS', 6000, 0);
+const TURN_JITTER_MS = numEnv('DEEPSEEK_TURN_JITTER_MS', 2000, 0);
 const MIN_USABLE_UPSTREAM_MS = numEnv('DEEPSEEK_MIN_USABLE_UPSTREAM_MS', 10000, 1000);
 
 function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {
