@@ -774,7 +774,7 @@ Notes:
   supported.
 - Long agent prompts are capped by `DEEPSEEK_MAX_PROMPT_CHARS` (default
   80,000 chars) before they reach DeepSeek, so do not assume the OpenCode
-default context size. Keep prompts within that budget.
+  default context size. Keep prompts within that budget.
 
 ---
 
