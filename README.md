@@ -456,10 +456,11 @@ sleeps only while enough request-deadline budget remains; otherwise it answers
 `0` to disable:
 
 ```bash
-DEEPSEEK_AGENT_TURN_GAP_MS=6000 npm start       # target minimum gap between agent turns (0 disables)
-DEEPSEEK_TURN_JITTER_MS=2000 npm start          # uniform random jitter added to the gap
-DEEPSEEK_MIN_USABLE_UPSTREAM_MS=10000 npm start # min deadline budget required to sleep instead of reject
+DEEPSEEK_AGENT_TURN_GAP_MS=6000 npm start       # target minimum gap between agent turns (0 disables; max 60000)
+DEEPSEEK_TURN_JITTER_MS=2000 npm start          # uniform random jitter added to the gap (max 60000)
+DEEPSEEK_MIN_USABLE_UPSTREAM_MS=10000 npm start # min deadline budget required to sleep instead of reject (max: request deadline)
 ```
+Out-of-range values warn and fall back to defaults; a gap at or above the usable minimum logs a boot warning since tight deadlines will reject instead of sleep.
 
 Ambient telemetry (advisory — periodic `GET /api/v0/users/current` per account
 so the login shows normal browser route presence; off by default, fire-and-forget,
