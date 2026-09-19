@@ -1,5 +1,19 @@
 # FreeDeepseekAPI
 
+##  Quick start
+
+One-line install (Linux/macOS native; Windows under Git Bash):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Swastik36/FreeDeepseekAPI/main/scripts/install.sh | sh
+```
+
+This clones the fork, walks you through DeepSeek login, and installs the
+systemd service. Update later with `npm run update` (run it from Git Bash on
+Windows) — it refuses dirty trees, fast-forwards only, runs tests before
+restarting, and rolls back automatically if tests fail.
+*Manual install explained below.
+
 <p align="center">
   <strong>Local OpenAI-compatible API proxy for DeepSeek Web Chat</strong>
 </p>
@@ -24,7 +38,7 @@ FreeDeepseekAPI runs a local API server for **DeepSeek Web Chat** (`chat.deepsee
 
 The project works through your regular logged-in DeepSeek account in a separate Chrome profile. The local server accepts API requests and then talks to DeepSeek Web itself using the saved browser session.
 
-> ⚠️ This is an experimental web-chat proxy. DeepSeek may change its internal Web API without warning. For production use cases, the official paid DeepSeek API is more reliable.
+> ⚠️ This is an experimental web-chat proxy. DeepSeek may change its internal Web API without warning. For production use cases, the official paid DeepSeek API is more reliable. ⚠️
 
 ForgetMeAI: https://t.me/forgetmeai
 
@@ -60,7 +74,7 @@ ForgetMeAI: https://t.me/forgetmeai
 
 ---
 
-## ✨ What it gives you
+##  What it gives you
 
 - Use DeepSeek Web as a local API endpoint.
 - Connect DeepSeek to Open WebUI and other OpenAI-compatible clients.
@@ -70,7 +84,7 @@ ForgetMeAI: https://t.me/forgetmeai
 - Use the OpenAI Responses API shim for new OpenAI/Codex-style clients.
 - Keep separate web sessions for different agents/users.
 
-## 🚀 Features
+##  Features
 
 - **OpenAI-compatible API:** `POST /v1/chat/completions`
 - **Anthropic-compatible shim:** `POST /v1/messages`
@@ -84,19 +98,6 @@ ForgetMeAI: https://t.me/forgetmeai
 - **Zero dependencies:** Node.js 18+, no npm dependencies
 
 ---
-
-## ⚡ Quick start
-
-One-line install (Linux/macOS native; Windows under Git Bash):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Swastik36/FreeDeepseekAPI/main/scripts/install.sh | sh
-```
-
-This clones the fork, walks you through DeepSeek login, and installs the
-systemd service. Update later with `npm run update` (run it from Git Bash on
-Windows) — it refuses dirty trees, fast-forwards only, runs tests before
-restarting, and rolls back automatically if tests fail.
 
 Manual install:
 
@@ -152,7 +153,7 @@ add its exact origin, comma-separated, e.g.
 
 ---
 
-## 🪟 Windows setup
+##  Windows setup
 
 ```powershell
 git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
@@ -191,7 +192,7 @@ CHROME_PATH=$(which google-chrome) npm run auth
 
 ---
 
-## 🖥 VPS / headless setup
+##  VPS / headless setup
 
 The most reliable flow without Chrome on the server:
 
@@ -231,7 +232,7 @@ DEEPSEEK_TOKEN="<token>" npm run auth:import -- --input ./cookies.json
 
 ---
 
-## 🦭 Rootless Podman
+##  Rootless Podman
 
 The container is intended only for non-interactive proxy runs. Do the
 browser-based authorization on the host with `npm run auth`: the auth scripts and
