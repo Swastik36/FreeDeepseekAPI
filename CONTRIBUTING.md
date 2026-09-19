@@ -13,7 +13,7 @@ free of new runtime dependencies.
 ## Getting started
 
 ```bash
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/Swastik36/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 npm run auth      # opens the login flow, writes deepseek-auth.json
 npm start         # starts the proxy on http://localhost:9655

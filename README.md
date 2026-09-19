@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ForgetMeAI/FreeDeepseekAPI/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
+  <a href="https://github.com/Swastik36/FreeDeepseekAPI/blob/main/LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
   <img alt="Node.js 18 plus" src="https://img.shields.io/badge/node-18%2B-339933.svg" />
   <img alt="No npm dependencies" src="https://img.shields.io/badge/dependencies-0-blue.svg" />
   <img alt="OpenAI compatible" src="https://img.shields.io/badge/OpenAI-compatible-111111.svg" />
@@ -40,7 +40,7 @@ The project works through your regular logged-in DeepSeek account in a separate 
 
 > ⚠️ This is an experimental web-chat proxy. DeepSeek may change its internal Web API without warning. For production use cases, the official paid DeepSeek API is more reliable. ⚠️
 
-ForgetMeAI: https://t.me/forgetmeai
+> Fork of [ForgetMeAI/FreeDeepseekAPI](https://github.com/ForgetMeAI/FreeDeepseekAPI), maintained at [Swastik36/FreeDeepseekAPI](https://github.com/Swastik36/FreeDeepseekAPI).
 
 ---
 
@@ -102,7 +102,7 @@ ForgetMeAI: https://t.me/forgetmeai
 Manual install:
 
 ```bash
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/Swastik36/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 npm run auth
 npm start
@@ -156,7 +156,7 @@ add its exact origin, comma-separated, e.g.
 ##  Windows setup
 
 ```powershell
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/Swastik36/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 npm run auth
 npm start
@@ -176,7 +176,7 @@ If Chrome is not found, `npm run auth` now prints ready-made instructions for Wi
 ## 🐧 Linux / Chromium setup
 
 ```bash
-git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+git clone https://github.com/Swastik36/FreeDeepseekAPI.git
 cd FreeDeepseekAPI
 CHROME_PATH=$(which chromium) npm run auth
 npm start
