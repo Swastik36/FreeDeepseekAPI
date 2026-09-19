@@ -1,19 +1,5 @@
 # FreeDeepseekAPI
 
-##  Quick start
-
-One-line install (Linux/macOS native; Windows under Git Bash):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Swastik36/FreeDeepseekAPI/main/scripts/install.sh | sh
-```
-
-This clones the fork, walks you through DeepSeek login, and installs the
-systemd service. Update later with `npm run update` (run it from Git Bash on
-Windows) — it refuses dirty trees, fast-forwards only, runs tests before
-restarting, and rolls back automatically if tests fail.
-*Manual install explained below.
-
 <p align="center">
   <strong>Local OpenAI-compatible API proxy for DeepSeek Web Chat</strong>
 </p>
@@ -33,6 +19,20 @@ restarting, and rolls back automatically if tests fail.
   <a href="#-endpoints">Endpoints</a> •
   <a href="#-open-webui">Open WebUI</a>
 </p>
+
+##  Quick start
+
+One-line install (Linux/macOS native; Windows under Git Bash):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Swastik36/FreeDeepseekAPI/main/scripts/install.sh | sh
+```
+
+This clones the fork, walks you through DeepSeek login, and installs the
+systemd service. Update later with `npm run update` (run it from Git Bash on
+Windows) — it refuses dirty trees, fast-forwards only, runs tests before
+restarting, and rolls back automatically if tests fail.
+*Manual install explained below.
 
 FreeDeepseekAPI runs a local API server for **DeepSeek Web Chat** (`chat.deepseek.com`) and lets you connect DeepSeek Web to Open WebUI, LiteLLM, Hermes, Claude Code, OpenAI SDK-style clients, and other OpenAI-compatible tools.
 
