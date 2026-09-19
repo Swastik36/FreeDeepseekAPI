@@ -1,8 +1,31 @@
-const test = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+
+const REPO_ROOT = path.resolve(__dirname, '..');
+const TEMP_SESSION_STORE = path.join(os.tmpdir(), `anti-suspension-clean-sessions-${process.pid}.json`);
+
+/**
+ * Returns a sanitized copy of process.env stripped of DEEPSEEK_* configuration knobs,
+ * preserving safe runtime variables (PATH, NODE_OPTIONS) and enforcing session store safety.
+ */
+function makeCleanEnv(overrides = {}) {
+    const clean = {};
+    for (const [k, v] of Object.entries(process.env)) {
+        // Strip proxy configuration knobs that alter gate decisions, timeouts, or clamps
+        if (!k.startsWith('DEEPSEEK_')) {
+            clean[k] = v;
+        }
+    }
+    // CONTRIBUTING.md rule (§Tests): any test loading server.js must point DEEPSEEK_SESSION_STORE
+    // to a temporary file to guarantee the live .sessions.json is never modified or wiped.
+    // Crucially: never fall back to process.env.DEEPSEEK_SESSION_STORE, which might point to live store.
+    clean.DEEPSEEK_SESSION_STORE = overrides.DEEPSEEK_SESSION_STORE || TEMP_SESSION_STORE;
+
+    return { ...clean, ...overrides };
+}
 
 const serverInternals = require('../server.js').__test;
 const { validateDeviceId, persistAuthResult, readPageAuth } = require('../scripts/deepseek_chrome_auth.js');
@@ -496,7 +519,9 @@ test('Batch 4 (Pillar 5): askDeepSeekStream pacing gate throws 429 reject before
         run();
     `;
     execFileSync(process.execPath, ['-e', childCode], {
-        env: { ...process.env, DEEPSEEK_AGENT_TURN_GAP_MS: '5000' },
+        cwd: REPO_ROOT,
+        timeout: 5000,
+        env: makeCleanEnv({ DEEPSEEK_AGENT_TURN_GAP_MS: '5000' }),
     });
 });
 
@@ -592,61 +617,124 @@ test('H-3: pacing gate stamps reservation at admission and serializes concurrent
         internals.accounts.length = 0;
         internals.accounts.push(mockAccount);
 
+        let powCallCount = 0;
+        const unexpectedUrls = [];
+
+        global.fetch = async (url, opts) => {
+            const urlStr = String(url || '');
+            if (urlStr.includes('create_pow_challenge')) {
+                powCallCount++;
+                return { ok: false, status: 500, text: async () => 'mock-pow-abort' };
+            }
+            unexpectedUrls.push(urlStr);
+            console.error('[HERMETIC-TRIPWIRE] Blocked unexpected fetch: ' + urlStr);
+            return { ok: false, status: 599, text: async () => 'unexpected-url-tripwire' };
+        };
+
         async function run() {
-            const t0 = Date.now();
-            // Call 1: passes gate, delay is 0, claims reservation at t0.
-            // Will fail at PoW challenge network call, but reservation is stamped before PoW.
+            let call1DurationMs = 0;
+            let primaryError = null;
             try {
-                await internals.askDeepSeekStream('p1', 'agent_1', 'deepseek-chat', 'p1', {
-                    isClientGone: () => false,
-                    requestStartedAt: t0,
-                    isAgentLoop: true,
-                });
-            } catch (e) {
-                // PoW fetch fails with network/auth error
-            }
+                // --- Call 1: passes gate, stamps reservation, reaches mock fetch ---
+                const t0 = Date.now();
+                try {
+                    await internals.askDeepSeekStream('p1', 'agent_1', 'deepseek-chat', 'p1', {
+                        isClientGone: () => false,
+                        requestStartedAt: t0,
+                        isAgentLoop: true,
+                    });
+                } catch (e) {
+                    // Expected: throws on mocked status 500 from dsFetch
+                }
+                call1DurationMs = Date.now() - t0;
 
-            // Assert mockAccount.lastDispatchedAt was updated by Call 1 to >= t0
-            assert(mockAccount.lastDispatchedAt >= t0, 'Call 1 must have written reservation stamp >= t0');
+                // Verify Call 1 internal speed (proves in-memory execution, no network latency)
+                assert.ok(call1DurationMs < 250, 'Call 1 must complete in <250ms (took ' + call1DurationMs + 'ms)');
+                assert.ok(mockAccount.lastDispatchedAt >= t0, 'Call 1 must have written reservation stamp >= t0');
+                assert.equal(powCallCount, 1, 'Call 1 must reach create_pow_challenge mock exactly once');
 
-            // Reset cooldown so mockAccount is admitted by selectAccountForSession for Call 2
-            mockAccount.cooldownUntil = 0;
+                // Hygienic state reset between calls: reset cooldown and failure counters
+                mockAccount.cooldownUntil = 0;
+                mockAccount.failures = 0;
+                mockAccount.consecutiveFailures = 0;
 
-            // Call 2 arrives with only 2s remaining deadline
-            const t2 = Date.now();
-            try {
-                await internals.askDeepSeekStream('p2', 'agent_2', 'deepseek-chat', 'p2', {
-                    isClientGone: () => false,
-                    requestStartedAt: t2 - 118000, // 2s remaining
-                    isAgentLoop: true,
-                });
-                assert.fail('Call 2 should have been rejected by pacing gate because of Call 1 reservation');
+                // --- Call 2: arrives with only 2s remaining deadline, rejected by pacing reservation ---
+                const t2 = Date.now();
+                let call2Err = null;
+                try {
+                    await internals.askDeepSeekStream('p2', 'agent_2', 'deepseek-chat', 'p2', {
+                        isClientGone: () => false,
+                        requestStartedAt: t2 - 118000, // 2s remaining
+                        isAgentLoop: true,
+                    });
+                } catch (err) {
+                    call2Err = err;
+                }
+                assert.ok(call2Err, 'Call 2 should have been rejected by pacing gate because of Call 1 reservation');
+                assert.equal(call2Err.isPacingReject, true, 'Call 2 must be a pacing reject, got: ' + (call2Err && call2Err.message));
+                assert.equal(call2Err.status, 429);
+                // Prove Call 2 rejected pre-dispatch without reaching upstream fetch
+                assert.equal(powCallCount, 1, 'Call 2 must reject at pacing gate before reaching upstream fetch');
+
+                // --- Call 3: rollback on client disconnect during sleep ---
+                mockAccount.cooldownUntil = 0;
+                mockAccount.failures = 0;
+                mockAccount.consecutiveFailures = 0;
+                const prevStamp = Date.now() - 50;
+                mockAccount.lastDispatchedAt = prevStamp;
+                let call3Err = null;
+                try {
+                    await internals.askDeepSeekStream('p3', 'agent_3', 'deepseek-chat', 'p3', {
+                        isClientGone: () => true, // client gone immediately
+                        requestStartedAt: Date.now(),
+                        isAgentLoop: true,
+                    });
+                } catch (e) {
+                    call3Err = e;
+                }
+                assert.ok(call3Err, 'Call 3 should have thrown client disconnected');
+                assert.equal(call3Err.message, 'Client disconnected during pacing interval');
+                assert.equal(mockAccount.lastDispatchedAt, prevStamp, 'reservation must roll back when client disconnects during wait');
             } catch (err) {
-                assert.equal(err.status, 429);
-                assert.equal(err.isPacingReject, true);
-            }
+                primaryError = err;
+            } finally {
+                const latchErrors = [];
+                if (unexpectedUrls.length > 0) {
+                    console.error('[HERMETIC-LATCH] Blocked unexpected URLs: ' + unexpectedUrls.join(', '));
+                    latchErrors.push('Zero unexpected network URLs allowed; saw: ' + unexpectedUrls.join(', '));
+                }
+                if (powCallCount !== 1) {
+                    latchErrors.push('Expected exactly 1 PoW challenge call across turn, observed ' + powCallCount);
+                }
 
-            // Test rollback on client disconnect during sleep
-            mockAccount.cooldownUntil = 0;
-            const prevStamp = Date.now() - 50;
-            mockAccount.lastDispatchedAt = prevStamp;
-            try {
-                await internals.askDeepSeekStream('p3', 'agent_3', 'deepseek-chat', 'p3', {
-                    isClientGone: () => true, // client gone immediately
-                    requestStartedAt: Date.now(),
-                    isAgentLoop: true,
-                });
-                assert.fail('should have thrown client disconnected');
-            } catch (e) {
-                assert.equal(e.message, 'Client disconnected during pacing interval');
+                // Aggregate primary test errors and latch failures so neither masks the other in console diagnostics
+                if (primaryError && latchErrors.length > 0) {
+                    const latchSummary = '[HERMETIC LATCH FAILURE]: ' + latchErrors.join('; ');
+                    const combined = new Error(primaryError.message + '\\n' + latchSummary);
+                    combined.name = primaryError.name || 'Error';
+                    combined.stack = primaryError.stack + '\\n' + latchSummary;
+                    throw combined;
+                } else if (primaryError) {
+                    throw primaryError;
+                } else if (latchErrors.length > 0) {
+                    assert.fail(latchErrors.join('; '));
+                }
             }
-            assert.equal(mockAccount.lastDispatchedAt, prevStamp, 'reservation must roll back when client disconnects during wait');
         }
-        run();
+
+        run().catch(err => {
+            console.error(err);
+            process.exitCode = 1;
+        });
     `;
+    const startedAt = Date.now();
     execFileSync(process.execPath, ['-e', childCode], {
-        env: { ...process.env, DEEPSEEK_AGENT_TURN_GAP_MS: '6000', DEEPSEEK_TURN_JITTER_MS: '0' },
+        cwd: REPO_ROOT,
+        timeout: 5000,
+        env: makeCleanEnv({ DEEPSEEK_AGENT_TURN_GAP_MS: '6000', DEEPSEEK_TURN_JITTER_MS: '0' }),
     });
+    const durationMs = Date.now() - startedAt;
+    assert.ok(durationMs < 2000, `H-3 child must complete in <2000ms (took ${durationMs}ms)`);
 });
 
 test('M-D: pacing knobs enforce upper clamps and warn when gap >= min-usable', () => {
@@ -654,21 +742,27 @@ test('M-D: pacing knobs enforce upper clamps and warn when gap >= min-usable', (
 
     // 1. Exceeding max (60000ms) logs invalid warning and falls back to default 6000
     const outClamp = execFileSync(process.execPath, ['-e', 'const s = require("./server.js"); console.log("GAP:" + s.__test.AGENT_TURN_GAP_MS);'], {
-        env: { ...process.env, DEEPSEEK_AGENT_TURN_GAP_MS: '300000' },
+        cwd: REPO_ROOT,
+        timeout: 5000,
+        env: makeCleanEnv({ DEEPSEEK_AGENT_TURN_GAP_MS: '300000' }),
     }).toString();
     assert.match(outClamp, /\[DS-API\] Invalid DEEPSEEK_AGENT_TURN_GAP_MS="300000"; using default 6000/);
     assert.match(outClamp, /GAP:6000/);
 
     // 2. MIN_USABLE_UPSTREAM_MS exceeding REQUEST_DEADLINE_MS falls back to default 10000
     const outMinUsable = execFileSync(process.execPath, ['-e', 'const s = require("./server.js"); console.log("MIN:" + s.__test.MIN_USABLE_UPSTREAM_MS);'], {
-        env: { ...process.env, DEEPSEEK_MIN_USABLE_UPSTREAM_MS: '200000' },
+        cwd: REPO_ROOT,
+        timeout: 5000,
+        env: makeCleanEnv({ DEEPSEEK_MIN_USABLE_UPSTREAM_MS: '200000' }),
     }).toString();
     assert.match(outMinUsable, /\[DS-API\] Invalid DEEPSEEK_MIN_USABLE_UPSTREAM_MS="200000"; using default 10000/);
     assert.match(outMinUsable, /MIN:10000/);
 
     // 3. Gap >= min-usable emits startup warning
     const outWarn = execFileSync(process.execPath, ['-e', 'const s = require("./server.js");'], {
-        env: { ...process.env, DEEPSEEK_AGENT_TURN_GAP_MS: '15000' },
+        cwd: REPO_ROOT,
+        timeout: 5000,
+        env: makeCleanEnv({ DEEPSEEK_AGENT_TURN_GAP_MS: '15000' }),
     }).toString();
     assert.match(outWarn, /\[DS-API\] Warning: DEEPSEEK_AGENT_TURN_GAP_MS \(15000ms\) >= DEEPSEEK_MIN_USABLE_UPSTREAM_MS \(10000ms\)/);
 });
@@ -704,10 +798,22 @@ test('M-A: parseToolCalls batch output updates account multiToolBatchCount and b
 });
 
 test('M-B: shipped pacing defaults are pinned and human turns bypass pacing gate without delay', async () => {
-    // 1. Shipped defaults pinned
-    assert.equal(serverInternals.AGENT_TURN_GAP_MS, 6000, 'AGENT_TURN_GAP_MS must be 6000ms');
-    assert.equal(serverInternals.TURN_JITTER_MS, 2000, 'TURN_JITTER_MS must be 2000ms');
-    assert.equal(serverInternals.MIN_USABLE_UPSTREAM_MS, 10000, 'MIN_USABLE_UPSTREAM_MS must be 10000ms');
+    const { execFileSync } = require('node:child_process');
+
+    // 1. Shipped defaults pinned in clean unconfigured environment
+    const pinOutput = execFileSync(process.execPath, ['-e', `
+        const assert = require('node:assert/strict');
+        const s = require('./server.js').__test;
+        assert.equal(s.AGENT_TURN_GAP_MS, 6000, 'AGENT_TURN_GAP_MS default must be 6000ms');
+        assert.equal(s.TURN_JITTER_MS, 2000, 'TURN_JITTER_MS default must be 2000ms');
+        assert.equal(s.MIN_USABLE_UPSTREAM_MS, 10000, 'MIN_USABLE_UPSTREAM_MS default must be 10000ms');
+        console.log('PIN_OK');
+    `], {
+        cwd: REPO_ROOT,
+        timeout: 5000,
+        env: makeCleanEnv(),
+    }).toString();
+    assert.match(pinOutput, /PIN_OK/);
 
     // 2. Human turns bypass classifier
     const humanMessages = [
@@ -794,6 +900,13 @@ test('L-E: stickyBurstReject accepts precomputed isOverBurst to avoid redundant 
     assert.equal(resTrue.type, 'rate_limit');
     assert.match(resTrue.message, /hit the burst cap/);
 });
+
+after(() => {
+    try {
+        fs.rmSync(TEMP_SESSION_STORE, { force: true });
+    } catch {}
+});
+
 
 
 
