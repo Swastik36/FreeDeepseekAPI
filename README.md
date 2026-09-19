@@ -69,6 +69,7 @@ The project works through your regular logged-in DeepSeek account in a separate 
 - [Models](#-models)
 - [Endpoints](#-endpoints)
 - [Open WebUI](#-open-webui)
+- [OpenCode](#-opencode)
 - [Refresh the login](#-refresh-the-login)
 - [Project status](#-project-status)
 
@@ -701,6 +702,79 @@ http://localhost:9655/v1
 If `PROXY_API_KEY` is not set, the API key can be anything. If the key is set,
 the client must pass exactly that key — the proxy checks the bearer token before
 granting access to models, sessions, and completions.
+
+---
+
+## ⌨️ OpenCode
+
+OpenCode does not auto-discover arbitrary OpenAI-compatible servers (only
+Ollama, LM Studio, and vLLM are probed automatically), so add the proxy as a
+custom provider in `opencode.jsonc`. The proxy already ships OpenCode-specific
+handling: session reuse per agent, compaction detection, and separate
+`reasoning_content` for thinking models.
+
+Global config: `~/.config/opencode/opencode.jsonc`. Project config:
+`opencode.jsonc` in the project root.
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "fds": {
+      "name": "FreeDeepseekAPI",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:9655/v1",
+        "apiKey": "{env:FDS_API_KEY}"
+      },
+      "models": {
+        "deepseek-chat": { "name": "DeepSeek Chat" },
+        "deepseek-reasoner": {
+          "name": "DeepSeek Reasoner",
+          "compatibility": { "reasoningField": "reasoning_content" }
+        },
+        "deepseek-chat-search": { "name": "DeepSeek Chat (Web Search)" },
+        "deepseek-v4-pro": { "name": "DeepSeek V4 Pro (Expert + reasoning)" }
+      }
+    }
+  },
+  "model": "fds/deepseek-chat"
+}
+```
+
+If the proxy has no `PROXY_API_KEY` set, export any placeholder so the provider
+has a credential to send:
+
+```bash
+export FDS_API_KEY=anything
+```
+
+If `PROXY_API_KEY` **is** set, use the same value:
+
+```bash
+export FDS_API_KEY="$PROXY_API_KEY"
+```
+
+Then pick a model with `/models` in the TUI, or for one run:
+
+```bash
+opencode run --model fds/deepseek-reasoner "Explain this stack trace"
+```
+
+Notes:
+
+- `/connect` does **not** work here. It only lists catalog providers; custom
+  providers are configured in the file above.
+- `reasoningField: "reasoning_content"` is what makes thinking visible for
+  `deepseek-reasoner` — without it OpenCode will not show the reasoning part.
+- The `models` keys are what you select in OpenCode. Only aliases the proxy
+  actually serves are safe: `deepseek-chat`, `deepseek-reasoner`,
+  `deepseek-chat-search`, `deepseek-reasoner-search`, `deepseek-v4-pro`,
+  `deepseek-expert`. `deepseek-vision` and `deepseek-expert-search` are not
+  supported.
+- Long agent prompts are capped by `DEEPSEEK_MAX_PROMPT_CHARS` (default
+  80,000 chars) before they reach DeepSeek, so do not assume the OpenCode
+default context size. Keep prompts within that budget.
 
 ---
 
