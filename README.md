@@ -87,6 +87,19 @@ ForgetMeAI: https://t.me/forgetmeai
 
 ## ⚡ Quick start
 
+One-line install (Linux/macOS native; Windows under Git Bash):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Swastik36/FreeDeepseekAPI/main/scripts/install.sh | sh
+```
+
+This clones the fork, walks you through DeepSeek login, and installs the
+systemd service. Update later with `npm run update` (run it from Git Bash on
+Windows) — it refuses dirty trees, fast-forwards only, runs tests before
+restarting, and rolls back automatically if tests fail.
+
+Manual install:
+
 ```bash
 git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
 cd FreeDeepseekAPI

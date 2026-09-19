@@ -41,8 +41,10 @@ files, JSON validity, and (online) PoW endpoint reachability.
 
 ## Tests
 
-`npm test` runs `node --check` over the main entry points and scripts, then both
-test files with the built-in `node:test` runner.
+`npm test` runs `node --check` over the main entry points and scripts, then all
+test files with the built-in `node:test` runner. `tests/update.test.js` and
+`tests/install.test.js` shell out to `git` and `sh`, so the test target assumes
+both are on `PATH` (the installer already requires them).
 
 Rules that are easy to get wrong:
 
