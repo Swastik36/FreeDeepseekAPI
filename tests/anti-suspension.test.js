@@ -526,3 +526,276 @@ test('Batch 4 (Pillar 5): pacing deadline 429 carries isPacingReject and bypasse
     const shouldThrowDirectly = !serverInternals.isRateLimitError(pacingError) || pacingError.isPacingReject;
     assert.equal(shouldThrowDirectly, true);
 });
+
+test('M-C: isRetryAccountEligible scopes in-place retry to account quota and burst state', () => {
+    const validConfig = { token: 'valid-token', cookie: 'valid-cookie' };
+    const now = Date.now();
+    const readyAccount = {
+        id: 'acct-ready',
+        config: validConfig,
+        cooldownUntil: now + 30000, // in cooldown!
+        requestTimes: [],
+    };
+    // Cooldown is ignored because inPlaceRateLimitRetry lifts it
+    assert.equal(serverInternals.isRetryAccountEligible(readyAccount, now), true);
+
+    // Missing token/cookie -> not eligible
+    assert.equal(serverInternals.isRetryAccountEligible({ id: 'no-creds', config: {} }, now), false);
+
+    // Burst cap check: set burst limit to 2
+    serverInternals.setBurstPerMinute(2);
+    try {
+        const burstSpentAccount = {
+            id: 'acct-burst',
+            config: validConfig,
+            cooldownUntil: now + 5000,
+            requestTimes: [now - 1000, now - 2000],
+        };
+        assert.equal(serverInternals.withinBurst(burstSpentAccount, now), false);
+        assert.equal(serverInternals.isRetryAccountEligible(burstSpentAccount, now), false);
+
+        // shouldRetryInPlace with accountReady: false skips retry
+        const retryCheck = serverInternals.shouldRetryInPlace({
+            flagOn: true,
+            rateLimit: true,
+            migrated: false,
+            gone: false,
+            deadline: false,
+            retryAfterSec: 2,
+            anyReady: true,
+            accountReady: serverInternals.isRetryAccountEligible(burstSpentAccount, now),
+        });
+        assert.equal(retryCheck, false, 'burst-blocked account skips in-place retry');
+    } finally {
+        serverInternals.setBurstPerMinute(0); // restore default
+    }
+});
+
+test('H-3: pacing gate stamps reservation at admission and serializes concurrent turns', () => {
+    const { execFileSync } = require('node:child_process');
+    const childCode = `
+        const assert = require('assert');
+        const server = require('./server.js');
+        const internals = server.__test;
+
+        const now = Date.now();
+        const mockAccount = {
+            id: 'acct_reservation_test',
+            file: 'test.json',
+            config: { token: 't', cookie: 'c' },
+            headers: { 'Authorization': 'Bearer t' },
+            cooldownUntil: 0,
+            failures: 0,
+            inflight: 0,
+            lastDispatchedAt: now - 10000,
+        };
+        internals.accounts.length = 0;
+        internals.accounts.push(mockAccount);
+
+        async function run() {
+            const t0 = Date.now();
+            // Call 1: passes gate, delay is 0, claims reservation at t0.
+            // Will fail at PoW challenge network call, but reservation is stamped before PoW.
+            try {
+                await internals.askDeepSeekStream('p1', 'agent_1', 'deepseek-chat', 'p1', {
+                    isClientGone: () => false,
+                    requestStartedAt: t0,
+                    isAgentLoop: true,
+                });
+            } catch (e) {
+                // PoW fetch fails with network/auth error
+            }
+
+            // Assert mockAccount.lastDispatchedAt was updated by Call 1 to >= t0
+            assert(mockAccount.lastDispatchedAt >= t0, 'Call 1 must have written reservation stamp >= t0');
+
+            // Reset cooldown so mockAccount is admitted by selectAccountForSession for Call 2
+            mockAccount.cooldownUntil = 0;
+
+            // Call 2 arrives with only 2s remaining deadline
+            const t2 = Date.now();
+            try {
+                await internals.askDeepSeekStream('p2', 'agent_2', 'deepseek-chat', 'p2', {
+                    isClientGone: () => false,
+                    requestStartedAt: t2 - 118000, // 2s remaining
+                    isAgentLoop: true,
+                });
+                assert.fail('Call 2 should have been rejected by pacing gate because of Call 1 reservation');
+            } catch (err) {
+                assert.equal(err.status, 429);
+                assert.equal(err.isPacingReject, true);
+            }
+
+            // Test rollback on client disconnect during sleep
+            mockAccount.cooldownUntil = 0;
+            const prevStamp = Date.now() - 50;
+            mockAccount.lastDispatchedAt = prevStamp;
+            try {
+                await internals.askDeepSeekStream('p3', 'agent_3', 'deepseek-chat', 'p3', {
+                    isClientGone: () => true, // client gone immediately
+                    requestStartedAt: Date.now(),
+                    isAgentLoop: true,
+                });
+                assert.fail('should have thrown client disconnected');
+            } catch (e) {
+                assert.equal(e.message, 'Client disconnected during pacing interval');
+            }
+            assert.equal(mockAccount.lastDispatchedAt, prevStamp, 'reservation must roll back when client disconnects during wait');
+        }
+        run();
+    `;
+    execFileSync(process.execPath, ['-e', childCode], {
+        env: { ...process.env, DEEPSEEK_AGENT_TURN_GAP_MS: '6000', DEEPSEEK_TURN_JITTER_MS: '0' },
+    });
+});
+
+test('M-D: pacing knobs enforce upper clamps and warn when gap >= min-usable', () => {
+    const { execFileSync } = require('node:child_process');
+
+    // 1. Exceeding max (60000ms) logs invalid warning and falls back to default 6000
+    const outClamp = execFileSync(process.execPath, ['-e', 'const s = require("./server.js"); console.log("GAP:" + s.__test.AGENT_TURN_GAP_MS);'], {
+        env: { ...process.env, DEEPSEEK_AGENT_TURN_GAP_MS: '300000' },
+    }).toString();
+    assert.match(outClamp, /\[DS-API\] Invalid DEEPSEEK_AGENT_TURN_GAP_MS="300000"; using default 6000/);
+    assert.match(outClamp, /GAP:6000/);
+
+    // 2. MIN_USABLE_UPSTREAM_MS exceeding REQUEST_DEADLINE_MS falls back to default 10000
+    const outMinUsable = execFileSync(process.execPath, ['-e', 'const s = require("./server.js"); console.log("MIN:" + s.__test.MIN_USABLE_UPSTREAM_MS);'], {
+        env: { ...process.env, DEEPSEEK_MIN_USABLE_UPSTREAM_MS: '200000' },
+    }).toString();
+    assert.match(outMinUsable, /\[DS-API\] Invalid DEEPSEEK_MIN_USABLE_UPSTREAM_MS="200000"; using default 10000/);
+    assert.match(outMinUsable, /MIN:10000/);
+
+    // 3. Gap >= min-usable emits startup warning
+    const outWarn = execFileSync(process.execPath, ['-e', 'const s = require("./server.js");'], {
+        env: { ...process.env, DEEPSEEK_AGENT_TURN_GAP_MS: '15000' },
+    }).toString();
+    assert.match(outWarn, /\[DS-API\] Warning: DEEPSEEK_AGENT_TURN_GAP_MS \(15000ms\) >= DEEPSEEK_MIN_USABLE_UPSTREAM_MS \(10000ms\)/);
+});
+
+test('M-A: parseToolCalls batch output updates account multiToolBatchCount and batchSizeCounts', () => {
+    const rawContent = [
+        '{"tool_call":{"name":"read_file","arguments":{"path":"a.txt"}}}',
+        '{"tool_call":{"name":"read_file","arguments":{"path":"b.txt"}}}',
+        '{"tool_call":{"name":"read_file","arguments":{"path":"c.txt"}}}',
+    ].join('\n');
+    const multiCalls = serverInternals.parseToolCalls(rawContent, { allowedToolNames: new Set(['read_file']) });
+    assert.equal(multiCalls.length, 3);
+
+    const mockAccount = {
+        id: 'acct_metrics',
+        multiToolBatchCount: 0,
+        batchSizeCounts: {},
+    };
+
+    serverInternals.recordBatchMetrics(mockAccount, multiCalls.length);
+    assert.equal(mockAccount.multiToolBatchCount, 1);
+    assert.equal(mockAccount.batchSizeCounts['3'], 1);
+
+    // Second batch of size 3 increments count to 2
+    serverInternals.recordBatchMetrics(mockAccount, 3);
+    assert.equal(mockAccount.multiToolBatchCount, 2);
+    assert.equal(mockAccount.batchSizeCounts['3'], 2);
+
+    // Single-call (size 1) does NOT count as a multi-tool batch
+    serverInternals.recordBatchMetrics(mockAccount, 1);
+    assert.equal(mockAccount.multiToolBatchCount, 2);
+    assert.equal(mockAccount.batchSizeCounts['1'], undefined);
+});
+
+test('M-B: shipped pacing defaults are pinned and human turns bypass pacing gate without delay', async () => {
+    // 1. Shipped defaults pinned
+    assert.equal(serverInternals.AGENT_TURN_GAP_MS, 6000, 'AGENT_TURN_GAP_MS must be 6000ms');
+    assert.equal(serverInternals.TURN_JITTER_MS, 2000, 'TURN_JITTER_MS must be 2000ms');
+    assert.equal(serverInternals.MIN_USABLE_UPSTREAM_MS, 10000, 'MIN_USABLE_UPSTREAM_MS must be 10000ms');
+
+    // 2. Human turns bypass classifier
+    const humanMessages = [
+        { role: 'system', content: 'You are an assistant.' },
+        { role: 'user', content: 'Can you help me write code?' },
+    ];
+    assert.equal(serverInternals.isAgentLoopTurn({ messages: humanMessages, agentId: 'human-user' }), false, 'genuine user turn must evaluate to false');
+
+    // 3. Human turns bypass gate completely (isAgentLoop: false)
+    const mockAccount = {
+        id: 'acct_human_bypass',
+        file: 'test.json',
+        config: { token: 't', cookie: 'c' },
+        headers: { 'Authorization': 'Bearer t' },
+        cooldownUntil: 0,
+        failures: 0,
+        inflight: 0,
+        lastDispatchedAt: Date.now() - 50, // 50ms ago; if paced, would require ~5950ms delay
+    };
+    const prevDispatchedAt = mockAccount.lastDispatchedAt;
+    serverInternals.accounts.length = 0;
+    serverInternals.accounts.push(mockAccount);
+
+    // Hermetic fetch mock: intercepts create_pow_challenge so test never hits network
+    // and throws before line 1945 dispatch timestamping
+    const origFetch = global.fetch;
+    let powChallengeReached = false;
+    global.fetch = async (url, opts) => {
+        if (String(url).includes('create_pow_challenge')) {
+            powChallengeReached = true;
+            return { ok: false, status: 500, text: async () => 'mock-pow-abort' };
+        }
+        return origFetch(url, opts);
+    };
+
+    // Drive askDeepSeekStream with isAgentLoop: false
+    const t0 = Date.now();
+    try {
+        await serverInternals.askDeepSeekStream('hello', 'human_agent', 'deepseek-chat', 'hello', {
+            isClientGone: () => false,
+            requestStartedAt: t0,
+            isAgentLoop: false, // human turn bypass!
+        });
+    } catch (e) {
+        // expected: throws at mocked cr.ok === false
+    } finally {
+        global.fetch = origFetch;
+    }
+    const elapsed = Date.now() - t0;
+    assert.equal(powChallengeReached, true, 'Human turn must proceed directly through gate to upstream call');
+    // Pacing delay of 5950ms was NOT scheduled; returns immediately (< 500ms)
+    assert.ok(elapsed < 500, `Human turn must not sleep (elapsed: ${elapsed}ms)`);
+    // Reservation stamp was NOT claimed (lastDispatchedAt remained unchanged by gate)
+    assert.equal(mockAccount.lastDispatchedAt, prevDispatchedAt, 'Gate must not stamp reservation on human bypass');
+});
+
+test('L-D: calculateRequiredDelay clamps jitter to jitterMs when rand returns 1', () => {
+    // With targetGapMs = 6000, jitterMs = 2000, elapsed = 0:
+    // rand = 1: Math.floor(1 * 2001) = 2001 -> clamped to 2000 -> target = 8000
+    assert.equal(serverInternals.calculateRequiredDelay(0, 6000, 2000, () => 1), 8000);
+    // rand = 0: jitter = 0 -> target = 6000
+    assert.equal(serverInternals.calculateRequiredDelay(0, 6000, 2000, () => 0), 6000);
+    // rand = 0.5: Math.floor(0.5 * 2001) = 1000 -> target = 7000
+    assert.equal(serverInternals.calculateRequiredDelay(0, 6000, 2000, () => 0.5), 7000);
+});
+
+test('L-E: stickyBurstReject accepts precomputed isOverBurst to avoid redundant evaluation', () => {
+    const now = Date.now();
+    const sticky = {
+        id: 'acct_burst_check',
+        config: { token: 't', cookie: 'c' },
+        requestTimes: [now - 10000],
+    };
+    const session = { id: 'sess_live' };
+
+    // When isOverBurst is precomputed as false -> immediately returns null
+    const resFalse = serverInternals.stickyBurstReject(sticky, session, now, 10, false);
+    assert.equal(resFalse, null);
+
+    // When isOverBurst is precomputed as true -> returns 429 Error
+    const resTrue = serverInternals.stickyBurstReject(sticky, session, now, 10, true);
+    assert.ok(resTrue instanceof Error);
+    assert.equal(resTrue.status, 429);
+    assert.equal(resTrue.type, 'rate_limit');
+    assert.match(resTrue.message, /hit the burst cap/);
+});
+
+
+
+
+

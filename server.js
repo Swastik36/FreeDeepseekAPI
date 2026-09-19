@@ -391,10 +391,11 @@ function withinBurst(account, nowMs = Date.now(), limit = BURST_PER_MINUTE) {
 // when a live chat sits on a burst-spent account, else null. Pure apart from
 // reading its inputs, so the wiring ("fail fast, chat preserved, no mark")
 // is unit-testable. Chat-less stickies get null and rotate freely below.
-function stickyBurstReject(sticky, session, nowMs = Date.now(), limit = BURST_PER_MINUTE) {
+function stickyBurstReject(sticky, session, nowMs = Date.now(), limit = BURST_PER_MINUTE, isOverBurst = null) {
     if (!sticky || !sticky.config || !sticky.config.token || !sticky.config.cookie) return null;
     if (!(limit > 0)) return null;
-    if (burstUsedThisMinute(sticky, nowMs) < limit) return null;
+    const over = isOverBurst !== null ? isOverBurst : (burstUsedThisMinute(sticky, nowMs) >= limit);
+    if (!over) return null;
     if (!session || !session.id) return null;
     const oldest = oldestInWindow(sticky.requestTimes, nowMs - BURST_WINDOW_MS);
     const waitSec = oldest !== null ? Math.max(1, Math.ceil((oldest + BURST_WINDOW_MS - nowMs) / 1000)) : 60;
@@ -465,7 +466,8 @@ function shouldAttemptInPlaceRetry(retryAfterSec) {
 function shouldRetryInPlace(o = {}) {
     if (!o.flagOn || !o.rateLimit || o.migrated || o.gone || o.deadline) return false;
     if (!shouldAttemptInPlaceRetry(o.retryAfterSec)) return false;
-    if (!o.anyReady) return false;
+    if (o.anyReady !== undefined && !o.anyReady) return false;
+    if (o.accountReady !== undefined && !o.accountReady) return false;
     return true;
 }
 // Bounded wait: never sleep past the request deadline (H-2 — an unbounded
@@ -491,6 +493,12 @@ function nextEwmaLatency(prevMs, sampleMs) {
 function isAccountReady(a, nowMs = Date.now()) {
     return !!(a && a.config && a.config.token && a.config.cookie
         && (a.cooldownUntil || 0) <= nowMs && withinQuota(a, nowMs) && withinBurst(a, nowMs));
+}
+// Testable eligibility check for in-place rate-limit retry:
+// Account must possess credentials, and must NOT be blocked by hourly quota or burst cap.
+// Note: cooldownUntil is explicitly NOT checked here because inPlaceRateLimitRetry lifts cooldown once.
+function isRetryAccountEligible(a, nowMs = Date.now()) {
+    return !!(a && a.config && a.config.token && a.config.cookie && withinQuota(a, nowMs) && withinBurst(a, nowMs));
 }
 // Readiness pre-filter shared by the retry gate: true when at least one
 // account passes the shared predicate. Exported for tests.
@@ -799,7 +807,7 @@ function selectAccountForSession(session, sessionKey = '') {
             throw err;
         }
         // Burst mirrors quota exactly (separate knob, separate message).
-        const burstErr = stickyBurstReject(sticky, session, now);
+        const burstErr = stickyBurstReject(sticky, session, now, BURST_PER_MINUTE, stickyOverBurst);
         if (burstErr) throw burstErr;
         // A DeepSeek chat_session belongs to the auth account that created it.
         // If that account disappeared, lost credentials, or (for a chat-less
@@ -1081,9 +1089,12 @@ function maybeTriggerAmbientTelemetry(account, now = Date.now(), fetchImpl = fet
     });
 }
 // Turn-Aware Delta Pacing (Pillar 5)
-const AGENT_TURN_GAP_MS = numEnv('DEEPSEEK_AGENT_TURN_GAP_MS', 6000, 0);
-const TURN_JITTER_MS = numEnv('DEEPSEEK_TURN_JITTER_MS', 2000, 0);
-const MIN_USABLE_UPSTREAM_MS = numEnv('DEEPSEEK_MIN_USABLE_UPSTREAM_MS', 10000, 1000);
+const AGENT_TURN_GAP_MS = numEnv('DEEPSEEK_AGENT_TURN_GAP_MS', 6000, 0, 60000);
+const TURN_JITTER_MS = numEnv('DEEPSEEK_TURN_JITTER_MS', 2000, 0, 60000);
+const MIN_USABLE_UPSTREAM_MS = numEnv('DEEPSEEK_MIN_USABLE_UPSTREAM_MS', 10000, 1000, REQUEST_DEADLINE_MS);
+if (AGENT_TURN_GAP_MS > 0 && AGENT_TURN_GAP_MS >= MIN_USABLE_UPSTREAM_MS) {
+    console.log(`[DS-API] Warning: DEEPSEEK_AGENT_TURN_GAP_MS (${AGENT_TURN_GAP_MS}ms) >= DEEPSEEK_MIN_USABLE_UPSTREAM_MS (${MIN_USABLE_UPSTREAM_MS}ms); turn pacing may reject turns when remaining deadline is tight.`);
+}
 
 function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {
     if (isSharedTitleBucket(agentId) || isTitleGenerationRequest(messages)) {
@@ -1103,7 +1114,7 @@ function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {
 
 function calculateRequiredDelay(elapsedMs, targetGapMs, jitterMs, rand = Math.random) {
     if (targetGapMs <= 0) return 0;
-    const jitter = jitterMs > 0 ? Math.floor(rand() * (jitterMs + 1)) : 0;
+    const jitter = jitterMs > 0 ? Math.min(jitterMs, Math.floor(rand() * (jitterMs + 1))) : 0;
     const target = targetGapMs + jitter;
     return Math.max(0, target - elapsedMs);
 }
@@ -1854,18 +1865,35 @@ async function askDeepSeekStream(
         if (pacing.action === 'reject') {
             throw pacing.error;
         }
+        const reservationStamp = now + (pacing.delayMs || 0);
+        const prevDispatchedAt = account.lastDispatchedAt || 0;
+        account.lastDispatchedAt = Math.max(prevDispatchedAt, reservationStamp);
+
         if (pacing.action === 'wait' && pacing.delayMs > 0) {
-            await new Promise(resolve => setTimeout(resolve, pacing.delayMs));
             if (isClientGone()) {
+                if (account.lastDispatchedAt === reservationStamp) {
+                    account.lastDispatchedAt = prevDispatchedAt;
+                }
                 throw new Error('Client disconnected during pacing interval');
             }
-            if ((Date.now() - requestStartedAt) > REQUEST_DEADLINE_MS) {
-                const err = new Error('Request deadline expired during pacing interval. Retry in ~1s; chat preserved.');
-                err.status = 429;
-                err.retryAfter = 1;
-                err.type = 'rate_limit';
-                err.isPacingReject = true;
-                throw err;
+            try {
+                await new Promise(resolve => setTimeout(resolve, pacing.delayMs));
+                if (isClientGone()) {
+                    throw new Error('Client disconnected during pacing interval');
+                }
+                if ((Date.now() - requestStartedAt) > REQUEST_DEADLINE_MS) {
+                    const err = new Error('Request deadline expired during pacing interval. Retry in ~1s; chat preserved.');
+                    err.status = 429;
+                    err.retryAfter = 1;
+                    err.type = 'rate_limit';
+                    err.isPacingReject = true;
+                    throw err;
+                }
+            } catch (waitErr) {
+                if (account.lastDispatchedAt === reservationStamp) {
+                    account.lastDispatchedAt = prevDispatchedAt;
+                }
+                throw waitErr;
             }
         }
     }
@@ -1914,7 +1942,7 @@ async function askDeepSeekStream(
     // burst needs the ring even when quota is off (C1 — the gated wrapper
     // here would silently disable burst under DEEPSEEK_HOURLY_QUOTA=0).
     recordUpstreamTurn(account);
-    account.lastDispatchedAt = Date.now();
+    account.lastDispatchedAt = Math.max(account.lastDispatchedAt || 0, Date.now());
     const powT0 = Date.now();
     // A PoW failure is an account-level upstream fault, not a chat fault — but
     // it must not cool the account: a stalled WASM CDN is not a rate limit,
@@ -2840,6 +2868,14 @@ function parseToolCalls(text, options = {}) {
     }
 
     return capped;
+}
+
+function recordBatchMetrics(account, batchSize) {
+    if (!account || !(batchSize > 1)) return;
+    account.multiToolBatchCount = (account.multiToolBatchCount || 0) + 1;
+    if (!account.batchSizeCounts) account.batchSizeCounts = {};
+    const szKey = String(batchSize);
+    account.batchSizeCounts[szKey] = (account.batchSizeCounts[szKey] || 0) + 1;
 }
 
 function hasLeftoverToolEnvelopes(text) {
@@ -4899,12 +4935,21 @@ const server = http.createServer(async (req, res) => {
                 // when NO account is ready would send one request upstream that
                 // the exhausted message promises never happens. Migration below
                 // then throws the proper all-cooling 429.
+                const retryAccount = accounts.find(a => a.id === session.accountId);
+                const retryEligible = isRetryAccountEligible(retryAccount);
                 const anyReadyNow = anyAccountReady(accounts);
                 const remainingMs = Math.max(0, REQUEST_DEADLINE_MS - (Date.now() - requestStartedAt));
                 const waitMs = retryWaitMs(e.retryAfter, remainingMs);
-                if (shouldRetryInPlace({ flagOn: RETRY_RATELIMIT, rateLimit: isRateLimitError(e) && !e?.isPacingReject, migrated: rateLimitMigrated, gone: clientGone, deadline: deadlineHit(), retryAfterSec: e.retryAfter, anyReady: anyReadyNow })
-                    && waitMs > 0) {
-                    const retryAccount = accounts.find(a => a.id === session.accountId);
+                if (shouldRetryInPlace({
+                    flagOn: RETRY_RATELIMIT,
+                    rateLimit: isRateLimitError(e) && !e?.isPacingReject,
+                    migrated: rateLimitMigrated,
+                    gone: clientGone,
+                    deadline: deadlineHit(),
+                    retryAfterSec: e.retryAfter,
+                    anyReady: anyReadyNow,
+                    accountReady: retryEligible,
+                }) && waitMs > 0) {
                     if (retryAccount) {
                         console.log(`${agentTag} rate-limit: one in-place retry on acct:${retryAccount.id} in ${waitMs}ms (lifting cooldown once)`);
                         await new Promise(r => setTimeout(r, waitMs));
@@ -5255,12 +5300,7 @@ const server = http.createServer(async (req, res) => {
                 if (multiCalls && multiCalls.length > 0 && multiCalls.every(tc => allowedToolNames.has(tc.name))) {
                     console.log(`${agentTag} Model emitted ${multiCalls.length} valid tool call(s) in turn: ${multiCalls.map(tc => tc.name).join(', ')}`);
                     toolCall = multiCalls.length === 1 ? multiCalls[0] : multiCalls;
-                    if (multiCalls.length > 1 && initialCall?.account) {
-                        initialCall.account.multiToolBatchCount = (initialCall.account.multiToolBatchCount || 0) + 1;
-                        if (!initialCall.account.batchSizeCounts) initialCall.account.batchSizeCounts = {};
-                        const szKey = String(multiCalls.length);
-                        initialCall.account.batchSizeCounts[szKey] = (initialCall.account.batchSizeCounts[szKey] || 0) + 1;
-                    }
+                    recordBatchMetrics(initialCall?.account, multiCalls.length);
                 } else {
                     if (hasLeftoverToolEnvelopes(fullContent)) {
                         console.log(`${agentTag} Model emitted multiple tool envelopes but some are disallowed or malformed; attempting format repair instead of silently narrowing.`);
@@ -5641,6 +5681,7 @@ module.exports = {
         formatToolDefinitions,
         parseToolCall,
         parseToolCalls,
+        recordBatchMetrics,
         hasLeftoverToolEnvelopes,
         MAX_TOOL_CALLS_PER_TURN,
         ACTIVE_HOSTED_WINDOW_MS,
@@ -5687,6 +5728,7 @@ module.exports = {
         shouldRetryInPlace,
         retryWaitMs,
         inPlaceRateLimitRetry,
+        isRetryAccountEligible,
         anyAccountReady,
         recordAccountRequest,
         recordUpstreamTurn,

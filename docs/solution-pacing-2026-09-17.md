@@ -31,7 +31,7 @@ invisible turns (titles, compaction summaries, repair retries) join the burst.
   If a future edit adds marking to that catch, this test must be updated first.
 
 ### 2b. Min-gap pacer — DEFERRED (4b)
-- Knobs: `DEEPSEEK_MIN_TURN_GAP_MS`, `DEEPSEEK_TURN_JITTER_MS` (both default 0).
+- Knobs: `DEEPSEEK_AGENT_TURN_GAP_MS` (default 6000), `DEEPSEEK_TURN_JITTER_MS` (default 2000).
   When enabled: gap = min + rand*jitter; candidate default 2000+3000 **only
   after** Sep-19 measurement. Numbers in v1 of this doc were placeholders —
   stated plainly so nobody treats them as derived.

@@ -2971,6 +2971,8 @@ test('retry toggle: shouldRetryInPlace wires flag, rate-limit, state, backoff, r
   assert.equal(f({ ...base, retryAfterSec: 600 }), false, 'long backoff goes to migration');
   assert.equal(f({ ...base, retryAfterSec: 5 }), true, 'brief backoff attempts');
   assert.equal(f({ ...base, anyReady: false }), false, 'all cooling skips the lift (no upstream leak)');
+  assert.equal(f({ ...base, accountReady: false }), false, 'quota/burst-blocked retry account skips the lift');
+  assert.equal(f({ ...base, accountReady: true }), true, 'eligible retry account attempts');
 });
 
 test('retry toggle: shouldAttemptInPlaceRetry only for unknown/brief backoffs', () => {
