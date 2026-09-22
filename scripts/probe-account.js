@@ -16,6 +16,15 @@ const fs = require('fs');
 
 const POW_URL = 'https://chat.deepseek.com/api/v0/chat/create_pow_challenge';
 
+// Quarantine allowlist (unit-tested, single source of truth for CLI + doctor):
+// only reasons proving the credential itself is dead may exile an account.
+// Rate limits, server errors, malformed envelopes, transport failures and
+// unreadable files must NEVER trigger a move (see double-tap + breaker in
+// auth-cli.sh for the remaining false-positive guards).
+function isQuarantineWorthy(reason) {
+  return reason === 'pow-missing' || reason === 'http-401' || reason === 'http-403';
+}
+
 // Pure verdict classifier (unit-tested): full-body parse, never slice-before-parse.
 function classifyPowResponse(status, bodyText) {
   const body = String(bodyText || '');
@@ -98,4 +107,4 @@ if (require.main === module) {
   main().then(code => process.exit(code)).catch(e => { console.error('[probe] ERROR:', e.message); process.exit(1); });
 }
 
-module.exports = { classifyPowResponse, probeFile };
+module.exports = { classifyPowResponse, isQuarantineWorthy, probeFile };

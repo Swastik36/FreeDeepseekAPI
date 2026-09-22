@@ -18,8 +18,10 @@ data/accounts/*.json
 .sessions.json
 # Live DeepSeek auth tokens/cookies (0600) — never commit. Keep the dir.
 accounts/*.json
+accounts/.*
 # Quarantined (suspended/expired) account files — also secrets, never commit.
 accounts-quarantined-*/*.json
+accounts-quarantined-*/.*
 # Credential backups the auth CLI writes — same secrets as the .json files.
 accounts/*.bak
 accounts/*.bak-*
@@ -28,3 +30,8 @@ accounts-quarantined-*/*.bak-*
 data/accounts/*.bak
 # Live browser profile (cookies, session state) — never commit.
 .chrome-profile-second/
+# Proxy restart state (starting account rotation) — never commit.
+.proxy-state.json
+.proxy-state.json.tmp
+*.proxy-state.json
+

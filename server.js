@@ -36,7 +36,26 @@ function numEnv(name, def, min = -Infinity, max = Infinity) {
 
 const DS_FETCH_TIMEOUT_MS = numEnv('DEEPSEEK_FETCH_TIMEOUT_MS', 60000, 1);
 function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
-    return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(timeoutMs) });
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    let signal;
+    if (options.signal) {
+        if (typeof AbortSignal.any === 'function') {
+            signal = AbortSignal.any([options.signal, timeoutSignal]);
+        } else {
+            const controller = new AbortController();
+            const onAbort = () => controller.abort();
+            if (options.signal.aborted || timeoutSignal.aborted) {
+                controller.abort();
+            } else {
+                options.signal.addEventListener('abort', onAbort, { once: true });
+                timeoutSignal.addEventListener('abort', onAbort, { once: true });
+            }
+            signal = controller.signal;
+        }
+    } else {
+        signal = timeoutSignal;
+    }
+    return fetch(url, { ...options, signal });
 }
 
 // Log verbosity: DEEPSEEK_LOG_LEVEL=debug enables per-pick score breakdowns and
@@ -154,7 +173,7 @@ function isBrowserOriginAllowed(origin, allowedOrigins = PROXY_CORS_ORIGINS) {
 const CONTEXT_COMPACTED_HEADER = 'X-FreeDeepseek-Context-Compacted';
 function setCorsResponseHeaders(res) {
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-agent-session, x-api-key, anthropic-version, anthropic-beta');
     res.setHeader('Access-Control-Expose-Headers', CONTEXT_COMPACTED_HEADER);
 }
 function markContextCompacted(res) {
@@ -223,7 +242,7 @@ function persistSessionsNow(storePath = SESSION_STORE_PATH) {
             sessions: Array.from(sessions.entries()).map(([agentId, s]) => [agentId, serializeSession(s)]),
         });
         const tmp = `${target}.tmp`;
-        fs.writeFileSync(tmp, payload);
+        fs.writeFileSync(tmp, payload, { mode: 0o600 });
         fs.renameSync(tmp, target);
         try { fs.chmodSync(target, 0o600); } catch (e) { /* best effort */ }
     } catch (e) {
@@ -448,7 +467,7 @@ function rateLimitRetryDelayMs(retryAfterSec) {
 // is what protects the accounts — hammering helps nothing: while all accounts
 // cool, retries never reach DeepSeek anyway.
 function rateLimitExhaustedMessage(waitSec) {
-    return `DeepSeek rate limit reached on all accounts. Retry in ~${waitSec}s — sooner just returns 429 again without reaching DeepSeek. Tip: /compact to shrink context first; smaller turns burn less quota.`;
+    return `[OpenCode Warning] No available DeepSeek accounts (all cooling down, in quarantine, or quota-spent). In OpenCode: wait ~${waitSec}s or run /compact to shrink context. Tip: run 'npm run auth-cli' to renew or restore accounts.`;
 }
 // In-place retry is only attempted when quick recovery is plausible: unknown
 // Retry-After gets one optimistic probe, brief backoffs (<= cap) are worth the
@@ -492,6 +511,8 @@ function nextEwmaLatency(prevMs, sampleMs) {
 // Exported for tests.
 function isAccountReady(a, nowMs = Date.now()) {
     return !!(a && a.config && a.config.token && a.config.cookie
+        && !a.authUnavailable
+        && !a.isProbeActive
         && (a.cooldownUntil || 0) <= nowMs && withinQuota(a, nowMs) && withinBurst(a, nowMs));
 }
 // Testable eligibility check for in-place rate-limit retry:
@@ -523,6 +544,7 @@ async function inPlaceRateLimitRetry(account, attemptTurn) {
         lastUpstreamAt: Number(account.lastUpstreamAt) || 0,
     };
     account.cooldownUntil = 0;
+    account.isProbeActive = true;
     try {
         return { recovered: true, result: await attemptTurn() };
     } catch (retryErr) {
@@ -538,6 +560,8 @@ async function inPlaceRateLimitRetry(account, attemptTurn) {
         if (saved.ring !== null && Array.isArray(account.requestTimes)) account.requestTimes = saved.ring;
         account.lastUpstreamAt = saved.lastUpstreamAt;
         return { recovered: false, error: retryErr };
+    } finally {
+        delete account.isProbeActive;
     }
 }
 // Operator-configurable extra tool-call sentinels (round-3 G4):
@@ -586,6 +610,50 @@ let inFlight = 0;  // concurrent in-flight completions (backpressure cap)
 // loops), max concurrent completions, and the empty-response retry cap.
 const REQUEST_DEADLINE_MS = numEnv('DEEPSEEK_REQUEST_DEADLINE_MS', 120000, 1000);
 const MAX_CONCURRENT = Math.max(1, Math.floor(numEnv('DEEPSEEK_MAX_CONCURRENT', 24, 1)));
+let MAX_PER_ACCOUNT = numEnv('DEEPSEEK_MAX_PER_ACCOUNT', 1, 0, 10);
+function getMaxPerAccount() { return MAX_PER_ACCOUNT; }
+function setMaxPerAccount(n) {
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
+        console.warn(`[DS-API] setMaxPerAccount: ignoring invalid value ${n}; keeping ${MAX_PER_ACCOUNT}`);
+        return;
+    }
+    MAX_PER_ACCOUNT = Math.max(0, Math.min(10, Math.floor(n)));
+} // test hook
+
+function acquireAccountLease(account) {
+    if (!account) return false;
+    account.inflight = (Number(account.inflight) || 0) + 1;
+    return true;
+}
+
+function releaseAccountLease(account) {
+    if (!account) return;
+    const current = Number(account.inflight) || 0;
+    const remaining = current - 1;
+    if (remaining < 0) {
+        console.warn(`[account:${account.id}] inflight clamp engaged (counter would go negative); floored at 0 — investigate for a leak.`);
+    }
+    account.inflight = Math.max(0, remaining);
+}
+
+// Per-account capacity ceiling: admits new turns on an account only when its
+// in-flight count is strictly below MAX_PER_ACCOUNT (or disabled when <= 0).
+// Deliberately separate from isAccountReady so /readyz and the retry gate
+// remain semantic readiness probes (not capacity gauges).
+function hasCapacity(a) {
+    if (!a) return false;
+    return !(MAX_PER_ACCOUNT > 0) || (Number(a.inflight) || 0) < MAX_PER_ACCOUNT;
+}
+
+// Estimated remaining wait for a saturated account, bounded between 2s and 10s
+// (and capped by REQUEST_DEADLINE_MS) based on its EWMA latency and elapsed time.
+function saturatedWaitSec(account, nowMs = Date.now()) {
+    const elapsed = Math.max(0, nowMs - (account?.lastDispatchedAt || nowMs));
+    const ewma = Number(account?.ewmaLatencyMs) || 5000;
+    const estMs = Math.max(2000, ewma - elapsed);
+    const deadlineCapSec = Math.max(1, Math.ceil(REQUEST_DEADLINE_MS / 1000));
+    return Math.min(deadlineCapSec, Math.min(10, Math.max(2, Math.ceil(estMs / 1000))));
+}
 // Request-body caps (§6/§7): per-request 10MB (413) plus a global
 // in-flight-body budget (64MB, 503+Retry-After) so concurrent trickled
 // uploads cannot balloon memory. inflightBodyBytes is charged per chunk and
@@ -653,7 +721,8 @@ function loadDeepSeekConfig({ fatal = true } = {}) {
         try {
             const raw = fs.readFileSync(file, 'utf8');
             const config = JSON.parse(raw);
-            const id = `account_${accounts.length + 1}`;
+            const fileBase = path.basename(file, '.json').replace(/[^a-zA-Z0-9_-]/g, '_');
+            const id = config.id || config.account_id || (paths.length === 1 && file === DS_CONFIG_PATH ? 'account_1' : (fileBase || `account_${accounts.length + 1}`));
             if (!config.wasmUrl) {
                 // Fail-loud at load, not per-turn: without wasmUrl every PoW
                 // solve throws and the account 500s every request (F16).
@@ -701,8 +770,147 @@ function accountStatus(account) {
         last_dispatched_at: account.lastDispatchedAt || null,
         multi_tool_batches: account.multiToolBatchCount || 0,
         batch_size_distribution: account.batchSizeCounts || {},
+        quarantined: Boolean(account.quarantined),
     };
 }
+
+function quarantineAccount(account, reason = 'unknown', targetRootDir = null) {
+    if (!account) return null;
+    account.quarantined = true;
+    account.authUnavailable = true;
+
+    const idx = accounts.indexOf(account);
+    if (idx !== -1) {
+        accounts.splice(idx, 1);
+    }
+    if (accounts.length > 0) {
+        DS_CONFIG = accounts[0]?.config || {};
+        dsHeaders = accounts[0]?.headers || buildBaseHeaders({});
+        if (accountRoundRobin >= accounts.length) accountRoundRobin = 0;
+    } else {
+        DS_CONFIG = {};
+        dsHeaders = buildBaseHeaders({});
+    }
+
+    let quarantinedFilePath = null;
+    if (account.file && typeof account.file === 'string') {
+        try {
+            const todayStr = new Date().toISOString().slice(0, 10);
+            let repoRoot;
+            const fileDir = path.dirname(path.resolve(account.file));
+            if (targetRootDir) {
+                repoRoot = targetRootDir;
+            } else if (path.basename(fileDir) === 'accounts' || fileDir.endsWith('/accounts')) {
+                repoRoot = path.dirname(fileDir);
+            } else {
+                repoRoot = fileDir;
+            }
+            const qDir = path.join(repoRoot, `accounts-quarantined-${todayStr}`);
+            if (!fs.existsSync(qDir)) {
+                fs.mkdirSync(qDir, { recursive: true, mode: 0o700 });
+            }
+            const fileName = path.basename(account.file);
+            const targetFile = path.join(qDir, fileName);
+            if (fs.existsSync(account.file)) {
+                fs.renameSync(account.file, targetFile);
+                try { fs.chmodSync(targetFile, 0o600); } catch (e) {}
+                quarantinedFilePath = targetFile;
+            }
+            try {
+                if (fs.existsSync(fileDir)) {
+                    const dirFiles = fs.readdirSync(fileDir);
+                    const fileStem = path.basename(account.file, '.json');
+                    for (const f of dirFiles) {
+                        if (f === fileName) continue;
+                        if (f.startsWith(`${fileName}.bak`) || f.startsWith(`${fileStem}.bak`)) {
+                            const srcBak = path.join(fileDir, f);
+                            const dstBak = path.join(qDir, f);
+                            try {
+                                fs.renameSync(srcBak, dstBak);
+                                try { fs.chmodSync(dstBak, 0o600); } catch (e) {}
+                            } catch (e) {}
+                        }
+                    }
+                }
+            } catch (e) {}
+            account.file = quarantinedFilePath || targetFile;
+        } catch (e) {
+            console.error(`[DS-API] Error moving account ${account.id} to quarantine: ${e.message}`);
+        }
+    }
+
+    for (const [, s] of sessions) {
+        if (s && s.accountId === account.id) {
+            s.accountId = null;
+            s.id = null;
+            s.parentMessageId = null;
+        }
+    }
+    persistSessions();
+
+    console.warn(`[DS-API] Account ${account.id} QUARANTINED (${reason}). Moved to ${quarantinedFilePath || 'quarantine'}. Active accounts remaining: ${accounts.length}`);
+    return quarantinedFilePath;
+}
+
+function rotateAccountsOnRestart(stateFile = path.join(__dirname, '.proxy-state.json')) {
+    if (accounts.length <= 1) return null;
+    let state = { restartCount: 0, lastAccountId: null, accountOffset: 0 };
+    try {
+        if (fs.existsSync(stateFile)) {
+            const raw = fs.readFileSync(stateFile, 'utf8');
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') {
+                state.restartCount = Number(parsed.restartCount) || 0;
+                state.lastAccountId = parsed.lastAccountId || null;
+                state.accountOffset = Number(parsed.accountOffset) || 0;
+            }
+        }
+    } catch (e) {}
+
+    const canonical = accounts.slice().sort((a, b) => a.id.localeCompare(b.id));
+    let lastIdx = state.lastAccountId ? canonical.findIndex(a => a.id === state.lastAccountId) : -1;
+    if (lastIdx === -1) {
+        lastIdx = 0;
+    }
+    const nextIdx = (lastIdx + 1) % canonical.length;
+    const targetAccount = canonical[nextIdx];
+
+    const currentIdx = accounts.findIndex(a => a.id === targetAccount.id);
+    if (currentIdx > 0) {
+        const shifted = accounts.splice(0, currentIdx);
+        accounts.push(...shifted);
+    }
+
+    state.restartCount += 1;
+    state.lastAccountId = accounts[0].id;
+    state.accountOffset = nextIdx;
+
+    try {
+        const tmp = `${stateFile}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+        fs.renameSync(tmp, stateFile);
+        try { fs.chmodSync(stateFile, 0o600); } catch (e) {}
+    } catch (e) {
+        try { fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), { mode: 0o600 }); } catch (e2) {}
+    }
+
+    DS_CONFIG = accounts[0]?.config || {};
+    dsHeaders = accounts[0]?.headers || buildBaseHeaders({});
+    accountRoundRobin = nextIdx;
+
+    for (const [, s] of sessions) {
+        if (s) {
+            s.accountId = accounts[0].id;
+            s.id = null;
+            s.parentMessageId = null;
+        }
+    }
+    persistSessions();
+
+    console.log(`[DS-API] Proxy restart account rotation: switched starting account to ${accounts[0].id} (rotation #${state.restartCount}, account ${nextIdx + 1}/${accounts.length})`);
+    return state;
+}
+
 // Dynamic model discovery (round-3 G3): hourly advisory poll of
 // client/settings?scope=model. Advisory ONLY — never adds/removes aliases;
 // surfaces upstream flag flips in /health for operators. Verified 2026-09-17:
@@ -792,29 +1000,41 @@ function selectAccountForSession(session, sessionKey = '') {
         // to reset + free rotation below, exactly like cooling ones.
         const stickyOverQuota = stickyUsable && HOURLY_QUOTA > 0 && !withinQuota(sticky, now);
         const stickyOverBurst = stickyUsable && BURST_PER_MINUTE > 0 && !withinBurst(sticky, now);
-        if (stickyUsable && !stickyCooling && !stickyOverQuota && !stickyOverBurst) return sticky;
+        const stickySaturated = stickyUsable && !hasCapacity(sticky);
+        if (stickyUsable && !sticky.authUnavailable && !stickyCooling && !stickyOverQuota && !stickyOverBurst && !stickySaturated) return sticky;
+        if (stickyUsable && sticky.authUnavailable && session.id) {
+            const err = new Error(`[OpenCode Warning] Account ${sticky.id} (owner of this chat) credentials expired or invalid (HTTP 401/403). Run npm run auth-cli to renew.`);
+            err.status = 503; err.type = 'auth_unavailable';
+            throw err;
+        }
         if (stickyCooling && session.id) {
             const waitSec = Math.max(1, Math.ceil((sticky.cooldownUntil - now) / 1000));
-            const err = new Error(`Account ${sticky.id} (owner of this chat) is cooling down. Retry in ~${waitSec}s; chat preserved.`);
+            const err = new Error(`[OpenCode Warning] Account ${sticky.id} (owner of this chat) is cooling down. Retry in ~${waitSec}s; chat preserved.`);
             err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
             throw err;
         }
         if (stickyOverQuota && session.id) {
             const oldest = oldestInWindow(sticky.requestTimes, now - QUOTA_WINDOW_MS);
             const waitSec = oldest !== null ? Math.max(1, Math.ceil((oldest + QUOTA_WINDOW_MS - now) / 1000)) : 60;
-            const err = new Error(`Account ${sticky.id} (owner of this chat) spent its hourly quota (${HOURLY_QUOTA}/h). Retry in ~${waitSec}s; chat preserved.`);
+            const err = new Error(`[OpenCode Warning] Account ${sticky.id} (owner of this chat) spent its hourly quota (${HOURLY_QUOTA}/h). Retry in ~${waitSec}s; chat preserved.`);
             err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
             throw err;
         }
         // Burst mirrors quota exactly (separate knob, separate message).
         const burstErr = stickyBurstReject(sticky, session, now, BURST_PER_MINUTE, stickyOverBurst);
         if (burstErr) throw burstErr;
+        if (stickySaturated && session.id) {
+            const waitSec = saturatedWaitSec(sticky, now);
+            const err = new Error(`[OpenCode Warning] Account ${sticky.id} (owner of this chat) is at capacity limit (${Number(sticky.inflight) || 0}/${MAX_PER_ACCOUNT} in flight). Retry in ~${waitSec}s; chat preserved.`);
+            err.status = 503; err.retryAfter = waitSec; err.type = 'overloaded';
+            throw err;
+        }
         // A DeepSeek chat_session belongs to the auth account that created it.
         // If that account disappeared, lost credentials, or (for a chat-less
         // session) is cooling down, never reuse its session id under a
         // different account. If a live chat id exists, fail-fast and preserve (no new chats).
         if (session.id) {
-            const err = new Error(`Account ${session.accountId || 'unknown'} (owner of this chat) lost credentials or is unavailable; chat preserved. Run npm run auth.`);
+            const err = new Error(`[OpenCode Warning] Account ${session.accountId || 'unknown'} (owner of this chat) lost credentials or is unavailable; chat preserved. Run npm run auth-cli.`);
             err.status = 503;
             err.type = 'auth_unavailable';
             throw err;
@@ -822,29 +1042,37 @@ function selectAccountForSession(session, sessionKey = '') {
         resetRemoteSession(session);
         session.accountId = null;
     }
-    const ready = accounts.filter(a => isAccountReady(a, now));
+    const ready = accounts.filter(a => isAccountReady(a, now) && hasCapacity(a));
     if (ready.length === 0) {
-        const waiting = accounts.filter(a => a.config.token && a.config.cookie).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0];
+        const usable = accounts.filter(a => a && a.config && a.config.token && a.config.cookie);
+        const busyReady = usable.filter(a => isAccountReady(a, now) && !hasCapacity(a));
+        if (busyReady.length > 0) {
+            const minWait = Math.min(...busyReady.map(a => saturatedWaitSec(a, now)));
+            const err = new Error(`[OpenCode Warning] All ready DeepSeek accounts are at capacity limit (${MAX_PER_ACCOUNT} per account). In OpenCode: wait ~${minWait}s.`);
+            err.status = 503; err.retryAfter = minWait; err.type = 'overloaded';
+            throw err;
+        }
+        const waiting = usable.slice().sort((a, b) => (a.cooldownUntil || 0) - (b.cooldownUntil || 0))[0];
         if (waiting) {
             // Earliest availability across cooldown, quota, AND burst via the
             // shared earliestReleaseMs helper (H1/M2 — per-site math drifted).
             const releaseMs = earliestReleaseMs(now);
             if (HOURLY_QUOTA > 0) {
-                const capped = accounts.filter(a => a.config.token && a.config.cookie && !withinQuota(a, now)).map(a => a.id);
+                const capped = usable.filter(a => !withinQuota(a, now)).map(a => a.id);
                 if (capped.length > 0) logDebug(`[DS-API] hourly quota spent, sitting out: ${capped.join(',')} (quota ${HOURLY_QUOTA}/h)`);
             }
             if (BURST_PER_MINUTE > 0) {
-                const capped = accounts.filter(a => a.config.token && a.config.cookie && !withinBurst(a, now)).map(a => a.id);
+                const capped = usable.filter(a => !withinBurst(a, now)).map(a => a.id);
                 if (capped.length > 0) logDebug(`[DS-API] burst cap spent, sitting out: ${capped.join(',')} (${BURST_PER_MINUTE}/min)`);
             }
             const waitSec = Math.max(1, Math.ceil((releaseMs - now) / 1000));
             // Tagged so the request handler returns 429 + Retry-After instead of a
             // generic 500 (integrator backoff keys on the status code, not the text).
-            const err = new Error(rateLimitExhaustedMessage(waitSec) + ' Or import a fresh account with npm run auth:import.');
+            const err = new Error(rateLimitExhaustedMessage(waitSec));
             err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
             throw err;
         }
-        const noAuth = new Error('No valid DeepSeek auth accounts. Run npm run auth or npm run auth:import.');
+        const noAuth = new Error('[OpenCode Warning] No valid DeepSeek auth accounts available (none loaded, all quarantined, or unauthenticated). Run npm run auth-cli to renew or add accounts.');
         noAuth.status = 503; noAuth.type = 'no_auth';
         throw noAuth;
     }
@@ -1017,9 +1245,14 @@ function selectFreshAccount(ready) {
     return selectFreshAccountDetail(ready).account;
 }
 // Compaction-triggered rotation (Pillar 3)
-function selectCompactionTargetAccount(session, now = Date.now()) {
-    let candidates = accounts.filter(a => a && a.id !== session.accountId && isAccountReady(a, now));
-    if (candidates.length === 0) return session.accountId;
+function selectCompactionTargetAccount(session, now = Date.now(), accountList = accounts) {
+    if (Array.isArray(now)) {
+        accountList = now;
+        now = Date.now();
+    }
+    const list = Array.isArray(accountList) ? accountList : accounts;
+    let candidates = list.filter(a => a && a.id !== (session ? session.accountId : undefined) && isAccountReady(a, now) && hasCapacity(a));
+    if (candidates.length === 0) return session ? session.accountId : null;
 
     // Prefer healthy peers (consecutiveFailures === 0) if available to avoid rotating to a stricken peer
     const healthy = candidates.filter(a => (a.consecutiveFailures || 0) === 0);
@@ -1061,6 +1294,10 @@ function buildTelemetryHeaders(account) {
         'User-Agent': account.headers?.['User-Agent'] || DEFAULT_BROWSER_UA,
         'Accept': 'application/json, text/plain, */*',
         'Referer': 'https://chat.deepseek.com/',
+        'Origin': 'https://chat.deepseek.com',
+        'x-client-platform': 'web',
+        'x-client-version': '2.0.0',
+        'x-app-version': '2.0.0',
     };
     if (account.config.device_id) {
         headers['x-device-id'] = account.config.device_id;
@@ -1081,6 +1318,9 @@ function maybeTriggerAmbientTelemetry(account, now = Date.now(), fetchImpl = fet
         signal: AbortSignal.timeout(15000),
     }).then(res => {
         account.lastTelemetryStatus = res.status;
+        if (res.body && typeof res.body.cancel === 'function') {
+            try { res.body.cancel(); } catch (e) {}
+        }
         if (res.status === 401) {
             logDebug(`[telemetry:${account.id}] upstream returned 401 on /users/current`);
         }
@@ -1096,7 +1336,9 @@ if (AGENT_TURN_GAP_MS > 0 && AGENT_TURN_GAP_MS >= MIN_USABLE_UPSTREAM_MS) {
     console.log(`[DS-API] Warning: DEEPSEEK_AGENT_TURN_GAP_MS (${AGENT_TURN_GAP_MS}ms) >= DEEPSEEK_MIN_USABLE_UPSTREAM_MS (${MIN_USABLE_UPSTREAM_MS}ms); turn pacing may reject turns when remaining deadline is tight.`);
 }
 
-function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {
+function isAgentLoopTurn(arg = {}) {
+    if (!arg) return true; // Fail closed
+    const { messages, agentId, compactionReset = null } = (Array.isArray(arg) ? { messages: arg } : arg);
     if (isSharedTitleBucket(agentId) || isTitleGenerationRequest(messages)) {
         return true;
     }
@@ -1106,7 +1348,15 @@ function isAgentLoopTurn({ messages, agentId, compactionReset = null }) {
     const lastMsg = messages[messages.length - 1];
     if (!lastMsg) return true;
     if (lastMsg.role === 'tool') return true;
-    if (typeof lastMsg.content === 'string' && lastMsg.content.includes('[Tool Result]')) return true;
+    if (lastMsg.role === 'assistant' && (lastMsg.tool_calls || lastMsg.function_call)) return true;
+    if (typeof lastMsg.content === 'string' && /\[Tool Result\]/i.test(lastMsg.content)) return true;
+    if (Array.isArray(lastMsg.content)) {
+        const hasToolPart = lastMsg.content.some(part =>
+            part && (part.type === 'tool_result' || part.type === 'tool_use' ||
+            (typeof part.text === 'string' && /\[Tool Result\]/i.test(part.text)))
+        );
+        if (hasToolPart) return true;
+    }
 
     if (lastMsg.role === 'user') return false; // Genuine human turn
     return true; // Fail closed for unknown shapes
@@ -1180,11 +1430,18 @@ function markAccountFailure(account, status, reason = '', retryAfterRaw = null) 
         return;
     }
     account.consecutiveTimeouts = 0;
-    if ([401, 403, 429].includes(Number(status))) {
+    if (status === 401 || status === 403) {
+        account.authUnavailable = true;
+        account.cooldownUntil = 0;
+        account.consecutiveFailures = 0;
+        console.log(`[account:${account.id}] Auth expired/failed during ${reason || 'request'} (HTTP ${status}). Flagged as authUnavailable.`);
+        return;
+    }
+    if (Number(status) === 429) {
         // On 429, honor a valid Retry-After header (seconds or HTTP-date) when present;
         // otherwise fall back to the fixed env-configured cooldown. Clamped above
         // so a malicious/absurd value can't brick the account (8b).
-        const retryMs = Number(status) === 429 ? parseRetryAfterMs(retryAfterRaw) : null;
+        const retryMs = parseRetryAfterMs(retryAfterRaw);
         const cooldownMs = retryMs != null
             ? Math.min(retryMs, MAX_ACCOUNT_COOLDOWN_MS)
             : DEFAULT_ACCOUNT_COOLDOWN_MS;
@@ -1815,7 +2072,10 @@ async function consumeDeepSeekStream(readable, { onReasoningDone, onReasoningPro
     };
     for await (const chunk of readable) {
         if (isClientGone && isClientGone()) {
-            try { if (typeof readable.destroy === 'function') readable.destroy(); } catch (e) { }
+            try {
+                if (typeof readable.cancel === 'function') readable.cancel();
+                else if (typeof readable.destroy === 'function') readable.destroy();
+            } catch (e) { }
             return { content: '', reasoningContent: '', messageId: null, finishReason: null, modelError: null, abandoned: true };
         }
         buffer += decoder.decode(chunk, { stream: true });
@@ -1843,12 +2103,17 @@ async function askDeepSeekStream(
     agentId,
     model = 'deepseek-default',
     freshSessionPrompt = prompt,
-    { isClientGone = () => false, requestStartedAt = Date.now(), isAgentLoop = false } = {}
+    { isClientGone = () => false, requestStartedAt = Date.now(), isAgentLoop = false, existingLease = null, clientSignal = null } = {}
 ) {
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
     const hadRemoteSession = Boolean(session.id);
     const account = selectAccountForSession(session, agentId);
+    let leaseAcquired = false;
+    if (!existingLease || existingLease !== account) {
+        acquireAccountLease(account);
+        leaseAcquired = true;
+    }
     const dsHeaders = account.headers;
     account.lastUsedAt = Date.now();
     const askTurnStartedAt = Date.now();
@@ -1863,6 +2128,10 @@ async function askDeepSeekStream(
         const remainingMs = REQUEST_DEADLINE_MS - (now - requestStartedAt);
         const pacing = resolvePacingAction({ elapsedMs, remainingMs });
         if (pacing.action === 'reject') {
+            if (leaseAcquired) {
+                releaseAccountLease(account);
+                leaseAcquired = false;
+            }
             throw pacing.error;
         }
         const reservationStamp = now + (pacing.delayMs || 0);
@@ -1873,6 +2142,10 @@ async function askDeepSeekStream(
             if (isClientGone()) {
                 if (account.lastDispatchedAt === reservationStamp) {
                     account.lastDispatchedAt = prevDispatchedAt;
+                }
+                if (leaseAcquired) {
+                    releaseAccountLease(account);
+                    leaseAcquired = false;
                 }
                 throw new Error('Client disconnected during pacing interval');
             }
@@ -1893,17 +2166,15 @@ async function askDeepSeekStream(
                 if (account.lastDispatchedAt === reservationStamp) {
                     account.lastDispatchedAt = prevDispatchedAt;
                 }
+                if (leaseAcquired) {
+                    releaseAccountLease(account);
+                    leaseAcquired = false;
+                }
                 throw waitErr;
             }
         }
     }
 
-    // Per-account load signal (brief §2): incremented when an upstream call
-    // starts for this account, decremented in `finally` when it settles.
-    // A leaked counter permanently blackholes the account under scoring, so
-    // the finally below is load-bearing: it covers returns, throws, and the
-    // catch-and-rethrow path alike.
-    account.inflight = (Number(account.inflight) || 0) + 1;
     const agentTag = `[${agentId}/acct:${account.id}]`;
 
     // Rollover retired per implementor-brief-no-new-chats-2026-09-15
@@ -1918,12 +2189,18 @@ async function askDeepSeekStream(
     try {
         const cr = await dsFetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
             method: 'POST', headers: dsHeaders,
-            body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
+            body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
+            signal: clientSignal
         });
     const chalText = await cr.text();
     if (!cr.ok) {
-        markAccountFailure(account, cr.status, 'pow challenge');
-        throw new Error(`DeepSeek auth/network error while creating PoW challenge: HTTP ${cr.status}. Run npm run doctor. If auth expired, run npm run auth or npm run auth:import.`);
+        const retryAfter = cr.headers?.get ? cr.headers.get('retry-after') : null;
+        markAccountFailure(account, cr.status, 'pow challenge', retryAfter);
+        const err = new Error(`DeepSeek auth/network error while creating PoW challenge: HTTP ${cr.status}. Run npm run doctor. If auth expired, run npm run auth or npm run auth:import.`);
+        err.status = cr.status;
+        err.retryAfter = retryAfter;
+        if (cr.status === 429) err.type = 'rate_limit_error';
+        throw err;
     }
     let chalJson;
     try { chalJson = JSON.parse(chalText); }
@@ -1934,7 +2211,12 @@ async function askDeepSeekStream(
     const challenge = chalJson?.data?.biz_data?.challenge;
     if (!challenge) {
         markAccountFailure(account, cr.status, 'pow challenge missing');
-        throw new Error('DeepSeek PoW response has no data.biz_data.challenge. Auth may be expired, captcha may be required, or DeepSeek changed Web API. Run npm run doctor, then npm run auth.');
+        quarantineAccount(account, 'missing pow challenge');
+        const err = new Error('[OpenCode Warning] DeepSeek PoW challenge missing. Account has been placed in quarantine. Run npm run auth-cli to renew or restore accounts.');
+        err.status = 403;
+        err.type = 'auth_quarantined';
+        err.isQuarantined = true;
+        throw err;
     }
     // Quota clock starts here: the turn reached upstream (challenge issued),
     // whether the completion that follows succeeds or not. Earlier failures
@@ -1966,12 +2248,19 @@ async function askDeepSeekStream(
 
     if (!session.id) {
         const sr = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
-            method: 'POST', headers: dsHeaders, body: '{}'
+            method: 'POST', headers: dsHeaders, body: '{}',
+            signal: clientSignal
         });
         const { json: sessionData, text: sessionText } = await readDeepSeekJsonResponse(sr, 'session create', account);
         const createdSessionId = sessionData?.data?.biz_data?.chat_session?.id || sessionData?.data?.biz_data?.id;
         if (!sr.ok || !createdSessionId) {
-            throw new Error(`Could not create DeepSeek chat session (HTTP ${sr.status}). Auth may be expired/captcha-blocked. Run npm run doctor, then npm run auth. First chars: ${String(sessionText || '').substring(0, 120)}`);
+            const retryAfter = sr.headers?.get ? sr.headers.get('retry-after') : null;
+            markAccountFailure(account, sr.status, 'session create', retryAfter);
+            const err = new Error(`Could not create DeepSeek chat session (HTTP ${sr.status}). Auth may be expired/captcha-blocked. Run npm run doctor, then npm run auth. First chars: ${String(sessionText || '').substring(0, 120)}`);
+            err.status = sr.status;
+            err.retryAfter = retryAfter;
+            if (sr.status === 429) err.type = 'rate_limit_error';
+            throw err;
         }
         session.id = createdSessionId;
         session.accountId = account.id;
@@ -1999,7 +2288,8 @@ async function askDeepSeekStream(
             prompt: effectivePrompt, ref_file_ids: [],
             thinking_enabled: modelCfg.thinking_enabled, search_enabled: modelCfg.search_enabled,
             action: null, preempt: false,
-        })
+        }),
+        signal: clientSignal
     });
 
     // If session expired, reset and retry once
@@ -2034,6 +2324,10 @@ async function askDeepSeekStream(
     account.ewmaLatencyMs = nextEwmaLatency(account.ewmaLatencyMs, turnMs);
     return { resp, agentId, account, promptUsed: effectivePrompt, freshSessionReset: recoveredFreshSession };
     } catch (e) {
+        if (leaseAcquired) {
+            releaseAccountLease(account);
+            leaseAcquired = false;
+        }
         if (isTimeoutError(e) || e.name === 'AbortError' || /timeout|abort/i.test(e.message || '')) {
             markAccountFailure(account, 504, 'timeout / fetch abort');
             try { e._accountMarked = true; } catch (_) {}
@@ -2046,10 +2340,6 @@ async function askDeepSeekStream(
             try { e._accountMarked = true; } catch (_) {}
         }
         throw e;
-    } finally {
-        const remaining = (Number(account.inflight) || 1) - 1;
-        if (remaining < 0) console.warn(`[account:${account.id}] inflight clamp engaged (counter would go negative); floored at 0 — investigate for a leak.`);
-        account.inflight = Math.max(0, remaining);
     }
 }
 
@@ -2316,8 +2606,9 @@ function coerceToolCallObject(obj, { allowBare = false } = {}) {
     } else if (Object.prototype.hasOwnProperty.call(obj, 'function_call')) {
         candidate = obj.function_call;
     } else if (Object.prototype.hasOwnProperty.call(obj, 'tool_calls')) {
-        if (!Array.isArray(obj.tool_calls) || obj.tool_calls.length !== 1) return null;
-        candidate = obj.tool_calls[0];
+        if (!Array.isArray(obj.tool_calls) || obj.tool_calls.length === 0) return null;
+        candidate = obj.tool_calls.length === 1 ? obj.tool_calls[0] : null;
+        if (!candidate) return null;
     } else if (allowBare) {
         candidate = obj;
     }
@@ -2385,6 +2676,12 @@ function normalizeToolMarkupTags(text) {
 
 function decodeDsmlValue(value) {
     return String(value || '')
+        .replace(/&#(\d+);/g, (_, num) => {
+            try { return String.fromCodePoint(parseInt(num, 10)); } catch (e) { return _; }
+        })
+        .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+            try { return String.fromCodePoint(parseInt(hex, 16)); } catch (e) { return _; }
+        })
         .replace(/&quot;/gi, '"')
         .replace(/&apos;/gi, "'")
         .replace(/&lt;/gi, '<')
@@ -2793,21 +3090,74 @@ function parseToolCalls(text, options = {}) {
 
     let rawCalls = null;
 
-    // Primary split: newline-delimited envelopes
-    const lines = text.trim().split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    if (lines.length > 0) {
-        let allValid = true;
-        const candidateCalls = [];
-        for (const line of lines) {
-            const tc = parseToolCall(line, options);
-            if (!tc || !isNameAllowed(tc.name)) {
-                allValid = false;
-                break;
+    // Pre-pass 1: Top-level JSON arrays [{...}, {...}] and standard {"tool_calls": [...]}
+    const trimmed = text.trim();
+    let jsonCandidate = trimmed;
+    const fenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    if (fenceMatch) jsonCandidate = fenceMatch[1].trim();
+    if ((jsonCandidate.startsWith('[') && jsonCandidate.endsWith(']')) ||
+        (jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}'))) {
+        try {
+            const parsed = JSON.parse(jsonCandidate);
+            const items = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.tool_calls) ? parsed.tool_calls : null);
+            if (items && items.length > 0) {
+                const candidateCalls = [];
+                let allValid = true;
+                for (const item of items) {
+                    const tc = coerceToolCallObject(item, { allowBare: true });
+                    if (!tc || !isNameAllowed(tc.name)) { allValid = false; break; }
+                    candidateCalls.push(tc);
+                }
+                if (allValid && candidateCalls.length > 0) rawCalls = candidateCalls;
             }
-            candidateCalls.push(tc);
-        }
-        if (allValid && candidateCalls.length > 0) {
-            rawCalls = candidateCalls;
+        } catch (e) { /* fall through to scanner */ }
+    }
+
+    // Pre-pass 2: DSML multi-invoke batches inside <tool_calls>...</tool_calls>
+    if (!rawCalls && /[|｜]+\s*DSML\s*[|｜]+|[<＜]\s*\/?\s*(?:DSML)?(?:[\w.-]+:)?(?:tool[\s_-]*calls|function[\s_-]*calls|invoke)\b/i.test(text)) {
+        try {
+            const normalized = normalizeToolMarkupTags(text);
+            const scope = extractToolCallScope(normalized);
+            if (scope !== null) {
+                const tags = scanDsmlStructuralTags(scope);
+                if (tags && tags.length > 0) {
+                    const invokeOpenings = tags.filter(t => t.name === 'invoke' && !t.closing && !t.selfClosing);
+                    const invokeClosings = tags.filter(t => t.name === 'invoke' && t.closing);
+                    if (invokeOpenings.length > 1 && invokeOpenings.length === invokeClosings.length) {
+                        const candidateCalls = [];
+                        let allValid = true;
+                        for (let i = 0; i < invokeOpenings.length; i++) {
+                            const open = invokeOpenings[i];
+                            const close = invokeClosings[i];
+                            if (close.start < open.end) { allValid = false; break; }
+                            const parsed = parseDsmlInvoke(getMarkupAttribute(open.attrs, 'name'), scope.substring(open.end, close.start));
+                            if (!parsed || !isNameAllowed(parsed.name)) { allValid = false; break; }
+                            candidateCalls.push(parsed);
+                        }
+                        if (allValid && candidateCalls.length > 0) rawCalls = candidateCalls;
+                    }
+                }
+            }
+        } catch (e) { /* fall through */ }
+    }
+
+    // Primary split: newline-delimited envelopes
+    if (!rawCalls) {
+        const lines = text.trim().split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        if (lines.length > 0) {
+            let allValid = true;
+            const candidateCalls = [];
+            for (const line of lines) {
+                const tc = parseToolCall(line, options);
+                if (!tc || !isNameAllowed(tc.name)) {
+                    allValid = false;
+                    break;
+                }
+                candidateCalls.push(tc);
+            }
+            if (allValid && candidateCalls.length > 0) {
+                rawCalls = candidateCalls;
+            }
         }
     }
 
@@ -2967,7 +3317,7 @@ function buildToolCallResponse(toolCall, model = 'deepseek-default', prompt = ''
             message,
             finish_reason: 'tool_calls'
         }],
-        usage: buildUsage(prompt, '', reasoningContent),
+        usage: buildUsage(prompt, calls.map(tc => `${tc.name || ''}:${tc.arguments || ''}`).join(' '), reasoningContent),
         watermark: FORGETMEAI_WATERMARK
     };
 }
@@ -3826,6 +4176,7 @@ function finishOpenAIStream(res, openaiResp, opts = {}) {
             else try { console.log(`[think] Live-sent thinking prefix diverged at finish (sent=${liveSent.length}, clean=${cleanReasoning.length}); emitting full reasoning (possible duplicate)`); } catch (e) { }
         }
         for (let i = 0; i < tail.length; i += 50) {
+            if (!res || res.writableEnded || res.destroyed) break;
             const chunk = tail.substring(i, i + 50);
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: chunk }, finish_reason: null }] })}\n\n`);
         }
@@ -3851,6 +4202,7 @@ function finishOpenAIStream(res, openaiResp, opts = {}) {
         res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
     } else {
         for (let i = 0; i < (msg.content || '').length; i += 50) {
+            if (!res || res.writableEnded || res.destroyed) break;
             const chunk = msg.content.substring(i, i + 50);
             res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] })}\n\n`);
         }
@@ -3910,6 +4262,10 @@ function sendStreamError(res, apiMode, error) {
             writeSse(res, 'response.failed', { type: 'response.failed', response: { status: 'failed', error: { message, type } } });
         } else {
             const errPayload = {
+                id: 'err-' + Date.now(),
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: 'deepseek-chat',
                 error: { message, type },
                 choices: [{
                     index: 0,
@@ -4198,7 +4554,8 @@ function resolveRateLimitMigration(session, accountList, alreadyMigrated = false
     const list = Array.isArray(accountList) ? accountList : accounts;
     const others = list.filter(a => a
         && a.id !== (session ? session.accountId : undefined)
-        && isAccountReady(a, now));
+        && isAccountReady(a, now)
+        && hasCapacity(a));
     if (others.length === 0) return { failFast: true, reason: 'no-ready-account' };
     // Smart routing (brief §2): score-min over the ready peers via the same
     // scorer — never selectFreshAccount, which would re-impose
@@ -4595,6 +4952,7 @@ const server = http.createServer(async (req, res) => {
     const replyInflightBodyCap = () => replyCap(503, { 'Content-Type': 'application/json', 'Retry-After': '2' },
         `[DS-API] 503 global in-flight body cap (${inflightBodyBytes}/${MAX_INFLIGHT_BODY_BYTES} bytes) — rejecting ${req.socket.remoteAddress}`,
         'overloaded', 'Server busy (global upload budget exceeded). Retry shortly.');
+    const bodyChunks = [];
     req.on('data', chunk => {
         if (responded) return; // stop accumulating after a cap reply
         const len = Buffer.byteLength(chunk);
@@ -4604,7 +4962,7 @@ const server = http.createServer(async (req, res) => {
         // checks live in this one handler, both routed through `responded`.
         if (reqBytes > MAX_BODY_BYTES) { replyBodyTooLarge(); return; }
         if (inflightBodyBytes > MAX_INFLIGHT_BODY_BYTES) { replyInflightBodyCap(); return; }
-        body += chunk;
+        bodyChunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
     });
     req.on('error', (err) => {
         // Without this listener an 'error' event throws and takes the process
@@ -4615,6 +4973,7 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
         settleBody();
         if (responded) return; // a cap reply already went out; never touch inFlight
+        const body = Buffer.concat(bodyChunks).toString('utf8');
         // Re-check the gate inside `end` (§7 preferred): the arrival gate
         // raced the async body, so burst trickled POSTs would otherwise all
         // slip through. No arrival reservation (that would let slowloris
@@ -4627,7 +4986,9 @@ const server = http.createServer(async (req, res) => {
         inFlight++;
         let inFlightCounted = true;
         let clientGone = false;
-        res.on('close', () => { clientGone = true; clearKeepAlive(res); });
+        const clientAbortController = new AbortController();
+        res.on('close', () => { clientGone = true; clientAbortController.abort(); clearKeepAlive(res); });
+        let activeAccountLease = null;
         const requestStartedAt = Date.now();
         const deadlineHit = () => Date.now() - requestStartedAt > REQUEST_DEADLINE_MS;
         let activeSession = null;
@@ -4701,10 +5062,22 @@ const server = http.createServer(async (req, res) => {
                     console.log(`[DS-API] Handled title generation locally: "${title}"`);
                     const responseObj = buildTextResponse(title, messages[0]?.content || '', requestedModel);
                     if (stream) {
-                        sendOpenAIStream(res, responseObj);
+                        if (apiMode === 'anthropic') {
+                            sendAnthropicStream(res, responseObj);
+                        } else if (apiMode === 'responses') {
+                            sendResponsesStream(res, responseObj);
+                        } else {
+                            sendOpenAIStream(res, responseObj);
+                        }
                     } else {
                         res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify(responseObj));
+                        if (apiMode === 'anthropic') {
+                            res.end(JSON.stringify(toAnthropicResponse(responseObj)));
+                        } else if (apiMode === 'responses') {
+                            res.end(JSON.stringify(toResponsesResponse(responseObj)));
+                        } else {
+                            res.end(JSON.stringify(responseObj));
+                        }
                     }
                     return;
                 }
@@ -4925,7 +5298,10 @@ const server = http.createServer(async (req, res) => {
                     isClientGone: () => clientGone,
                     requestStartedAt,
                     isAgentLoop: isAgent,
+                    existingLease: activeAccountLease,
+                    clientSignal: clientAbortController.signal,
                 });
+                activeAccountLease = initialCall.account;
             } catch (e) {
                 // askDeepSeekStream already cooled the throttled account.
                 // Order: optional in-place retry first (same account+chat),
@@ -4960,9 +5336,12 @@ const server = http.createServer(async (req, res) => {
                                 isClientGone: () => clientGone,
                                 requestStartedAt,
                                 isAgentLoop: true,
+                                existingLease: activeAccountLease,
+                                clientSignal: clientAbortController.signal,
                             }));
                         if (attempt.recovered) {
                             initialCall = attempt.result;
+                            activeAccountLease = initialCall.account;
                             recoveredInPlace = true;
                             console.log(`${agentTag} in-place rate-limit retry recovered the turn`);
                         } else if (attempt.error) {
@@ -4974,9 +5353,13 @@ const server = http.createServer(async (req, res) => {
                 }
                 // Recovered turns skip everything below (initialCall is set).
                 if (!recoveredInPlace) {
-                    if (!isRateLimitError(e) || e?.isPacingReject || rateLimitMigrated || clientGone || deadlineHit()) throw e;
+                    if ((!isRateLimitError(e) && !e?.isQuarantined) || e?.isPacingReject || rateLimitMigrated || clientGone || deadlineHit()) throw e;
                     const decision = resolveRateLimitMigration(session, accounts, rateLimitMigrated);
                     if (!decision.migrateTo) throw e;
+                    if (activeAccountLease) {
+                        releaseAccountLease(activeAccountLease);
+                        activeAccountLease = null;
+                    }
                     const move = performRateLimitMigration(session, decision.migrateTo);
                     rateLimitMigrated = true;
                     const migrationBuild = rebuildMigrationFreshPrompt();
@@ -4988,8 +5371,11 @@ const server = http.createServer(async (req, res) => {
                         isClientGone: () => clientGone,
                         requestStartedAt,
                         isAgentLoop: true,
+                        existingLease: activeAccountLease,
+                        clientSignal: clientAbortController.signal,
                     });
-                    console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): rate-limit`);
+                    activeAccountLease = initialCall.account;
+                    console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): ${e?.isQuarantined ? 'quarantined-fallback' : 'rate-limit'}`);
                 }
             }
             let dsResp = initialCall.resp;
@@ -5134,6 +5520,10 @@ const server = http.createServer(async (req, res) => {
                     } }));
                     return;
                 }
+                if (activeAccountLease) {
+                    releaseAccountLease(activeAccountLease);
+                    activeAccountLease = null;
+                }
                 const move = performRateLimitMigration(session, decision.migrateTo);
                 rateLimitMigrated = true;
                 const migrationBuild = rebuildMigrationFreshPrompt();
@@ -5146,10 +5536,16 @@ const server = http.createServer(async (req, res) => {
                     isClientGone: () => clientGone,
                     requestStartedAt,
                     isAgentLoop: true,
+                    existingLease: activeAccountLease,
+                    clientSignal: clientAbortController.signal,
                 });
+                activeAccountLease = initialCall.account;
                 console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): rate-limit`);
                 dsResp = initialCall.resp;
+                pumpBase = '';
                 thinkPump.reset(); // BEFORE the read: new remote chat; the dead attempt's prefix must not suppress the fresh attempt
+                res._reasoningEmitted = false;
+                res._reasoningLiveSent = '';
                 const migratedResult = await readDeepSeekResponse(dsResp.body);
                 if (migratedResult.abandoned || clientGone) return;
                 const migratedState = normalizeRetryResponse(migratedResult);
@@ -5189,10 +5585,16 @@ const server = http.createServer(async (req, res) => {
                 console.log(`${agentTag} ${reason} (msg#${session.messageCount}, retry ${retryAttempt}/${MAX_EMPTY_RETRIES}, prompt=${retryPrompt.length} chars). Retrying in-place in same chat...`);
                 // Brief delay before retry to let DeepSeek breathe
                 await new Promise(r => setTimeout(r, Math.min(500 * retryAttempt, 1500)));
+                pumpBase = '';
+                thinkPump.reset();
+                res._reasoningEmitted = false;
+                res._reasoningLiveSent = '';
                 const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel, retryPrompt, {
                     isClientGone: () => clientGone,
                     requestStartedAt,
                     isAgentLoop: true,
+                    existingLease: activeAccountLease,
+                    clientSignal: clientAbortController.signal,
                 });
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryState = normalizeRetryResponse(retryResult);
@@ -5212,6 +5614,10 @@ const server = http.createServer(async (req, res) => {
             if (!fullContent || fullContent.trim().length === 0) {
                 const timedOut = deadlineHit();
                 const exhaustion = resolveEmptyExhaustion({ session, modelError, timedOut, retryAttempt });
+                if (isRateLimitError(modelError)) {
+                    const targetAccount = accounts.find(a => a.id === session.accountId) || initialCall?.account;
+                    if (targetAccount) coolAccountForRateLimit(targetAccount, modelError);
+                }
                 console.log(`${agentTag} ${exhaustion.type} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Preserving chat ${session.id}; giving up.`);
                 if (res.headersSent) {
                     sendStreamError(res, apiMode, { message: exhaustion.message, type: exhaustion.type });
@@ -5267,9 +5673,15 @@ const server = http.createServer(async (req, res) => {
                         isClientGone: () => clientGone,
                         requestStartedAt,
                         isAgentLoop: true,
+                        existingLease: activeAccountLease,
+                        clientSignal: clientAbortController.signal,
                     }
                 );
                 const { resp: contResp, account: contAccount } = continuationCall;
+                if (contAccount && contAccount !== activeAccountLease) {
+                    if (activeAccountLease) releaseAccountLease(activeAccountLease);
+                    activeAccountLease = contAccount;
+                }
                 // A cross-account continuation is valid only when the call
                 // detected that reset and sent the full recovery prompt. If an
                 // unexpected rotation ever bypasses that guard, restore the pre-call
@@ -5348,11 +5760,21 @@ const server = http.createServer(async (req, res) => {
                     // follows; the capped path logs and returns with no sleep.
                     await new Promise(r => setTimeout(r, 1000));
                     recordRepairAttempt(session, repairHash);
-                    const { resp: retryResp2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt, {
+                    pumpBase = '';
+                    thinkPump.reset();
+                    res._reasoningEmitted = false;
+                    res._reasoningLiveSent = '';
+                    const { resp: retryResp2, account: rAccount2 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt, {
                         isClientGone: () => clientGone,
                         requestStartedAt,
                         isAgentLoop: true,
+                        existingLease: activeAccountLease,
+                        clientSignal: clientAbortController.signal,
                     });
+                    if (rAccount2 && rAccount2 !== activeAccountLease) {
+                        if (activeAccountLease) releaseAccountLease(activeAccountLease);
+                        activeAccountLease = rAccount2;
+                    }
                     if (session.id !== retryChatId) {
                         console.log(`${agentTag} Strict retry landed on a new chat ${session.id} (was ${retryChatId}); full tools+context were resent.`);
                     }
@@ -5374,11 +5796,21 @@ const server = http.createServer(async (req, res) => {
                     const retryUnparseable = Boolean(retryContent2 && retryContent2.trim() && retryIsBrokenMarkup);
                     if (retryUnparseable && !repair.repeat && session.id === retryChatId && !clientGone && !deadlineHit()) {
                         console.log(`${agentTag} Strict retry: attempt 1 still malformed; escalating to attempt 2 in same chat.`);
-                        const { resp: retryResp3 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt, {
+                        pumpBase = '';
+                        thinkPump.reset();
+                        res._reasoningEmitted = false;
+                        res._reasoningLiveSent = '';
+                        const { resp: retryResp3, account: rAccount3 } = await askDeepSeekStream(strictPrompt, agentId, requestedModel, strictPrompt, {
                             isClientGone: () => clientGone,
                             requestStartedAt,
                             isAgentLoop: true,
+                            existingLease: activeAccountLease,
+                            clientSignal: clientAbortController.signal,
                         });
+                        if (rAccount3 && rAccount3 !== activeAccountLease) {
+                            if (activeAccountLease) releaseAccountLease(activeAccountLease);
+                            activeAccountLease = rAccount3;
+                        }
                         if (session.id !== retryChatId) {
                             console.log(`${agentTag} Strict retry landed on a new chat ${session.id} (was ${retryChatId}); full tools+context were resent.`);
                         }
@@ -5528,7 +5960,7 @@ const server = http.createServer(async (req, res) => {
             const headers = { 'Content-Type': 'application/json' };
             // Validate server-provided Retry-After (R4-C2): raw upstream
             // strings ('soon', absurd dates) must not reach clients verbatim.
-            if (status === 429 && e.retryAfter) {
+            if ((status === 429 || status === 503) && e.retryAfter) {
                 const waitMs = parseRetryAfterMs(e.retryAfter);
                 if (waitMs != null) headers['Retry-After'] = String(Math.max(1, Math.ceil(waitMs / 1000)));
             }
@@ -5556,6 +5988,10 @@ const server = http.createServer(async (req, res) => {
                 } : {}),
             } }));
         } finally {
+            if (activeAccountLease) {
+                releaseAccountLease(activeAccountLease);
+                activeAccountLease = null;
+            }
             // Every early return above that never incremented must not
             // decrement: unconditional inFlight-- drifts the counter negative
             // on 400/413/503 paths and silently disables the backpressure gate.
@@ -5633,6 +6069,7 @@ async function main() {
     // Restore the pre-restart chat map so live conversations keep their remote
     // chat (fixes silent new-chat + truncated context after every restart).
     restoreSessions();
+    rotateAccountsOnRestart();
     // Periodically evict idle sessions (unref'd so it never keeps the process alive).
     setInterval(sweepIdleSessions, 10 * 60 * 1000).unref();
     // Hourly advisory model discovery (unref'd; never breaks serving).
@@ -5808,11 +6245,20 @@ module.exports = {
         effectiveFailures,
         scoreBreakdown,
         isAccountReady,
+        hasCapacity,
+        acquireAccountLease,
+        releaseAccountLease,
+        saturatedWaitSec,
+        MAX_PER_ACCOUNT,
+        setMaxPerAccount,
+        getMaxPerAccount,
         nextEwmaLatency,
         parseModelDiscovery,
         logToken,
         countActiveHosted,
         accountStatus,
+        quarantineAccount,
+        rotateAccountsOnRestart,
         askDeepSeekStream,
         markAccountFailure,
         isProxyAuthorized,

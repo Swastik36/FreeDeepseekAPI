@@ -5,6 +5,10 @@ const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_AUTH = process.env.DEEPSEEK_AUTH_PATH || path.join(ROOT, 'deepseek-auth.json');
 
+// Single source of truth for verdict meaning: doctor never reimplements
+// classification (no local regex mapping) — probe-account.js owns it.
+const { classifyPowResponse, isQuarantineWorthy } = require('./probe-account.js');
+
 function isTruthy(v) { return /^(1|true|yes|on)$/i.test(String(v || '')); }
 function argHas(args, ...names) { return args.some(a => names.includes(a)); }
 function authPaths() {
@@ -56,14 +60,26 @@ async function liveCheck(auth) {
       method: 'POST', headers, body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
     const text = await r.text();
-    checks.push({ name: 'pow challenge', ok: r.ok && /biz_data|challenge/.test(text), status: r.status });
+    // Classify through the shared probe classifier: ALIVE requires an explicit
+    // success code (an error envelope carrying data is still dead).
+    const verdict = classifyPowResponse(r.status, text);
+    if (verdict.ok) {
+      checks.push({ name: 'pow challenge', ok: true, status: r.status });
+    } else {
+      checks.push({ name: 'pow challenge', ok: false, status: r.status, reason: verdict.reason });
+    }
   } catch (e) {
-    checks.push({ name: 'pow challenge', ok: false, error: e.message });
+    const reason = `network:${String((e && e.cause && e.cause.code) || (e && e.name) || 'fetch-failed').slice(0, 40)}`;
+    checks.push({ name: 'pow challenge', ok: false, error: e.message, reason });
   }
   return checks;
 }
 async function main(args = process.argv.slice(2)) {
   const offline = argHas(args, '--offline') || isTruthy(process.env.DOCTOR_OFFLINE);
+  // Opt-in mutation contract: without --quarantine doctor only diagnoses.
+  // With it, allowlisted dead verdicts are reported as QUARANTINE_CANDIDATE
+  // lines for auth-cli.sh to act on (all filesystem moves stay in sh).
+  const wantQuarantine = argHas(args, '--quarantine');
   console.log('FreeDeepseekAPI doctor');
   console.log(`Auth source: ${process.env.DEEPSEEK_AUTH_DIR ? 'DEEPSEEK_AUTH_DIR' : 'DEEPSEEK_AUTH_PATH/default'}`);
   const results = authPaths().map(checkAuthFile);
@@ -79,7 +95,13 @@ async function main(args = process.argv.slice(2)) {
       const checks = await liveCheck(r.auth);
       for (const c of checks) {
         if (c.ok) console.log(`  ✅ live ${c.name}: HTTP ${c.status}`);
-        else { ok = false; console.log(`  ❌ live ${c.name}: ${c.error || `HTTP ${c.status}`}`); }
+        else {
+          ok = false;
+          console.log(`  ❌ live ${c.name}: ${c.error || `HTTP ${c.status}`}`);
+          if (wantQuarantine && c.reason && isQuarantineWorthy(c.reason)) {
+            console.log(`QUARANTINE_CANDIDATE ${r.file} ${c.reason}`);
+          }
+        }
       }
     }
   }

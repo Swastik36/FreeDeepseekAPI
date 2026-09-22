@@ -98,6 +98,124 @@ probe_or_die() {
         die "$2"
     fi
 }
+probe_json() {
+    # probe_json <path> -> prints verdict JSON {ok, reason?, ms}; exit 0/1/2.
+    # The --json branch is the structured contract: check/double-tap parse
+    # .reason with node -e (never text-scrape human output).
+    node "$REPO_ROOT/scripts/probe-account.js" --json "$1"
+}
+_probe_once() {
+    # _probe_once <file> — one structured probe; sets _PV_HUMAN (display line),
+    # _PV_REASON ("" when ALIVE) and _PV_CODE (0/1/2). Returns _PV_CODE.
+    _PV_JSON=""; _PV_CODE=0; _PV_HUMAN=""; _PV_REASON=""
+    if _PV_JSON=$(probe_json "$1"); then _PV_CODE=0; else _PV_CODE=$?; fi
+    if [ "$_PV_CODE" -eq 2 ]; then return 2; fi
+    _PV_HUMAN=$(node -e 'const j=JSON.parse(process.argv[1]);console.log(j.ok?("ALIVE "+j.ms+"ms"):("DEAD "+j.reason+" "+j.ms+"ms"))' "$_PV_JSON") || return 2
+    _PV_REASON=$(node -e 'const j=JSON.parse(process.argv[1]);console.log(j.ok?"":String(j.reason||""))' "$_PV_JSON") || return 2
+    return $_PV_CODE
+}
+is_quarantine_worthy() {
+    # is_quarantine_worthy <reason> -> 0 when the reason proves credential-dead.
+    # The allowlist lives in probe-account.js (single source); sh never
+    # hardcodes its own copy of what "dead" means.
+    node -e 'try{process.exit(require(process.argv[2]+"/scripts/probe-account.js").isQuarantineWorthy(String(process.argv[1]||""))?0:1)}catch(e){process.exit(1)}' "${1:-}" "$REPO_ROOT" 2>/dev/null
+}
+auto_quarantine_on() {
+    # Default ON (unset env quarantines). Precedence: NO_QUARANTINE flag beats
+    # env; env DEEPSEEK_AUTO_QUARANTINE=0/false/no/off disables (case-insensitive
+    # 1/true/yes/on check mirrors doctor.js isTruthy).
+    if [ "${NO_QUARANTINE:-0}" = "1" ]; then return 1; fi
+    case ${DEEPSEEK_AUTO_QUARANTINE:-} in
+        ""|1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+quarantine_wanted() {
+    # 0 when a dead-worthy account should be evaluated (moved or dry-run
+    # reported). --dry-run forces evaluation so its report mirrors real logic.
+    if [ "${DRY_RUN:-0}" = "1" ]; then return 0; fi
+    auto_quarantine_on
+}
+is_non_interactive() {
+    # NON_INTERACTIVE=1/true/yes/on (case-insensitive) means non-interactive.
+    case ${NON_INTERACTIVE:-} in
+        1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+quarantine_account_file() {
+    # quarantine_account_file <json-path> <reason> — move the account plus its
+    # .bak companions into accounts-quarantined-<today>/ (0700 dir, 0600 files),
+    # mirroring server quarantineAccount: a sibling dir when the file's parent
+    # is "accounts", else inside the file's own dir. Symlinks are skipped;
+    # collisions refuse (never overwrite). Prints the undo (auth-cli.sh restore).
+    _q_src=$1 _q_reason=${2:-unknown}
+    _q_name=$(basename "$_q_src" .json)
+    if [ -L "$_q_src" ]; then info "skipped symlink: $_q_src"; return 0; fi
+    _q_parent=$(dirname "$_q_src")
+    _q_today=$(date +%F)
+    case $(basename "$_q_parent") in
+        accounts) _q_dir=$(dirname "$_q_parent")/accounts-quarantined-$_q_today ;;
+        *) _q_dir=$_q_parent/accounts-quarantined-$_q_today ;;
+    esac
+    _q_dest=$_q_dir/$_q_name.json
+    if [ -e "$_q_dest" ]; then
+        info "DEAD $_q_reason (quarantine blocked: $_q_dest already exists — likely a renewed duplicate; remove one manually)"
+        return 1
+    fi
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        info "would quarantine: $_q_name ($_q_reason) -> $_q_dir/"
+        return 0
+    fi
+    mkdir -p "$_q_dir"; chmod 700 "$_q_dir"
+    mv "$_q_src" "$_q_dest"
+    chmod 600 "$_q_dest"
+    for _q_b in "$_q_src".bak "$_q_src".bak-*; do
+        [ -e "$_q_b" ] || continue
+        [ -L "$_q_b" ] && continue
+        _q_bdest=$_q_dir/$(basename "$_q_b")
+        if [ -e "$_q_bdest" ]; then info "warning: keeping existing $_q_bdest, left ${_q_b} in quarantine"; continue; fi
+        mv "$_q_b" "$_q_bdest"
+        chmod 600 "$_q_bdest"
+    done
+    info "quarantined: $_q_name ($_q_reason) -> $_q_dir/"
+    info "undo: sh scripts/auth-cli.sh restore  # then pick $_q_name"
+    return 0
+}
+quarantine_restart_note() {
+    # After any quarantine move: offer restart on TTY only (ask_yn defaults Yes
+    # on empty input, so never prompt off-TTY); non-interactive runs log instead.
+    # Then a fresh-glob count warns when zero live accounts remain (proceeds anyway).
+    if [ -t 0 ] && ! is_non_interactive; then
+        offer_restart
+    else
+        info "restart required for quarantine to take effect: systemctl --user restart $SERVICE_NAME"
+    fi
+    _live=0
+    for _f in "$AUTH_DIR"/*.json; do
+        [ -e "$_f" ] || continue
+        case $_f in *.bak|*.bak-*) continue;; esac
+        _live=$((_live + 1))
+    done
+    if [ "$_live" -eq 0 ]; then
+        info "warning: zero live accounts remain — renew or import an account (check will keep failing until then)"
+    fi
+}
+maybe_quarantine() {
+    # maybe_quarantine <file> — double-tap + gate + move for a first DEAD
+    # verdict held in _PV_REASON. Returns 0 when a real move happened.
+    # A first DEAD allowlisted verdict triggers one immediate re-probe; the move
+    # needs two consecutive allowlisted verdicts (reasons may shift between taps).
+    if ! quarantine_wanted; then return 1; fi
+    if ! is_quarantine_worthy "$_PV_REASON"; then return 1; fi
+    if _PV2_JSON=$(probe_json "$1"); then _PV2_CODE=0; else _PV2_CODE=$?; fi
+    if [ "$_PV2_CODE" -ne 1 ]; then return 1; fi
+    _PV2_REASON=$(node -e 'const j=JSON.parse(process.argv[1]);console.log(String(j.reason||""))' "$_PV2_JSON" 2>/dev/null) || return 1
+    if ! is_quarantine_worthy "$_PV2_REASON"; then return 1; fi
+    if ! quarantine_account_file "$1" "$_PV2_REASON"; then return 1; fi
+    if [ "${DRY_RUN:-0}" = "1" ]; then return 1; fi
+    return 0
+}
 valid_device_id() {
     # valid_device_id <value> — single shared charset/length gate (L7-R2):
     # capture prompt, seed copy, and any future smoke test use one definition.
@@ -195,27 +313,99 @@ cmd_add() {
     TMP_PREFIX=""
     offer_restart
 }
+list_accounts_for_renew() {
+    _i=0
+    for _f in "$AUTH_DIR"/*.json; do
+        [ -e "$_f" ] || continue
+        case $_f in *.bak|*.bak-*) continue;; esac
+        _i=$((_i + 1))
+        printf '%d %s [live] %s\n' "$_i" "$(basename "$_f" .json)" "$_f"
+    done
+    for _d in "$REPO_ROOT"/accounts-quarantined-*; do
+        [ -d "$_d" ] || continue
+        [ -L "$_d" ] && continue
+        for _f in "$_d"/*.json; do
+            [ -e "$_f" ] || continue
+            [ -L "$_f" ] && continue
+            case $_f in *.bak|*.bak-*) continue;; esac
+            _i=$((_i + 1))
+            printf '%d %s [quarantined] %s\n' "$_i" "$(basename "$_f" .json)" "$_f"
+        done
+    done
+}
 cmd_renew() {
     _name=${1:-}
+    _src_quarantine=""
     if [ -z "$_name" ]; then
-        _name=$(pick_account "renew") || exit $?
+        TMP_PREFIX="$AUTH_DIR/.renew-$$"
+        umask 077
+        list_accounts_for_renew > "$TMP_PREFIX.renew-list"
+        _total=$(wc -l < "$TMP_PREFIX.renew-list" | tr -d ' ')
+        if [ "$_total" -eq 0 ]; then
+            rm -f "$TMP_PREFIX.renew-list"
+            TMP_PREFIX=""
+            die "no accounts in $AUTH_DIR or quarantine (use Add first)"
+        fi
+        printf 'Choose account to renew (q to cancel):\n' >&2
+        awk '{printf "  %2d. %-20s %s\n", $1, $2, $3}' "$TMP_PREFIX.renew-list" >&2
+        printf 'Number: ' >&2
+        IFS= read -r _n || true
+        case $_n in q|Q|"") rm -f "$TMP_PREFIX.renew-list"; TMP_PREFIX=""; exit 3;; esac
+        case $_n in *[!0-9]*|"") rm -f "$TMP_PREFIX.renew-list"; TMP_PREFIX=""; die "not a number: $_n";; esac
+        _line=$(awk -v n="$_n" '$1==n{print; exit}' "$TMP_PREFIX.renew-list")
+        rm -f "$TMP_PREFIX.renew-list"
+        TMP_PREFIX=""
+        [ -n "$_line" ] || die "no such number: $_n"
+        _name=$(printf '%s' "$_line" | awk '{print $2}')
+        _type=$(printf '%s' "$_line" | awk '{print $3}')
+        _src_file=$(printf '%s' "$_line" | awk '{print $4}')
+        if [ "$_type" = "[quarantined]" ]; then
+            _src_quarantine="$_src_file"
+        fi
+    else
+        _dest=$(name_to_file "$_name")
+        if [ ! -f "$_dest" ]; then
+            for _d in "$REPO_ROOT"/accounts-quarantined-*; do
+                [ -d "$_d" ] || continue
+                if [ -f "$_d/$_name.json" ]; then
+                    _src_quarantine="$_d/$_name.json"
+                    break
+                fi
+            done
+        fi
     fi
     valid_name "$_name" || die "bad name '$_name'"
     _dest=$(name_to_file "$_name")
-    [ -f "$_dest" ] || die "no such account: $_name (use Add first)"
+    if [ -z "$_src_quarantine" ] && [ ! -f "$_dest" ]; then
+        die "no such account: $_name (not in accounts/ or quarantine; use Add first)"
+    fi
     _chrome=$(resolve_chrome) || die "no Chromium found; set CHROME_PATH"
     TMP_PREFIX="$AUTH_DIR/.$_name.renew-$$"
-    info "Opening Chromium to renew '$_name' (filename never changes)..."
+    if [ -n "$_src_quarantine" ]; then
+        info "Opening Chromium to renew quarantined account '$_name' (will restore to live accounts)..."
+    else
+        info "Opening Chromium to renew '$_name' (filename never changes)..."
+    fi
     CHROME_PATH="$_chrome" DEEPSEEK_AUTH_PATH="$TMP_PREFIX.tmp" node "$REPO_ROOT/scripts/deepseek_chrome_auth.js"
     _c=$?
     if [ $_c -ne 0 ]; then
         die "login incomplete (exit $_c) — '$_name' left untouched"
     fi
-    seed_device_id "$_dest" "$TMP_PREFIX.tmp"
+    if [ -n "$_src_quarantine" ]; then
+        seed_device_id "$_src_quarantine" "$TMP_PREFIX.tmp"
+    else
+        seed_device_id "$_dest" "$TMP_PREFIX.tmp"
+    fi
     maybe_add_device_id "$TMP_PREFIX.tmp"
     info "Probing fresh credentials..."
     probe_or_die "$TMP_PREFIX.tmp" "probe says DEAD — '$_name' left untouched"
     install_staged "$TMP_PREFIX.tmp" "$_dest"
+    if [ -n "$_src_quarantine" ] && [ -f "$_src_quarantine" ]; then
+        _qdir=$(dirname "$_src_quarantine")
+        rm -f "$_src_quarantine" "$_src_quarantine.bak"* 2>/dev/null || true
+        info "restored from quarantine: $_name -> accounts/"
+        rmdir "$_qdir" 2>/dev/null || true
+    fi
     TMP_PREFIX=""
     offer_restart
 }
@@ -337,27 +527,87 @@ cmd_delete() {    _name=${1:-}
     offer_restart
 }
 cmd_check_one() {
-    # cmd_check_one <name> -> prints "<name>: <verdict>"; exit 0/1
+    # cmd_check_one <name> -> prints "<name>: <verdict>"; exit 0/1 (2 when the
+    # probe itself could not run). Single-account check has no quorum, so no
+    # circuit breaker here — double-tap only (documented asymmetry with check all).
     valid_name "$1" || die "bad name '$1'"
     _dest=$(name_to_file "$1")
     [ -f "$_dest" ] || die "no such account: $1"
-    if _out=$(probe_file "$_dest"); then _code=0; else _code=$?; fi
-    printf '%s: %s\n' "$1" "$_out"
+    if _probe_once "$_dest"; then _code=0; else _code=$?; fi
+    if [ "$_code" -eq 2 ]; then
+        printf '%s: PROBE-FAILED (unreadable?)\n' "$1"
+        return 2
+    fi
+    printf '%s: %s\n' "$1" "$_PV_HUMAN"
+    if [ "$_code" -ne 0 ] && maybe_quarantine "$_dest"; then
+        quarantine_restart_note
+    fi
     return $_code
 }
 cmd_check() {
-    _target=${1:-}
+    # cmd_check [--no-quarantine] [--dry-run] [all|<name>] — check defaults to
+    # auto-quarantine; exit 1 when any account is dead (moves never mask it).
+    NO_QUARANTINE=0; DRY_RUN=0; _target=""
+    for _a in "$@"; do
+        case $_a in
+            --no-quarantine) NO_QUARANTINE=1 ;;
+            --dry-run) DRY_RUN=1 ;;
+            --force) ;; # global, already consumed by main
+            --*) die "unknown check flag: $_a" ;;
+            *) _target=$_a ;;
+        esac
+    done
     if [ -z "$_target" ] || [ "$_target" = "all" ]; then
-        _fail=0 _i=0
+        _fail=0 _i=0 _n_verdict=0 _n_dead=0 _moved=0 _pending=""
         for _f in "$AUTH_DIR"/*.json; do
             [ -e "$_f" ] || continue
             case $_f in *.bak|*.bak-*) continue;; esac
             _i=$((_i + 1))
             _name=$(basename "$_f" .json)
-            _out=$(probe_file "$_f") || _fail=1
-            printf 'account_%d %s: %s\n' "$_i" "$_name" "$_out"
+            if _probe_once "$_f"; then _pcode=0; else _pcode=$?; fi
+            if [ "$_pcode" -eq 2 ]; then
+                printf 'account_%d %s: PROBE-FAILED (unreadable?)\n' "$_i" "$_name"
+                _fail=1
+                continue
+            fi
+            _n_verdict=$((_n_verdict + 1))
+            printf 'account_%d %s: %s\n' "$_i" "$_name" "$_PV_HUMAN"
+            if [ "$_pcode" -ne 0 ]; then
+                _fail=1
+                _n_dead=$((_n_dead + 1))
+                # Defer moves until the breaker quorum is known; confirm the
+                # double-tap now so the report mirrors real logic (incl. --dry-run).
+                if quarantine_wanted && is_quarantine_worthy "$_PV_REASON"; then
+                    if _PV2_JSON=$(probe_json "$_f"); then _PV2_CODE=0; else _PV2_CODE=$?; fi
+                    if [ "$_PV2_CODE" -eq 1 ]; then
+                        _PV2_REASON=$(node -e 'const j=JSON.parse(process.argv[1]);console.log(String(j.reason||""))' "$_PV2_JSON" 2>/dev/null) || _PV2_REASON=""
+                        if [ -n "$_PV2_REASON" ] && is_quarantine_worthy "$_PV2_REASON"; then
+                            _pending=$_pending$_f" | "$_PV2_REASON"
+"
+                        fi
+                    fi
+                fi
+            fi
         done
         [ "$_i" -gt 0 ] || die "no accounts in $AUTH_DIR"
+        if [ "$_n_verdict" -gt 0 ] && [ "$_n_dead" -eq "$_n_verdict" ]; then
+            # Mass-quarantine circuit breaker: every probed account dead is
+            # evidence of an upstream incident, not N independent deaths.
+            info "all accounts dead — suspected upstream incident; quarantined nothing"
+            return 1
+        fi
+        while IFS= read -r _pline; do
+            [ -n "$_pline" ] || continue
+            _pf=${_pline% | *}; _pr=${_pline##*| }
+            if [ "${DRY_RUN:-0}" = "1" ]; then
+                quarantine_account_file "$_pf" "$_pr" || true
+            else
+                if quarantine_account_file "$_pf" "$_pr"; then _moved=$((_moved + 1)); fi
+            fi
+        done <<EOF
+$_pending
+EOF
+        if [ "$_moved" -gt 0 ]; then quarantine_restart_note; fi
         return $_fail
     fi
     cmd_check_one "$_target"
@@ -422,7 +672,44 @@ console.log("[headers-import] staged (" + token.length + "-char token)");
     offer_restart
 }
 cmd_doctor() {
-    DEEPSEEK_AUTH_DIR="$AUTH_DIR" node "$REPO_ROOT/scripts/doctor.js"
+    # cmd_doctor [--quarantine] [--offline] — diagnose-don't-mutate by default;
+    # --quarantine opts into moving doctor-proven dead accounts (no circuit
+    # breaker here: the flag is already deliberate). doctor.js only prints
+    # QUARANTINE_CANDIDATE lines; all filesystem moves stay in sh.
+    _wantq=0 _off=""
+    for _a in "$@"; do
+        case $_a in
+            --quarantine) _wantq=1 ;;
+            --offline) _off="--offline" ;;
+            --force) ;; # global, already consumed by main
+            *) die "unknown doctor flag: $_a" ;;
+        esac
+    done
+    DRY_RUN=0
+    if [ "$_wantq" -eq 0 ]; then
+        # _off holds at most one known flag; unquoted split is intentional.
+        DEEPSEEK_AUTH_DIR="$AUTH_DIR" node "$REPO_ROOT/scripts/doctor.js" $_off
+        return $?
+    fi
+    if _doc_out=$(DEEPSEEK_AUTH_DIR="$AUTH_DIR" node "$REPO_ROOT/scripts/doctor.js" --quarantine $_off); then _doc_code=0; else _doc_code=$?; fi
+    printf '%s\n' "$_doc_out"
+    _moved=0
+    while IFS= read -r _line; do
+        case $_line in
+            "QUARANTINE_CANDIDATE "*)
+                _cand=${_line#QUARANTINE_CANDIDATE }
+                _c_reason=${_cand##* }
+                _c_file=${_cand% *}
+                [ -f "$_c_file" ] || continue
+                is_quarantine_worthy "$_c_reason" || continue
+                if quarantine_account_file "$_c_file" "$_c_reason"; then _moved=$((_moved + 1)); fi
+                ;;
+        esac
+    done <<EOF
+$_doc_out
+EOF
+    if [ "$_moved" -gt 0 ]; then quarantine_restart_note; fi
+    return $_doc_code
 }
 show_menu() {
     info ""
@@ -434,6 +721,7 @@ show_menu() {
 }
 usage() {
     printf 'usage: %s [add|renew|rename|restore|delete|check|import|doctor|restart] [name] [--force]\n' "$(basename -- "$0")" >&2
+    printf '  check [--no-quarantine] [--dry-run] [all|name]; doctor [--quarantine] [--offline]\n' >&2
     exit 2
 }
 
@@ -472,9 +760,9 @@ main() {
         rename) cmd_rename "${2:-}" "${3:-}" ;;
         restore) cmd_restore ;;
         delete) cmd_delete "${2:-}" ;;
-        check) cmd_check "${2:-all}" ;;
+        check) shift; cmd_check "$@" ;;
         import) cmd_import "${2:-}" ;;
-        doctor) cmd_doctor ;;
+        doctor) shift; cmd_doctor "$@" ;;
         restart) restart_service ;;
         -h|--help|help) usage ;;
         *) usage ;;

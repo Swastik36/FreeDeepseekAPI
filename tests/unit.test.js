@@ -101,6 +101,16 @@ function runNode(args, opts = {}) {
   });
 }
 
+function runSh(args, opts = {}) {
+  // POSIX-shell harness for auth-cli.sh (no existing shell harness in the
+  // suite): spawn 'sh scripts/auth-cli.sh ...' like an operator would.
+  return spawnSync('sh', args, {
+    cwd: ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, ...opts.env },
+  });
+}
+
 test('auth import copies valid deepseek-auth.json and chmods it to 0600', () => {
   const dir = tmpdir();
   const src = path.join(dir, 'source-auth.json');
@@ -1549,7 +1559,15 @@ test('sendStreamError OpenAI dual-shape: includes error object and choices[0].de
   let output = '';
   const res = { write: (d) => { output += d; }, end: () => {}, writableEnded: false };
   serverInternals.sendStreamError(res, 'openai', { message: 'upstream timeout', type: 'timeout_error' });
-  assert.ok(output.includes('data: {"error":{"message":"upstream timeout","type":"timeout_error"},"choices":[{"index":0,"delta":{"content":"\\n\\n[Error: upstream timeout]"},"finish_reason":"error"}]}\n\n'));
+  const lines = output.trim().split('\n\n');
+  const chunkLine = lines.find(l => l.startsWith('data: ') && !l.includes('[DONE]'));
+  assert.ok(chunkLine, 'emitted data chunk');
+  const parsed = JSON.parse(chunkLine.replace(/^data:\s*/, ''));
+  assert.equal(parsed.object, 'chat.completion.chunk');
+  assert.equal(parsed.error.message, 'upstream timeout');
+  assert.equal(parsed.error.type, 'timeout_error');
+  assert.equal(parsed.choices[0].delta.content, '\n\n[Error: upstream timeout]');
+  assert.equal(parsed.choices[0].finish_reason, 'error');
   assert.ok(output.includes('data: [DONE]\n\n'));
 });
 
@@ -2471,11 +2489,13 @@ test('performRateLimitMigration moves sticky account, resets chat scope, keeps h
 function saveRoutingEnv(t) {
   const prevPref = process.env.DEEPSEEK_PREFERRED_ACCOUNT;
   const prevMode = process.env.DEEPSEEK_ROUTING_MODE;
+  const prevMaxPerAcct = serverInternals.getMaxPerAccount();
   t.after(() => {
     if (prevPref === undefined) delete process.env.DEEPSEEK_PREFERRED_ACCOUNT;
     else process.env.DEEPSEEK_PREFERRED_ACCOUNT = prevPref;
     if (prevMode === undefined) delete process.env.DEEPSEEK_ROUTING_MODE;
     else process.env.DEEPSEEK_ROUTING_MODE = prevMode;
+    serverInternals.setMaxPerAccount(prevMaxPerAcct);
   });
 }
 
@@ -2598,6 +2618,7 @@ test('smart routing: inflight counter returns to baseline on throw paths (finall
 test('smart routing: migration target is the least-loaded ready peer via the scorer', (t) => {
   saveRoutingEnv(t);
   delete process.env.DEEPSEEK_ROUTING_MODE;
+  serverInternals.setMaxPerAccount(2);
   // Even with the busy peer named preferred, the scorer (not monopoly) decides.
   process.env.DEEPSEEK_PREFERRED_ACCOUNT = 'sr-mig-busy';
   const session = serverInternals.createSession();
@@ -3350,6 +3371,184 @@ test('retry toggle: anyAccountReady gates the retry on real readiness', () => {
   }
 });
 
+test('capacity: hasCapacity honors MAX_PER_ACCOUNT ceiling and disable floor 0', () => {
+  const prev = serverInternals.getMaxPerAccount();
+  try {
+    serverInternals.setMaxPerAccount(1);
+    assert.equal(serverInternals.hasCapacity({ inflight: 0 }), true);
+    assert.equal(serverInternals.hasCapacity({ inflight: 1 }), false);
+    assert.equal(serverInternals.hasCapacity({ inflight: 2 }), false);
+    assert.equal(serverInternals.hasCapacity(null), false, 'null fails closed');
+    assert.equal(serverInternals.hasCapacity({}), true, 'missing inflight treated as 0');
+
+    serverInternals.setMaxPerAccount(3);
+    assert.equal(serverInternals.hasCapacity({ inflight: 2 }), true);
+    assert.equal(serverInternals.hasCapacity({ inflight: 3 }), false);
+
+    // Disable ceiling with 0
+    serverInternals.setMaxPerAccount(0);
+    assert.equal(serverInternals.hasCapacity({ inflight: 100 }), true, 'disabled ceiling admits any inflight');
+  } finally {
+    serverInternals.setMaxPerAccount(prev);
+  }
+});
+
+test('capacity: saturatedWaitSec bounds delay between 2s and 10s based on EWMA', () => {
+  const now = Date.now();
+  const f = serverInternals.saturatedWaitSec;
+  // Default ewma 5000ms with 0 elapsed -> ~5s
+  assert.equal(f({ lastDispatchedAt: now, ewmaLatencyMs: 5000 }, now), 5);
+  // High latency 25000ms -> clamped to 10s ceiling
+  assert.equal(f({ lastDispatchedAt: now, ewmaLatencyMs: 25000 }, now), 10);
+  // Turn almost finished (4500ms elapsed of 5000ms) -> clamped to 2s floor
+  assert.equal(f({ lastDispatchedAt: now - 4500, ewmaLatencyMs: 5000 }, now), 2);
+});
+
+test('capacity: sticky live chat fails fast 503 on saturated account, chat-less rotates', (t) => {
+  saveRoutingEnv(t);
+  serverInternals.setMaxPerAccount(1);
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+
+  const sticky = {
+    id: 'cap-sticky',
+    config: { token: 'tok-1', cookie: 'cook-1' },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, inflight: 1, headers: {}, requestTimes: [],
+  };
+  const idle = {
+    id: 'cap-idle',
+    config: { token: 'tok-2', cookie: 'cook-2' },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, inflight: 0, headers: {}, requestTimes: [],
+  };
+  serverInternals.accounts.push(sticky, idle);
+
+  // Live session on saturated sticky account must fail fast 503 (preserve chat)
+  const live = serverInternals.createSession();
+  live.id = 'live-chat-cap';
+  live.accountId = 'cap-sticky';
+  assert.throws(
+    () => serverInternals.selectAccountForSession(live),
+    (e) => {
+      assert.equal(e.status, 503);
+      assert.equal(e.type, 'overloaded');
+      assert.ok(Number(e.retryAfter) >= 2 && Number(e.retryAfter) <= 10);
+      assert.ok(e.message.includes('capacity limit'));
+      return true;
+    },
+    'saturated sticky live chat throws 503 overloaded'
+  );
+  assert.equal(live.id, 'live-chat-cap', 'chat preserved');
+  assert.equal(live.accountId, 'cap-sticky', 'sticky account unchanged');
+
+  // Chat-less session rotates freely away from saturated sticky to idle peer
+  const chatless = serverInternals.createSession();
+  chatless.accountId = 'cap-sticky';
+  const picked = serverInternals.selectAccountForSession(chatless);
+  assert.equal(picked.id, 'cap-idle', 'chat-less rotates to available peer');
+  assert.equal(chatless.accountId, 'cap-idle');
+  assert.equal(chatless.id, null);
+});
+
+test('capacity: all accounts saturated throws 503 overloaded (not 429 rate_limit)', (t) => {
+  saveRoutingEnv(t);
+  serverInternals.setMaxPerAccount(1);
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+
+  const acct1 = {
+    id: 'sat-1',
+    config: { token: 'tok-1', cookie: 'cook-1' },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, inflight: 1, headers: {}, requestTimes: [],
+  };
+  const acct2 = {
+    id: 'sat-2',
+    config: { token: 'tok-2', cookie: 'cook-2' },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, inflight: 1, headers: {}, requestTimes: [],
+  };
+  serverInternals.accounts.push(acct1, acct2);
+
+  assert.throws(
+    () => serverInternals.selectAccountForSession(serverInternals.createSession()),
+    (e) => {
+      assert.equal(e.status, 503, 'capacity saturation is 503, not 429');
+      assert.equal(e.type, 'overloaded');
+      assert.ok(Number(e.retryAfter) >= 2 && Number(e.retryAfter) <= 10);
+      assert.ok(e.message.includes('capacity limit'));
+      assert.ok(!e.message.includes('/compact'), 'does not mislead with /compact advice');
+      return true;
+    }
+  );
+});
+
+test('capacity: mixed state (cooling + saturated) throws 503 busy wait, not 5-minute 429', (t) => {
+  saveRoutingEnv(t);
+  serverInternals.setMaxPerAccount(1);
+  const originalAccounts = serverInternals.accounts.splice(0);
+  const savedSessions = Array.from(serverInternals.sessions.entries());
+  t.after(() => {
+    serverInternals.accounts.splice(0, serverInternals.accounts.length, ...originalAccounts);
+    serverInternals.sessions.clear();
+    for (const [k, v] of savedSessions) serverInternals.sessions.set(k, v);
+  });
+  serverInternals.sessions.clear();
+
+  const coolingLong = {
+    id: 'cool-long',
+    config: { token: 'tok-1', cookie: 'cook-1' },
+    cooldownUntil: Date.now() + 300_000, failures: 1, consecutiveTimeouts: 0, inflight: 0, headers: {}, requestTimes: [],
+  };
+  const healthyBusy = {
+    id: 'healthy-busy',
+    config: { token: 'tok-2', cookie: 'cook-2' },
+    cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, inflight: 1, headers: {}, requestTimes: [],
+    ewmaLatencyMs: 3000, lastDispatchedAt: Date.now(),
+  };
+  serverInternals.accounts.push(coolingLong, healthyBusy);
+
+  assert.throws(
+    () => serverInternals.selectAccountForSession(serverInternals.createSession()),
+    (e) => {
+      assert.equal(e.status, 503, 'ready-but-saturated peer yields 503');
+      assert.equal(e.type, 'overloaded');
+      assert.ok(e.retryAfter <= 10, 'retryAfter is turn-scale (<=10s), NOT 300s cooling');
+      return true;
+    }
+  );
+});
+
+test('capacity: resolveRateLimitMigration avoids saturated peers', (t) => {
+  saveRoutingEnv(t);
+  serverInternals.setMaxPerAccount(1);
+  const session = serverInternals.createSession();
+  session.id = 'mig-chat';
+  session.accountId = 'mig-home';
+
+  const home = { id: 'mig-home', config: { token: 't', cookie: 'c' }, cooldownUntil: Date.now() + 60_000, inflight: 0 };
+  const saturatedPeer = { id: 'mig-sat', config: { token: 't', cookie: 'c' }, cooldownUntil: 0, inflight: 1 };
+  const freePeer = { id: 'mig-free', config: { token: 't', cookie: 'c' }, cooldownUntil: 0, inflight: 0 };
+
+  // Migrates to freePeer, skipping saturatedPeer
+  const d1 = serverInternals.resolveRateLimitMigration(session, [home, saturatedPeer, freePeer], false);
+  assert.equal(d1.migrateTo, 'mig-free');
+
+  // When only saturated peer exists, fails fast rather than stacking
+  const d2 = serverInternals.resolveRateLimitMigration(session, [home, saturatedPeer], false);
+  assert.equal(d2.failFast, true);
+  assert.equal(d2.reason, 'no-ready-account');
+});
+
 test('retry toggle: exhausted-429 message guides backoff + compact, keeps contract', () => {
   const msg = serverInternals.rateLimitExhaustedMessage(90);
   assert.ok(msg.includes('~90s'), 'wait time present');
@@ -3371,6 +3570,287 @@ test('probe-account: classifyPowResponse verdicts without slicing', () => {
   assert.deepEqual(c(200, ''), { ok: false, reason: 'non-json' });
   assert.deepEqual(c(401, '{}'), { ok: false, reason: 'http-401' });
   assert.equal(c(200, 'x'.repeat(500) + '{"code":0}').ok, false, 'garbage prefix is not ALIVE');
+});
+
+test('probe-account: isQuarantineWorthy allowlist (credential-dead only)', () => {
+  const { isQuarantineWorthy, classifyPowResponse } = require('../scripts/probe-account.js');
+  for (const r of ['pow-missing', 'http-401', 'http-403']) {
+    assert.equal(isQuarantineWorthy(r), true, `${r} quarantines`);
+  }
+  for (const r of ['http-429', 'http-500', 'http-503', 'non-json',
+    'network:fetch-failed', 'network:ETIMEDOUT', 'file-missing-token-or-cookie', '', undefined, null]) {
+    assert.equal(isQuarantineWorthy(r), false, `${String(r)} never quarantines`);
+  }
+  // Doctor-mapped inputs: classify verdicts feed the same allowlist.
+  assert.equal(isQuarantineWorthy(classifyPowResponse(401, '{}').reason), true);
+  assert.equal(isQuarantineWorthy(classifyPowResponse(403, '{}').reason), true);
+  assert.equal(isQuarantineWorthy(classifyPowResponse(200, '{"code":5}').reason), true);
+  assert.equal(isQuarantineWorthy(classifyPowResponse(429, '{}').reason), false);
+  assert.equal(isQuarantineWorthy(classifyPowResponse(200, 'not json').reason), false);
+});
+
+test('probe-account: --json verdict carries assertable ok/reason/ms keys', () => {
+  const dir = tmpdir();
+  const f = path.join(dir, 'tokenless.json');
+  fs.writeFileSync(f, JSON.stringify({ token: '', cookie: '' }));
+  // Tokenless short-circuits before fetch: no network touched.
+  const res = runNode(['scripts/probe-account.js', '--json', f]);
+  assert.equal(res.status, 1);
+  const v = JSON.parse(res.stdout);
+  assert.equal(v.ok, false);
+  assert.equal(typeof v.reason, 'string');
+  assert.equal(typeof v.ms, 'number');
+});
+
+// CLI quarantine-on-dead-PoW shell tests (no network): the CLI under test is a
+// copy of the current auth-cli.sh in a sandbox whose parent acts as REPO_ROOT,
+// with a stub probe-account.js whose verdicts come from a fixture "stub" field
+// (alive/dead401/dead403/deadpow/dead429/flaky). The stub re-exports the real
+// allowlist so the sh single-source contract holds. Fixture dir is NOT named
+// "accounts", so the dated quarantine dir deterministically lands inside it.
+function markerProbeStub(realProbePath) {
+  return `#!/usr/bin/env node
+const fs = require('fs');
+const real = require(${JSON.stringify(realProbePath)});
+function stubVerdict(file) {
+  const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const m = j.stub;
+  if (m === 'alive') return { ok: true, ms: 1 };
+  if (m === 'dead401') return { ok: false, reason: 'http-401', ms: 1 };
+  if (m === 'dead403') return { ok: false, reason: 'http-403', ms: 1 };
+  if (m === 'deadpow') return { ok: false, reason: 'pow-missing', ms: 1 };
+  if (m === 'dead429') return { ok: false, reason: 'http-429', ms: 1 };
+  if (m === 'flaky') {
+    const flag = (process.env.STUB_STATE || '/tmp') + '/flaky-seen';
+    if (fs.existsSync(flag)) return { ok: true, ms: 1 };
+    fs.writeFileSync(flag, 'x');
+    return { ok: false, reason: 'http-401', ms: 1 };
+  }
+  if (!j.token || !j.cookie) return { ok: false, reason: 'file-missing-token-or-cookie', ms: 0 };
+  return { ok: true, ms: 1 };
+}
+async function main(argv = process.argv.slice(2)) {
+  const asJson = argv.includes('--json');
+  const file = argv.find(a => !a.startsWith('-'));
+  let verdict;
+  try { verdict = stubVerdict(file); }
+  catch (e) { console.error('[probe] cannot read ' + file + ': ' + e.message); return 2; }
+  console.log(asJson ? JSON.stringify(verdict) : (verdict.ok ? 'ALIVE ' + verdict.ms + 'ms' : 'DEAD ' + verdict.reason + ' ' + verdict.ms + 'ms'));
+  return verdict.ok ? 0 : 1;
+}
+if (require.main === module) { main().then(c => process.exit(c)); }
+module.exports = { isQuarantineWorthy: real.isQuarantineWorthy, classifyPowResponse: real.classifyPowResponse };
+`;
+}
+
+function doctorCandidateStub() {
+  return `#!/usr/bin/env node
+// Test stub (no network): canned diagnosis with one quarantine candidate.
+const dir = process.env.DEEPSEEK_AUTH_DIR || '';
+console.log('FreeDeepseekAPI doctor');
+console.log('Auth source: DEEPSEEK_AUTH_DIR');
+console.log('');
+console.log('Auth file: ' + dir + '/a.json');
+console.log('  FAIL live pow challenge: HTTP 401');
+console.log('QUARANTINE_CANDIDATE ' + dir + '/a.json http-401');
+console.log('');
+console.log('Auth file: ' + dir + '/b.json');
+console.log('  OK live pow challenge: HTTP 200');
+process.exit(2);
+`;
+}
+
+function qcliSetup(t, { doctor = 'real' } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fdsapi-qcli-'));
+  t.after(() => { try { fs.rmSync(root, { recursive: true, force: true }); } catch (e) {} });
+  const scripts = path.join(root, 'scripts');
+  fs.mkdirSync(scripts, { recursive: true });
+  fs.copyFileSync(path.join(ROOT, 'scripts', 'auth-cli.sh'), path.join(scripts, 'auth-cli.sh'));
+  fs.writeFileSync(
+    path.join(scripts, 'probe-account.js'),
+    markerProbeStub(path.join(ROOT, 'scripts', 'probe-account.js'))
+  );
+  if (doctor === 'stub') fs.writeFileSync(path.join(scripts, 'doctor.js'), doctorCandidateStub());
+  else fs.copyFileSync(path.join(ROOT, 'scripts', 'doctor.js'), path.join(scripts, 'doctor.js'));
+  const authDir = path.join(root, 'fixture-auth');
+  fs.mkdirSync(authDir, { recursive: true });
+  const cli = path.join(scripts, 'auth-cli.sh');
+  const run = (args, env = {}) => spawnSync('sh', [cli, ...args], {
+    cwd: ROOT, encoding: 'utf8',
+    env: { ...process.env, DEEPSEEK_AUTH_DIR: authDir, NON_INTERACTIVE: '1', ...env },
+  });
+  const write = (name, obj) => {
+    const p = path.join(authDir, name);
+    fs.writeFileSync(p, JSON.stringify(obj));
+    fs.chmodSync(p, 0o600);
+    return p;
+  };
+  // Dated dir discovered by glob (never predicted: local date vs UTC can differ).
+  const qdir = () => {
+    const hit = fs.readdirSync(authDir).find(f => f.startsWith('accounts-quarantined-'));
+    return hit ? path.join(authDir, hit) : null;
+  };
+  return { root, authDir, cli, run, write, qdir };
+}
+
+test('cli quarantine: check <name> moves dead account with perms, undo and restart note', (t) => {
+  const q = qcliSetup(t);
+  q.write('solo.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  fs.writeFileSync(path.join(q.authDir, 'solo.json.bak'), 'backup');
+  const res = q.run(['check', 'solo']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1, 'exit 1 preserved on dead');
+  assert.match(out, /solo: DEAD http-401/);
+  assert.match(out, /quarantined: solo \(http-401\) -> .*accounts-quarantined-/);
+  assert.match(out, /restore/, 'undo line printed');
+  assert.match(out, /restart required for quarantine to take effect: systemctl --user restart freedeepseek\.service/);
+  assert.match(out, /zero live accounts remain/, 'fresh-glob zero-live warning');
+  assert.equal(fs.existsSync(path.join(q.authDir, 'solo.json')), false, 'moved out of live dir');
+  const qd = q.qdir();
+  assert.ok(qd, 'dated quarantine dir created inside fixture');
+  assert.equal((fs.statSync(qd).mode & 0o777), 0o700);
+  assert.equal((fs.statSync(path.join(qd, 'solo.json')).mode & 0o777), 0o600);
+  assert.equal((fs.statSync(path.join(qd, 'solo.json.bak')).mode & 0o777), 0o600, '.bak moved with 0600');
+});
+
+test('cli quarantine: check all moves only double-confirmed dead, keeps live', (t) => {
+  const q = qcliSetup(t);
+  q.write('a.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  q.write('b.json', { token: 't', cookie: 'c', stub: 'alive' });
+  const res = q.run(['check', 'all']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1);
+  assert.match(out, /account_1 a: DEAD http-401/);
+  assert.match(out, /account_2 b: ALIVE/);
+  assert.match(out, /quarantined: a \(http-401\)/);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), false);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'b.json')), true, 'live account untouched');
+  assert.ok(q.qdir(), 'quarantine dir created');
+});
+
+test('cli quarantine: double-tap spares fail-once-then-pass accounts', (t) => {
+  const q = qcliSetup(t);
+  q.write('f.json', { token: 't', cookie: 'c', stub: 'flaky' });
+  const res = q.run(['check', 'f'], { STUB_STATE: q.root });
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1, 'first verdict still DEAD, exit 1 preserved');
+  assert.match(out, /f: DEAD http-401/);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'f.json')), true, 'no move after single allowlisted verdict');
+  assert.equal(q.qdir(), null, 'no quarantine dir created');
+});
+
+test('cli quarantine: circuit breaker moves nothing when every account is dead', (t) => {
+  const q = qcliSetup(t);
+  q.write('a.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  q.write('b.json', { token: 't', cookie: 'c', stub: 'deadpow' });
+  const res = q.run(['check', 'all']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1);
+  assert.match(out, /all accounts dead — suspected upstream incident; quarantined nothing/);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), true);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'b.json')), true);
+  assert.equal(q.qdir(), null, 'breaker moved nothing');
+});
+
+test('cli quarantine: http-429 dead is never quarantine-worthy', (t) => {
+  const q = qcliSetup(t);
+  q.write('r.json', { token: 't', cookie: 'c', stub: 'dead429' });
+  const res = q.run(['check', 'r']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1);
+  assert.match(out, /r: DEAD http-429/);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'r.json')), true, 'rate-limited account stays live');
+  assert.equal(q.qdir(), null);
+});
+
+test('cli quarantine: --dry-run reports without moving', (t) => {
+  const q = qcliSetup(t);
+  q.write('a.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  const res = q.run(['check', '--dry-run', 'a']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1);
+  assert.match(out, /would quarantine: a \(http-401\)/);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), true, 'dry run moves nothing');
+  assert.equal(q.qdir(), null);
+});
+
+test('cli quarantine: --no-quarantine flag and opt-out env suppress moves', (t) => {
+  const q = qcliSetup(t);
+  q.write('a.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  let res = q.run(['check', '--no-quarantine', 'a']);
+  assert.equal(res.status, 1);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), true, 'flag suppresses move');
+  assert.equal(q.qdir(), null);
+  res = q.run(['check', 'a'], { DEEPSEEK_AUTO_QUARANTINE: '0' });
+  assert.equal(res.status, 1);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), true, 'env=0 suppresses move');
+  assert.equal(q.qdir(), null);
+  res = q.run(['check', '--dry-run', '--no-quarantine', 'a']);
+  assert.match(res.stdout + res.stderr, /would quarantine/, 'dry-run wins over --no-quarantine');
+});
+
+test('cli quarantine: collision refuses with explicit message, account stays live', (t) => {
+  const q = qcliSetup(t);
+  q.write('a.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  const qdSeeds = new Set();
+  for (const delta of [-86400000, 0, 86400000]) {
+    qdSeeds.add(new Date(Date.now() + delta).toISOString().slice(0, 10));
+  }
+  // Seed all plausible dated dirs (sh uses local date, tests see UTC).
+  const seeded = [];
+  for (const stamp of qdSeeds) {
+    const d = path.join(q.authDir, `accounts-quarantined-${stamp}`);
+    fs.mkdirSync(d, { recursive: true });
+    fs.chmodSync(d, 0o700);
+    seeded.push(d);
+  }
+  const qd = q.qdir();
+  assert.ok(qd, 'seeded quarantine dir discoverable');
+  // Block every candidate: whichever dated dir the shell computes collides.
+  for (const d of seeded) fs.writeFileSync(path.join(d, 'a.json'), JSON.stringify({ token: 'old' }));
+  const res = q.run(['check', 'a']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1);
+  assert.match(out, /quarantine blocked: .*a\.json already exists — likely a renewed duplicate; remove one manually/);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), true, 'live file untouched on collision');
+});
+
+test('cli quarantine: symlinked account files are skipped, real files still move', (t) => {
+  const q = qcliSetup(t);
+  q.write('real.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  q.write('live.json', { token: 't', cookie: 'c', stub: 'alive' });
+  fs.symlinkSync(path.join(q.authDir, 'real.json'), path.join(q.authDir, 'link.json'));
+  const res = q.run(['check', 'all']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1);
+  assert.match(out, /skipped symlink: .*link\.json/);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'live.json')), true);
+  const qd = q.qdir();
+  assert.ok(qd);
+  assert.equal(fs.existsSync(path.join(qd, 'real.json')), true, 'real dead file moved');
+});
+
+test('cli quarantine: doctor --quarantine moves only reported candidates', (t) => {
+  const q = qcliSetup(t, { doctor: 'stub' });
+  q.write('a.json', { token: 't', cookie: 'c' });
+  q.write('b.json', { token: 't', cookie: 'c' });
+  const res = q.run(['doctor', '--quarantine']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 2, 'doctor exit code unchanged by quarantine');
+  assert.match(out, /QUARANTINE_CANDIDATE .*a\.json http-401/);
+  assert.match(out, /quarantined: a \(http-401\)/);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), false, 'candidate moved');
+  assert.equal(fs.existsSync(path.join(q.authDir, 'b.json')), true, 'non-candidate stays');
+  assert.ok(q.qdir());
+});
+
+test('cli quarantine: doctor without --quarantine never moves files', (t) => {
+  const q = qcliSetup(t);
+  q.write('a.json', { token: '', cookie: '' });
+  const res = q.run(['doctor', '--offline']);
+  assert.equal(res.status, 2);
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), true);
+  assert.equal(q.qdir(), null, 'diagnose-don\'t-mutate contract holds');
 });
 
 test('smart routing: scoreAccount clamps hostedCount into [0,8]', (t) => {  saveRoutingEnv(t);
@@ -4166,6 +4646,41 @@ test('§7 backpressure re-checked at body-end; global body budget 503s', async (
   }
 });
 
+test('capacity: HTTP 503 response carries Retry-After header and overloaded type', async () => {
+  const T = serverInternals;
+  const prevKey = process.env.PROXY_API_KEY;
+  delete process.env.PROXY_API_KEY;
+  const prevMaxPerAcct = T.getMaxPerAccount();
+  const originalAccounts = T.accounts.splice(0);
+  const savedSessions = Array.from(T.sessions.entries());
+  try {
+    T.setMaxPerAccount(1);
+    T.accounts.push({
+      id: 'http-sat',
+      config: { token: 'tok', cookie: 'cook' },
+      cooldownUntil: 0, failures: 0, consecutiveTimeouts: 0, inflight: 1, headers: {}, requestTimes: [],
+    });
+    await withServer(async (port) => {
+      const r = await post(port, '/v1/chat/completions', {
+        messages: [{ role: 'user', content: 'test capacity' }],
+      });
+      assert.equal(r.status, 503, `expected 503, got ${r.status}`);
+      assert.ok(r.headers['retry-after'], 'Retry-After header must be present on 503');
+      const waitSec = Number(r.headers['retry-after']);
+      assert.ok(Number.isFinite(waitSec) && waitSec >= 2 && waitSec <= 10);
+      assert.match(r.body, /capacity limit/);
+      assert.match(r.body, /overloaded/);
+    });
+  } finally {
+    T.setMaxPerAccount(prevMaxPerAcct);
+    T.accounts.splice(0, T.accounts.length, ...originalAccounts);
+    T.sessions.clear();
+    for (const [k, v] of savedSessions) T.sessions.set(k, v);
+    if (prevKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = prevKey;
+  }
+});
+
 test('§8/H1 null-id turn commits nothing; next turn full-resends', () => {
   const T = serverInternals;
   const s = T.createSession();
@@ -4851,3 +5366,370 @@ test('two reads through one pump with base sync emit concatenated thinking exact
     .map((p) => p.choices[0].delta.reasoning_content);
   assert.equal(emitted.join('') + finishParts.join(''), thinking, 'concatenated thinking must cross exactly once, in order');
 });
+
+test('audit 1.1: acquireAccountLease and releaseAccountLease manage inflight safely with underflow protection', () => {
+  const T = serverInternals;
+  const acct = { id: 'acct_test', inflight: 0 };
+  T.acquireAccountLease(acct);
+  assert.equal(acct.inflight, 1);
+  T.acquireAccountLease(acct);
+  assert.equal(acct.inflight, 2);
+  T.releaseAccountLease(acct);
+  assert.equal(acct.inflight, 1);
+  T.releaseAccountLease(acct);
+  assert.equal(acct.inflight, 0);
+  // Underflow should not go negative
+  T.releaseAccountLease(acct);
+  assert.equal(acct.inflight, 0);
+  // Null or undefined acct safely handled
+  assert.doesNotThrow(() => T.acquireAccountLease(null));
+  assert.doesNotThrow(() => T.releaseAccountLease(null));
+});
+
+test('audit 1.2: setMaxPerAccount ignores invalid, NaN, and negative values, clamping properly', () => {
+  const T = serverInternals;
+  const prev = T.getMaxPerAccount();
+  try {
+    T.setMaxPerAccount(-1);
+    assert.equal(T.getMaxPerAccount(), prev);
+    T.setMaxPerAccount(NaN);
+    assert.equal(T.getMaxPerAccount(), prev);
+    T.setMaxPerAccount(Infinity);
+    assert.equal(T.getMaxPerAccount(), prev);
+    T.setMaxPerAccount('2');
+    assert.equal(T.getMaxPerAccount(), prev);
+    T.setMaxPerAccount(5);
+    assert.equal(T.getMaxPerAccount(), 5);
+    T.setMaxPerAccount(15);
+    assert.equal(T.getMaxPerAccount(), 10);
+    T.setMaxPerAccount(0);
+    assert.equal(T.getMaxPerAccount(), 0);
+  } finally {
+    T.setMaxPerAccount(prev);
+  }
+});
+
+test('audit 2.1: parseToolCalls extracts top-level JSON arrays and standard tool_calls envelope', () => {
+  const T = serverInternals;
+  const allowed = new Set(['read_file', 'write_file']);
+  
+  // Array of tools
+  const arrPayload = `[
+    {"name": "read_file", "arguments": "{\\"path\\": \\"foo.js\\"}"},
+    {"name": "write_file", "arguments": "{\\"path\\": \\"bar.js\\", \\"content\\": \\"hello\\"}"}
+  ]`;
+  const calls1 = T.parseToolCalls(arrPayload, { allowedToolNames: allowed });
+  assert.ok(Array.isArray(calls1));
+  assert.equal(calls1.length, 2);
+  assert.equal(calls1[0].name, 'read_file');
+  assert.equal(calls1[1].name, 'write_file');
+
+  // Standard {"tool_calls": [...]} envelope
+  const envelopePayload = JSON.stringify({
+    tool_calls: [
+      { id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"main.rs"}' } },
+      { id: 'call_2', type: 'function', function: { name: 'write_file', arguments: '{"path":"test.rs"}' } }
+    ]
+  });
+  const calls2 = T.parseToolCalls(envelopePayload, { allowedToolNames: allowed });
+  assert.ok(Array.isArray(calls2));
+  assert.equal(calls2.length, 2);
+  assert.equal(calls2[0].name, 'read_file');
+  assert.equal(calls2[1].name, 'write_file');
+});
+
+test('audit 2.1 & 2.7: parseToolCalls handles DSML batches and decodes numeric entities', () => {
+  const T = serverInternals;
+  const allowed = new Set(['edit_file', 'run_cmd']);
+  const dsml = `<tool_calls>
+<invoke name="edit_file">
+<parameter name="file">&#x2F;tmp&#x2F;test.txt</parameter>
+<parameter name="text">&#65;&#66;&#67;</parameter>
+</invoke>
+<invoke name="run_cmd">
+<parameter name="cmd">echo "done"</parameter>
+</invoke>
+</tool_calls>`;
+  const calls = T.parseToolCalls(dsml, { allowedToolNames: allowed });
+  assert.ok(Array.isArray(calls));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].name, 'edit_file');
+  const args1 = JSON.parse(calls[0].arguments);
+  assert.equal(args1.file, '/tmp/test.txt');
+  assert.equal(args1.text, 'ABC');
+  assert.equal(calls[1].name, 'run_cmd');
+});
+
+test('audit 2.2: isTitleGenerationRequest detects OpenCode title prompt shapes', () => {
+  const T = serverInternals;
+  assert.equal(T.isTitleGenerationRequest([{ role: 'user', content: 'Generate a title for this conversation: We are building an agent.' }]), true);
+  assert.equal(T.isTitleGenerationRequest([{ role: 'user', content: '  generate a title for this conversation: \nHello world' }]), true);
+  assert.equal(T.isTitleGenerationRequest([{ role: 'user', content: 'Can you help me with Python?' }]), false);
+  assert.equal(T.isTitleGenerationRequest([]), false);
+});
+
+test('audit 2.6: buildToolCallResponse accurately counts tool call token overhead', () => {
+  const T = serverInternals;
+  const tc = [
+    { id: 'call_1', name: 'search_files', arguments: JSON.stringify({ query: 'DeepSeek API Architecture' }) },
+    { id: 'call_2', name: 'read_file', arguments: JSON.stringify({ path: '/docs/architecture.md' }) },
+  ];
+  const resp = T.buildToolCallResponse(tc, 'deepseek-chat', 'Search for architecture files');
+  assert.ok(resp.usage.completion_tokens > 0, 'completion_tokens must account for tool call overhead');
+  assert.ok(resp.usage.total_tokens >= resp.usage.prompt_tokens + resp.usage.completion_tokens);
+});
+
+test('audit 3.1 & 3.4: markAccountFailure separates HTTP 401/403 auth errors from 429 rate limits', () => {
+  const T = serverInternals;
+  const acct = { id: 'acct_auth', authUnavailable: false, cooldownUntil: 0, failures: 0 };
+  
+  // 401 Unauthorized
+  T.markAccountFailure(acct, 401, 'expired token');
+  assert.equal(acct.authUnavailable, true, '401 must flag authUnavailable');
+  assert.equal(acct.cooldownUntil, 0, '401 must not trigger time-based rate-limit cooldown');
+  assert.equal(T.isAccountReady(acct), false, 'authUnavailable account must not be ready');
+
+  // Reset
+  acct.authUnavailable = false;
+  // 429 Rate Limit
+  T.markAccountFailure(acct, 429, 'rate limit hit');
+  assert.equal(acct.authUnavailable, false, '429 must not flag authUnavailable');
+  assert.ok(acct.cooldownUntil > Date.now(), '429 must set cooldown');
+});
+
+test('audit 3.2: selectCompactionTargetAccount excludes saturated peer accounts', () => {
+  const T = serverInternals;
+  const prev = T.getMaxPerAccount();
+  try {
+    T.setMaxPerAccount(1);
+    const peer1 = { id: 'peer_1', config: { token: 't1', cookie: 'c1' }, inflight: 1, cooldownUntil: 0, lastUsedAt: 100 };
+    const peer2 = { id: 'peer_2', config: { token: 't2', cookie: 'c2' }, inflight: 0, cooldownUntil: 0, lastUsedAt: 200 };
+    const selected = T.selectCompactionTargetAccount({ accountId: 'current' }, [peer1, peer2]);
+    assert.equal(selected, 'peer_2', 'peer1 is at capacity ceiling (inflight=1), so peer2 must be chosen');
+  } finally {
+    T.setMaxPerAccount(prev);
+  }
+});
+
+test('audit 3.3: isAgentLoopTurn recognizes Anthropic tool_result and compound turns', () => {
+  const T = serverInternals;
+  // Anthropic tool_result block
+  const anthropicToolResultTurn = [
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'test output' }] }
+  ];
+  assert.equal(T.isAgentLoopTurn(anthropicToolResultTurn), true);
+
+  // Anthropic tool_use block
+  const anthropicToolUseTurn = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_2', name: 'bash', input: {} }] }
+  ];
+  assert.equal(T.isAgentLoopTurn(anthropicToolUseTurn), true);
+
+  // Multimodal [Tool Result]
+  const multimodalTurn = [
+    { role: 'user', content: '[Tool Result] Command exited with code 0' }
+  ];
+  assert.equal(T.isAgentLoopTurn(multimodalTurn), true);
+
+  // Standard human prompt
+  const humanTurn = [
+    { role: 'user', content: 'What is the capital of France?' }
+  ];
+  assert.equal(T.isAgentLoopTurn(humanTurn), false);
+
+  // Empty or invalid input fails closed to true
+  assert.equal(T.isAgentLoopTurn([]), true);
+  assert.equal(T.isAgentLoopTurn(null), true);
+});
+
+test('audit 1.3: concurrent leases respect MAX_PER_ACCOUNT ceiling and fail-closed capacity', async () => {
+  const T = serverInternals;
+  const prev = T.getMaxPerAccount();
+  try {
+    T.setMaxPerAccount(2);
+    const acct = { id: 'acct_conc', config: { token: 't', cookie: 'c' }, inflight: 0 };
+    
+    // Simulate concurrent requests trying to acquire lease
+    const results = [];
+    const tasks = [1, 2, 3, 4].map(async (id) => {
+      if (T.hasCapacity(acct)) {
+        T.acquireAccountLease(acct);
+        results.push({ id, acquired: true });
+        await new Promise(r => setTimeout(r, 10));
+        T.releaseAccountLease(acct);
+        results.push({ id, released: true });
+      } else {
+        results.push({ id, acquired: false });
+      }
+    });
+
+    await Promise.all(tasks);
+    assert.equal(acct.inflight, 0, 'all acquired leases must be cleanly released to 0');
+  } finally {
+    T.setMaxPerAccount(prev);
+  }
+});
+
+test('qol 1 & 2: quarantineAccount removes account, moves file and backups, unbinds sessions', (t) => {
+  const T = serverInternals;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ds-quarantine-test-'));
+  t.after(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  });
+
+  const accDir = path.join(tmpDir, 'accounts');
+  fs.mkdirSync(accDir, { recursive: true });
+  const accFile = path.join(accDir, 'test_acc.json');
+  const bakFile = path.join(accDir, 'test_acc.json.bak');
+  fs.writeFileSync(accFile, JSON.stringify({ token: 'tok', cookie: 'cook' }), { mode: 0o600 });
+  fs.writeFileSync(bakFile, 'backup data', { mode: 0o600 });
+
+  const account = {
+    id: 'test_acc',
+    file: accFile,
+    config: { token: 'tok', cookie: 'cook' },
+    headers: {},
+  };
+  T.accounts.push(account);
+
+  const session = T.createSession();
+  session.id = 'chat_123';
+  session.accountId = 'test_acc';
+  T.sessions.set('test_agent', session);
+
+  const qPath = T.quarantineAccount(account, 'missing pow challenge', tmpDir);
+  assert.ok(qPath, 'returns quarantined file path');
+  assert.equal(fs.existsSync(accFile), false, 'original account file removed');
+  assert.equal(fs.existsSync(qPath), true, 'account file moved to quarantine');
+  assert.equal(account.quarantined, true);
+  assert.equal(account.authUnavailable, true);
+  assert.equal(T.accounts.includes(account), false, 'removed from active accounts');
+
+  // Backup file also moved
+  const expectedBak = path.join(path.dirname(qPath), 'test_acc.json.bak');
+  assert.equal(fs.existsSync(expectedBak), true, 'companion backup file moved to quarantine');
+
+  // Session unbound
+  assert.equal(session.accountId, null);
+  assert.equal(session.id, null);
+});
+
+test('qol 2: fallback migration recognizes e.isQuarantined and migrates to ready peer', () => {
+  const T = serverInternals;
+  const session = T.createSession();
+  session.accountId = 'dead_acc';
+  session.id = 'chat_old';
+
+  const readyPeer = {
+    id: 'peer_ready',
+    config: { token: 'tok', cookie: 'cook' },
+    cooldownUntil: 0,
+    inflight: 0,
+    failures: 0,
+    requestTimes: [],
+  };
+  const decision = T.resolveRateLimitMigration(session, [readyPeer], false);
+  assert.equal(decision.migrateTo, 'peer_ready');
+
+  const move = T.performRateLimitMigration(session, decision.migrateTo);
+  assert.equal(move.newAccountId, 'peer_ready');
+  assert.equal(session.accountId, 'peer_ready');
+  assert.equal(session.id, null);
+});
+
+test('qol 3: OpenCode warning formatting across rateLimitExhaustedMessage and selectAccountForSession', (t) => {
+  const T = serverInternals;
+  const originalAccounts = T.accounts.splice(0);
+  t.after(() => {
+    T.accounts.splice(0, T.accounts.length, ...originalAccounts);
+  });
+
+  const msg = T.rateLimitExhaustedMessage(45);
+  assert.ok(msg.includes('[OpenCode Warning]'));
+  assert.ok(msg.includes('~45s'));
+  assert.ok(msg.includes('/compact'));
+  assert.ok(msg.includes('npm run auth-cli'));
+
+  // When no accounts are loaded or usable: throws 503 with [OpenCode Warning]
+  assert.throws(
+    () => T.selectAccountForSession(T.createSession()),
+    (e) => {
+      assert.equal(e.status, 503);
+      assert.equal(e.type, 'no_auth');
+      assert.ok(e.message.includes('[OpenCode Warning]'));
+      assert.ok(e.message.includes('npm run auth-cli'));
+      return true;
+    }
+  );
+
+  // When all accounts cooling down: throws 429 with [OpenCode Warning]
+  const coolingAcct = {
+    id: 'cool-1',
+    config: { token: 't', cookie: 'c' },
+    cooldownUntil: Date.now() + 30000,
+    inflight: 0,
+    failures: 1,
+    requestTimes: [],
+  };
+  T.accounts.push(coolingAcct);
+  assert.throws(
+    () => T.selectAccountForSession(T.createSession()),
+    (e) => {
+      assert.equal(e.status, 429);
+      assert.equal(e.type, 'rate_limit');
+      assert.ok(e.message.includes('[OpenCode Warning]'));
+      assert.ok(e.message.includes('npm run auth-cli'));
+      return true;
+    }
+  );
+});
+
+test('qol 4: rotateAccountsOnRestart advances starting account and re-anchors sessions', (t) => {
+  const T = serverInternals;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ds-rotation-test-'));
+  const stateFile = path.join(tmpDir, '.proxy-state.json');
+  t.after(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  });
+
+  const originalAccounts = T.accounts.splice(0);
+  t.after(() => {
+    T.accounts.splice(0, T.accounts.length, ...originalAccounts);
+  });
+
+  const a1 = { id: 'acct_a', config: { token: 'tok-a', cookie: 'cook-a' }, headers: { a: 1 } };
+  const a2 = { id: 'acct_b', config: { token: 'tok-b', cookie: 'cook-b' }, headers: { b: 2 } };
+  const a3 = { id: 'acct_c', config: { token: 'tok-c', cookie: 'cook-c' }, headers: { c: 3 } };
+  T.accounts.push(a1, a2, a3);
+
+  const session = T.createSession();
+  session.id = 'chat_prev';
+  session.accountId = 'acct_a';
+  T.sessions.set('agent_opencode', session);
+
+  // Restart 1: advances to acct_b
+  const st1 = T.rotateAccountsOnRestart(stateFile);
+  assert.equal(st1.restartCount, 1);
+  assert.equal(T.accounts[0].id, 'acct_b');
+  assert.equal(session.accountId, 'acct_b', 're-anchored to new starting account');
+  assert.equal(session.id, null, 'chat id reset so opencode speaks fresh to new account');
+
+  // Restart 2: advances to acct_c
+  const st2 = T.rotateAccountsOnRestart(stateFile);
+  assert.equal(st2.restartCount, 2);
+  assert.equal(T.accounts[0].id, 'acct_c');
+  assert.equal(session.accountId, 'acct_c');
+
+  // Restart 3: wraps back to acct_a
+  const st3 = T.rotateAccountsOnRestart(stateFile);
+  assert.equal(st3.restartCount, 3);
+  assert.equal(T.accounts[0].id, 'acct_a');
+  assert.equal(session.accountId, 'acct_a');
+
+  // Verify state file persisted with 0o600
+  assert.equal(fs.existsSync(stateFile), true);
+  const rawState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  assert.equal(rawState.restartCount, 3);
+  assert.equal(rawState.lastAccountId, 'acct_a');
+});
+
