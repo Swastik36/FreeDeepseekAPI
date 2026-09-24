@@ -294,8 +294,9 @@ curl --fail \
 ```
 
 The built-in healthcheck verifies the local `/health` (whether the process is alive).
-`/readyz` additionally returns `503` if no DeepSeek auth account is currently
-ready to serve requests. Container diagnostics:
+`/readyz` additionally returns `503` when no account is eligible under the
+credential/cooldown/quota readiness predicate; it is not a capacity gauge.
+Container diagnostics:
 
 ```bash
 podman logs free-deepseek-api
@@ -330,7 +331,7 @@ npm run doctor -- --offline
 - whether the JSON is valid;
 - whether `token`, `cookie`, `wasmUrl` are present;
 - whether the file permissions are safe on macOS/Linux (`0600`);
-- on a normal run — whether the DeepSeek PoW endpoint is reachable.
+- on a normal run — whether the DeepSeek PoW endpoint is reachable (30-second timeout per account, checked sequentially).
 
 If you see `data.biz_data is null`, `fetch failed`, `401/403/429`, or Hermes/OpenCode doesn't see the models — run `npm run doctor` first.
 
@@ -342,8 +343,9 @@ FreeDeepseekAPI does not create a new DeepSeek chat for every HTTP request witho
 
 - one `x-agent-session`, `session`, or `user` → one DeepSeek chat session;
 - if the session id already exists — the proxy reuses it and continues the chain via `parent_message_id`;
-- auto-reset happens on TTL, DeepSeek session errors, or an overlong message chain;
-- local history is kept as a short context so a new DeepSeek session can continue the conversation.
+- only an explicit `/new` or reset endpoint clears a live chat; client compaction and a rate-limit migration are the two sanctioned reset paths;
+- overlapping turns for the same resolved session are rejected with `409 session_busy` rather than racing the parent cursor;
+- local history is kept as a bounded recovery summary for sanctioned fresh-chat paths;
 - long agent requests are capped by `DEEPSEEK_MAX_PROMPT_CHARS` before sending (default 80,000 chars): the task start, fresh tool results, and the tool adapter are preserved;
 - if the client already sent multi-turn history, the local recovery history is not appended a second time;
 - an empty response is retried at most `DEEPSEEK_MAX_RETRIES` times (default 2), with a shrinking context on each retry.
@@ -360,20 +362,30 @@ curl -X POST http://localhost:9655/v1/chat/completions \
 To list active sessions:
 
 ```bash
-curl http://localhost:9655/v1/sessions
+curl --fail -H "Authorization: Bearer ${PROXY_API_KEY}" \
+  http://localhost:9655/v1/sessions
 ```
 
 To reset one session:
 
 ```bash
-curl -X POST "http://localhost:9655/reset-session?agent=my-agent"
+curl --fail -X POST \
+  -H "Authorization: Bearer ${PROXY_API_KEY}" \
+  "http://localhost:9655/reset-session?agent=my-agent"
 ```
 
-To reset all sessions:
+To reset all sessions in the authenticated caller's namespace:
 
 ```bash
-curl -X POST "http://localhost:9655/reset-session?agent=all"
+curl --fail -X POST \
+  -H "Authorization: Bearer ${PROXY_API_KEY}" \
+  "http://localhost:9655/reset-session?agent=all"
 ```
+
+With `PROXY_API_KEY`, logical agent names are isolated by key principal. Without
+a key, header-selected names are intentionally disabled: loopback callers share
+the `dev-agent` bucket, while remote callers are isolated by remote IP. Reset-all
+never crosses that keyless namespace boundary.
 
 Why chats still show up in DeepSeek Web: the proxy works through the internal Web Chat API, and DeepSeek stores the real chat sessions on its side. That is normal for a web proxy. The point of session reuse is to avoid spawning new chats without need and to reset carefully only when the chain has gone stale/broken.
 
@@ -381,7 +393,7 @@ Why chats still show up in DeepSeek Web: the proxy works through the internal We
 
 ## 👥 Multi-account pool
 
-You can connect multiple auth files. The correct model: sticky account per agent/session — the proxy never switches accounts inside a live DeepSeek session. If an account gets `401/403/429` and goes into cooldown, the session is safely reset and a new request may move to another available account.
+You can connect multiple auth files. The correct model is one sticky account per agent/session: the proxy never silently switches credentials inside a live DeepSeek chat. If an account returns `401/403` or enters `429` cooldown, an existing remote chat fails fast with its owner and cursor preserved; only chat-less sessions rotate, while the explicit rate-limit migration path performs a recovery-prompt-backed move.
 
 Option 1 — a directory with auth files:
 
@@ -403,10 +415,29 @@ How the pool works:
 
 - a new agent/session gets the lowest-scoring ready account (smart routing, see below);
 - the chosen account sticks to the session (`sticky`);
-- on `401`, `403`, `429` the account goes into cooldown;
-- if a session's sticky account goes into cooldown, the old DeepSeek session is reset so it stops hammering the rate-limited/expired account;
-- account status is visible in `/health` without auth-file paths or file names;
+- HTTP `429` places the account in timed cooldown; HTTP `401`/`403` marks its credentials unavailable;
+- a live chat never moves to another credential behind the client's back: cooling, quota-spent, saturated, or auth-dead owners fail fast with the remote chat preserved; chat-less sessions may rotate;
+- authorized callers can see sanitized account status in `/health`; anonymous probes receive only liveness data unless `DEEPSEEK_PUBLIC_STATUS=1` is set;
 - auth files must be stored with `0600` permissions.
+
+Admission is bounded globally and per account:
+
+```bash
+DEEPSEEK_MAX_CONCURRENT=24 npm start    # positive integer; concurrent completion turns pool-wide
+DEEPSEEK_MAX_PER_ACCOUNT=1 npm start    # integer 0-10; 0 disables this per-account ceiling
+```
+
+A per-account lease remains held for the complete upstream turn, including token
+streaming and in-place retries. Initial/sticky admission returns a short
+`503 overloaded` response when every otherwise-ready account is at its ceiling;
+rate-limit migration uses the same classification when peers are merely busy.
+
+Unexpected runtime faults (`unhandledRejection`/`uncaughtException`) persist
+sessions and exit non-zero so systemd restarts a clean process (default on):
+
+```bash
+DEEPSEEK_FATAL_ON_UNHANDLED=0 npm start  # 0 = log-only, keep running (debugging)
+```
 
 ### Smart routing
 
@@ -513,12 +544,22 @@ Minimal safe MVP: console auth is interactive-only, no env password. An acceptab
 ## ✅ Smoke test
 
 ```bash
-curl http://localhost:9655/
-curl http://localhost:9655/v1/models
-curl http://localhost:9655/v1/model-capabilities
+curl --fail http://localhost:9655/health
+curl --fail http://localhost:9655/readyz
+curl --fail -H "Authorization: Bearer ${PROXY_API_KEY}" \
+  http://localhost:9655/v1/models
+curl --fail -H "Authorization: Bearer ${PROXY_API_KEY}" \
+  http://localhost:9655/v1/model-capabilities
 ```
 
-If all is well, `/health` returns the server status, the list of supported aliases, and `config_ready: true`.
+`/health` is a liveness probe and always returns `status: "ok"` while the
+process is running. `/readyz` is a semantic eligibility probe: it returns HTTP
+200 when at least one account has credentials and is not auth-unavailable, probe-active, cooling, or quota/burst limited. Predicate (see `isAccountReady` in server.js): `ready = has-credentials AND NOT (auth-unavailable OR probe-active OR cooling OR quota/burst-limited)`. It intentionally remains ready during normal streaming
+saturation and does not claim that a PoW WASM URL has been validated. Anonymous
+status probes omit account, model, and session details; configure
+`PROXY_API_KEY` and send `Authorization: Bearer ...` for sanitized operational
+status, or explicitly opt in with `DEEPSEEK_PUBLIC_STATUS=1` on a trusted
+network.
 
 ---
 
@@ -673,7 +714,8 @@ Search is unavailable for Expert per remote config, so `deepseek-expert-search` 
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/` or `/health` | proxy status |
+| `GET` | `/` or `/health` | proxy liveness status |
+| `GET` | `/readyz` | account eligibility (HTTP 503 when none is eligible) |
 | `GET` | `/v1/models` | list of working OpenAI-compatible aliases |
 | `GET` | `/v1/model-capabilities` | full mapping of aliases, real model, capabilities |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible Chat Completions |

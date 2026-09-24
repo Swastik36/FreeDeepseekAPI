@@ -5,9 +5,10 @@
  * Includes tool calling: injects tool definitions into system prompt,
  * parses LLM text responses for TOOL_CALL patterns, returns OpenAI tool_calls format.
  * 
- * Per-agent sessions: each unique `user` field gets its own DeepSeek web session.
- * Auto-reset: sessions reset when message chain reaches 100 messages or age > 2 hours.
- * Listens on 127.0.0.1:9655 by default (HOST is configurable)
+ * Per-agent sessions: each resolved client key gets its own DeepSeek web session.
+ * Live chats reset only through explicit /new/reset, client compaction, or the
+ * recovery-prompt-backed rate-limit migration path; idle sessions are swept.
+ * Listens on 127.0.0.1:9655 by default (HOST is configurable).
  */
 
 const http = require('http');
@@ -35,6 +36,10 @@ function numEnv(name, def, min = -Infinity, max = Infinity) {
 }
 
 const DS_FETCH_TIMEOUT_MS = numEnv('DEEPSEEK_FETCH_TIMEOUT_MS', 60000, 1);
+// Fail-fast on unexpected runtime faults: persist sessions, then exit non-zero
+// so systemd restarts a clean process. Strict 0/1 range keeps a typo from
+// silently disabling the crash path (falls back to 1 with a warning).
+const FATAL_ON_UNHANDLED = numEnv('DEEPSEEK_FATAL_ON_UNHANDLED', 1, 0, 1);
 function dsFetch(url, options = {}, timeoutMs = DS_FETCH_TIMEOUT_MS) {
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
     let signal;
@@ -188,10 +193,45 @@ function markContextCompacted(res) {
 
 // === Per-Agent Session Store ===
 const sessions = new Map();  // keyed by agent ID (from `user` field)
+// At most one inbound completion turn may mutate a conversation at a time.
+// A remote chat has a single parent cursor, so overlapping requests can create
+// duplicate chats or commit mutually inconsistent message IDs. The map is
+// request-scoped state and is intentionally never persisted.
+const activeSessionTurns = new Map();
+function acquireSessionTurn(agentId, owner) {
+    if (!agentId || activeSessionTurns.has(agentId)) return false;
+    activeSessionTurns.set(agentId, owner);
+    return true;
+}
+function rekeySessionTurn(from, to, owner) {
+    if (from === to) return activeSessionTurns.get(from) === owner;
+    if (activeSessionTurns.get(from) !== owner || activeSessionTurns.has(to)) return false;
+    activeSessionTurns.delete(from);
+    activeSessionTurns.set(to, owner);
+    return true;
+}
+function releaseSessionTurn(agentId, owner) {
+    if (agentId && activeSessionTurns.get(agentId) === owner) activeSessionTurns.delete(agentId);
+}
+function findAdoptableSession(baseAgentId, candidateId, turnMessages) {
+    if (!baseAgentId || !candidateId || sessions.has(candidateId) || !Array.isArray(turnMessages)) return null;
+    const matches = [];
+    for (const [existingId, existingSession] of sessions) {
+        if (!existingId.startsWith(`${baseAgentId}:`) || activeSessionTurns.has(existingId)) continue;
+        if (!existingSession?.id || !existingSession.deltaBoundary) continue;
+        const sent = Number(existingSession.deltaMsgCount) || 0;
+        if (sent > 0 && sent < turnMessages.length
+            && hashMessageEnvelope(turnMessages[sent - 1]) === existingSession.deltaBoundary) {
+            matches.push({ id: existingId, session: existingSession });
+        }
+    }
+    return matches.length === 1 ? matches[0] : null;
+}
 const MAX_HISTORY_LENGTH = 15;
 const MAX_HISTORY_CHARS = 10000;
-const MAX_MESSAGE_DEPTH = 100;  // auto-reset after this many messages
+const MAX_MESSAGE_DEPTH = 100;  // observability threshold; no implicit chat reset
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;  // 2 hours
+const MAX_SESSION_STORE_BYTES = 32 * 1024 * 1024;
 
 // === Session persistence (survive restarts) ===
 // A restart used to wipe the in-memory chat map, reopening every live
@@ -204,6 +244,17 @@ const SESSION_STORE_PATH = process.env.DEEPSEEK_SESSION_STORE || path.join(__dir
 
 function serializeSession(session) {
     const s = session && typeof session === 'object' ? session : {};
+    const history = [];
+    let remainingHistoryChars = MAX_HISTORY_CHARS;
+    const rawHistory = Array.isArray(s.history) ? s.history.slice(-MAX_HISTORY_LENGTH) : [];
+    for (let index = rawHistory.length - 1; index >= 0 && remainingHistoryChars > 0; index--) {
+        const entry = rawHistory[index] || {};
+        const userBudget = Math.min(1000, remainingHistoryChars);
+        const user = boundHistoryTail(entry.user, userBudget);
+        const assistant = boundHistoryText(entry.assistant, Math.max(0, remainingHistoryChars - user.length));
+        history.unshift({ user, assistant });
+        remainingHistoryChars -= user.length + assistant.length;
+    }
     return {
         id: typeof s.id === 'string' ? s.id : null,
         parentMessageId: (typeof s.parentMessageId === 'string' || Number.isFinite(s.parentMessageId)) ? s.parentMessageId : null,
@@ -214,10 +265,7 @@ function serializeSession(session) {
         // otherwise smuggle non-string fields past restore and crash readers
         // (e.g. the reset-session preview's e.user.substring) with a 500.
         // Live entries are always strings, so this is a no-op in the hot path.
-        history: Array.isArray(s.history) ? s.history.slice(-MAX_HISTORY_LENGTH).map(e => ({
-            user: typeof e?.user === 'string' ? e.user : String(e?.user ?? ''),
-            assistant: typeof e?.assistant === 'string' ? e.assistant : String(e?.assistant ?? ''),
-        })) : [],
+        history,
         lastActivityAt: typeof s.lastActivityAt === 'number' ? s.lastActivityAt : Date.now(),
         deltaMsgCount: Number(s.deltaMsgCount) || 0,
         deltaBoundary: typeof s.deltaBoundary === 'string' ? s.deltaBoundary : null,
@@ -279,13 +327,23 @@ function persistSessions(storePath = SESSION_STORE_PATH) {
 function restoreSessions(now = Date.now(), storePath = SESSION_STORE_PATH) {
     let data;
     try {
-        data = JSON.parse(fs.readFileSync(String(storePath || SESSION_STORE_PATH), 'utf8'));
+        const rawStore = fs.readFileSync(String(storePath || SESSION_STORE_PATH));
+        if (rawStore.length > MAX_SESSION_STORE_BYTES) {
+            console.warn(`[DS-API] Session store exceeds ${MAX_SESSION_STORE_BYTES} bytes; refusing to parse it.`);
+            return 0;
+        }
+        data = JSON.parse(rawStore.toString('utf8'));
     } catch (e) {
         return 0; // cold start: no store yet, or unreadable — keep serving
     }
     if (!data || !Array.isArray(data.sessions)) return 0;
     let restored = 0;
+    let droppedAtCapacity = 0;
     for (const entry of data.sessions) {
+        if (sessions.size >= MAX_SESSIONS) {
+            droppedAtCapacity++;
+            continue;
+        }
         const agentId = entry && entry[0];
         const snap = entry && entry[1];
         if (typeof agentId !== 'string' || !snap || typeof snap !== 'object') continue;
@@ -296,6 +354,7 @@ function restoreSessions(now = Date.now(), storePath = SESSION_STORE_PATH) {
         sessions.set(agentId, session);
         restored++;
     }
+    if (droppedAtCapacity > 0) console.warn(`[DS-API] restore capacity ${MAX_SESSIONS}: dropped ${droppedAtCapacity} session entr${droppedAtCapacity === 1 ? 'y' : 'ies'}`);
     if (restored > 0) console.log(`[DS-API] Restored ${restored} session(s) from ${storePath}`);
     return restored;
 }
@@ -445,7 +504,7 @@ rel = Math.max(rel, oldest + BURST_WINDOW_MS);
 function earliestReleaseMs(nowMs = Date.now()) {
     let best = Infinity;
     for (const a of accounts) {
-        if (!(a.config.token && a.config.cookie)) continue;
+        if (!(a && a.config && a.config.token && a.config.cookie) || a.authUnavailable) continue;
         const rel = accountReleaseMs(a, nowMs);
         if (rel < best) best = rel;
     }
@@ -457,9 +516,9 @@ function earliestReleaseMs(nowMs = Date.now()) {
 const RETRY_RATELIMIT = isTruthy(process.env.DEEPSEEK_RETRY_RATELIMIT);
 const RATELIMIT_RETRY_BASE_MS = 2000;
 const RATELIMIT_RETRY_MAX_MS = 10000;
-function rateLimitRetryDelayMs(retryAfterSec) {
-    const honored = Math.max(0, Number(retryAfterSec) || 0) * 1000;
-    return Math.min(Math.max(RATELIMIT_RETRY_BASE_MS, honored), RATELIMIT_RETRY_MAX_MS);
+function rateLimitRetryDelayMs(retryAfterRaw) {
+    const honoredMs = parseRetryAfterMs(retryAfterRaw);
+    return Math.min(Math.max(RATELIMIT_RETRY_BASE_MS, honoredMs || 0), RATELIMIT_RETRY_MAX_MS);
 }
 // Shared fail-fast wording (graceful degradation, not a bare error): keeps the
 // 429 status + Retry-After contract integrators back off on, while telling the
@@ -473,11 +532,13 @@ function rateLimitExhaustedMessage(waitSec) {
 // Retry-After gets one optimistic probe, brief backoffs (<= cap) are worth the
 // wait, long backoffs go straight to migration (waiting out minutes in-request
 // burns the deadline and the client's patience).
-function shouldAttemptInPlaceRetry(retryAfterSec) {
-    if (retryAfterSec === undefined || retryAfterSec === null || retryAfterSec === '') return true;
-    const secs = Number(retryAfterSec);
-    if (!Number.isFinite(secs) || secs < 0) return true;
-    return secs * 1000 <= RATELIMIT_RETRY_MAX_MS;
+function shouldAttemptInPlaceRetry(retryAfterRaw) {
+    if (retryAfterRaw === undefined || retryAfterRaw === null || retryAfterRaw === '') return true;
+    const retryAfterMs = parseRetryAfterMs(retryAfterRaw);
+    // Unknown values retain the historical optimistic probe. A valid HTTP-date
+    // or delta-seconds value must never be downgraded to an immediate retry.
+    if (retryAfterMs == null) return true;
+    return retryAfterMs <= RATELIMIT_RETRY_MAX_MS;
 }
 // Full gate for the in-place retry branch, extracted pure so the wiring ("skip
 // when all cooling, skip long backoffs, default off") is unit-testable without
@@ -519,7 +580,7 @@ function isAccountReady(a, nowMs = Date.now()) {
 // Account must possess credentials, and must NOT be blocked by hourly quota or burst cap.
 // Note: cooldownUntil is explicitly NOT checked here because inPlaceRateLimitRetry lifts cooldown once.
 function isRetryAccountEligible(a, nowMs = Date.now()) {
-    return !!(a && a.config && a.config.token && a.config.cookie && withinQuota(a, nowMs) && withinBurst(a, nowMs));
+    return !!(a && a.config && a.config.token && a.config.cookie && !a.authUnavailable && withinQuota(a, nowMs) && withinBurst(a, nowMs));
 }
 // Readiness pre-filter shared by the retry gate: true when at least one
 // account passes the shared predicate. Exported for tests.
@@ -610,7 +671,7 @@ let inFlight = 0;  // concurrent in-flight completions (backpressure cap)
 // loops), max concurrent completions, and the empty-response retry cap.
 const REQUEST_DEADLINE_MS = numEnv('DEEPSEEK_REQUEST_DEADLINE_MS', 120000, 1000);
 const MAX_CONCURRENT = Math.max(1, Math.floor(numEnv('DEEPSEEK_MAX_CONCURRENT', 24, 1)));
-let MAX_PER_ACCOUNT = numEnv('DEEPSEEK_MAX_PER_ACCOUNT', 1, 0, 10);
+let MAX_PER_ACCOUNT = Math.floor(numEnv('DEEPSEEK_MAX_PER_ACCOUNT', 1, 0, 10));
 function getMaxPerAccount() { return MAX_PER_ACCOUNT; }
 function setMaxPerAccount(n) {
     if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
@@ -634,6 +695,18 @@ function releaseAccountLease(account) {
         console.warn(`[account:${account.id}] inflight clamp engaged (counter would go negative); floored at 0 — investigate for a leak.`);
     }
     account.inflight = Math.max(0, remaining);
+}
+
+// Rotation lease swap: askDeepSeekStream acquires the new account's lease
+// internally when it rotates, so the caller must release the lease it holds
+// and adopt the rotated one — otherwise the old lease leaks and pool
+// capacity shrinks. Returns the lease the caller must hold afterwards.
+function applyLeaseRotation(activeLease, rotatedAccount) {
+    if (rotatedAccount && rotatedAccount !== activeLease) {
+        if (activeLease) releaseAccountLease(activeLease);
+        return rotatedAccount;
+    }
+    return activeLease;
 }
 
 // Per-account capacity ceiling: admits new turns on an account only when its
@@ -752,7 +825,8 @@ function hasAuthConfig() { return accounts.some(a => a.config.token && a.config.
 function accountStatus(account) {
     return {
         id: account.id,
-        ready: !!(account.config.token && account.config.cookie),
+        ready: isAccountReady(account),
+        auth_unavailable: Boolean(account.authUnavailable),
         cooldown: account.cooldownUntil > Date.now(),
         cooldown_remaining_sec: Math.max(0, Math.ceil((account.cooldownUntil - Date.now()) / 1000)),
         failures: account.failures,
@@ -812,9 +886,15 @@ function quarantineAccount(account, reason = 'unknown', targetRootDir = null) {
             const fileName = path.basename(account.file);
             const targetFile = path.join(qDir, fileName);
             if (fs.existsSync(account.file)) {
-                fs.renameSync(account.file, targetFile);
-                try { fs.chmodSync(targetFile, 0o600); } catch (e) {}
-                quarantinedFilePath = targetFile;
+                if (fs.existsSync(targetFile)) {
+                    // Collision: never overwrite another quarantined credential
+                    // (auth-cli.sh contract); the account stays out of the pool.
+                    console.error(`[DS-API] Quarantine refused for ${account.id}: ${targetFile} already exists; left ${account.file} in place.`);
+                } else {
+                    fs.renameSync(account.file, targetFile);
+                    try { fs.chmodSync(targetFile, 0o600); } catch (e) {}
+                    quarantinedFilePath = targetFile;
+                }
             }
             try {
                 if (fs.existsSync(fileDir)) {
@@ -825,6 +905,8 @@ function quarantineAccount(account, reason = 'unknown', targetRootDir = null) {
                         if (f.startsWith(`${fileName}.bak`) || f.startsWith(`${fileStem}.bak`)) {
                             const srcBak = path.join(fileDir, f);
                             const dstBak = path.join(qDir, f);
+                            // Collision: keep the existing file, leave src in place (auth-cli.sh contract).
+                            if (fs.existsSync(dstBak)) continue;
                             try {
                                 fs.renameSync(srcBak, dstBak);
                                 try { fs.chmodSync(dstBak, 0o600); } catch (e) {}
@@ -833,7 +915,7 @@ function quarantineAccount(account, reason = 'unknown', targetRootDir = null) {
                     }
                 }
             } catch (e) {}
-            account.file = quarantinedFilePath || targetFile;
+            account.file = quarantinedFilePath || account.file;
         } catch (e) {
             console.error(`[DS-API] Error moving account ${account.id} to quarantine: ${e.message}`);
         }
@@ -898,16 +980,10 @@ function rotateAccountsOnRestart(stateFile = path.join(__dirname, '.proxy-state.
     dsHeaders = accounts[0]?.headers || buildBaseHeaders({});
     accountRoundRobin = nextIdx;
 
-    for (const [, s] of sessions) {
-        if (s) {
-            s.accountId = accounts[0].id;
-            s.id = null;
-            s.parentMessageId = null;
-        }
-    }
-    persistSessions();
-
-    console.log(`[DS-API] Proxy restart account rotation: switched starting account to ${accounts[0].id} (rotation #${state.restartCount}, account ${nextIdx + 1}/${accounts.length})`);
+    // Rotation changes selection order for NEW chats only. Restored sessions
+    // retain accountId + remote IDs: moving a live chat to another credential
+    // is both invalid upstream and a silent context split.
+    console.log(`[DS-API] Proxy restart account rotation: switched starting account to ${accounts[0].id} (rotation #${state.restartCount}, account ${nextIdx + 1}/${accounts.length}); restored chats unchanged`);
     return state;
 }
 
@@ -980,7 +1056,7 @@ function startModelDiscovery() {
     refreshDiscoveredModels().catch(() => {});
     setInterval(() => { refreshDiscoveredModels().catch(() => {}); }, MODEL_DISCOVERY_MS).unref();
 }
-function selectAccountForSession(session, sessionKey = '') {
+function selectAccountForSession(session, sessionKey = '', existingLease = null) {
     const now = Date.now();
     if (session.accountId) {
         const sticky = accounts.find(a => a.id === session.accountId);
@@ -1000,7 +1076,8 @@ function selectAccountForSession(session, sessionKey = '') {
         // to reset + free rotation below, exactly like cooling ones.
         const stickyOverQuota = stickyUsable && HOURLY_QUOTA > 0 && !withinQuota(sticky, now);
         const stickyOverBurst = stickyUsable && BURST_PER_MINUTE > 0 && !withinBurst(sticky, now);
-        const stickySaturated = stickyUsable && !hasCapacity(sticky);
+        const ownsStickyLease = Boolean(existingLease && sticky === existingLease);
+        const stickySaturated = stickyUsable && !ownsStickyLease && !hasCapacity(sticky);
         if (stickyUsable && !sticky.authUnavailable && !stickyCooling && !stickyOverQuota && !stickyOverBurst && !stickySaturated) return sticky;
         if (stickyUsable && sticky.authUnavailable && session.id) {
             const err = new Error(`[OpenCode Warning] Account ${sticky.id} (owner of this chat) credentials expired or invalid (HTTP 401/403). Run npm run auth-cli to renew.`);
@@ -1042,35 +1119,44 @@ function selectAccountForSession(session, sessionKey = '') {
         resetRemoteSession(session);
         session.accountId = null;
     }
-    const ready = accounts.filter(a => isAccountReady(a, now) && hasCapacity(a));
+    const ready = accounts.filter(a => (a === existingLease || (isAccountReady(a, now) && hasCapacity(a))));
     if (ready.length === 0) {
-        const usable = accounts.filter(a => a && a.config && a.config.token && a.config.cookie);
-        const busyReady = usable.filter(a => isAccountReady(a, now) && !hasCapacity(a));
-        if (busyReady.length > 0) {
-            const minWait = Math.min(...busyReady.map(a => saturatedWaitSec(a, now)));
+        const credentialed = accounts.filter(a => a && a.config && a.config.token && a.config.cookie);
+        const authValid = credentialed.filter(a => !a.authUnavailable);
+        const busyReady = authValid.filter(a => isAccountReady(a, now) && !hasCapacity(a));
+        const probeActive = authValid.some(a => a.isProbeActive);
+        if (busyReady.length > 0 || probeActive) {
+            const minWait = busyReady.length > 0
+                ? Math.min(...busyReady.map(a => saturatedWaitSec(a, now)))
+                : 2;
             const err = new Error(`[OpenCode Warning] All ready DeepSeek accounts are at capacity limit (${MAX_PER_ACCOUNT} per account). In OpenCode: wait ~${minWait}s.`);
             err.status = 503; err.retryAfter = minWait; err.type = 'overloaded';
             throw err;
         }
-        const waiting = usable.slice().sort((a, b) => (a.cooldownUntil || 0) - (b.cooldownUntil || 0))[0];
-        if (waiting) {
+        const waiting = authValid.filter(a => !isAccountReady(a, now));
+        if (waiting.length > 0) {
             // Earliest availability across cooldown, quota, AND burst via the
             // shared earliestReleaseMs helper (H1/M2 — per-site math drifted).
             const releaseMs = earliestReleaseMs(now);
             if (HOURLY_QUOTA > 0) {
-                const capped = usable.filter(a => !withinQuota(a, now)).map(a => a.id);
+                const capped = waiting.filter(a => !withinQuota(a, now)).map(a => a.id);
                 if (capped.length > 0) logDebug(`[DS-API] hourly quota spent, sitting out: ${capped.join(',')} (quota ${HOURLY_QUOTA}/h)`);
             }
             if (BURST_PER_MINUTE > 0) {
-                const capped = usable.filter(a => !withinBurst(a, now)).map(a => a.id);
+                const capped = waiting.filter(a => !withinBurst(a, now)).map(a => a.id);
                 if (capped.length > 0) logDebug(`[DS-API] burst cap spent, sitting out: ${capped.join(',')} (${BURST_PER_MINUTE}/min)`);
             }
-            const waitSec = Math.max(1, Math.ceil((releaseMs - now) / 1000));
-            // Tagged so the request handler returns 429 + Retry-After instead of a
-            // generic 500 (integrator backoff keys on the status code, not the text).
+            const waitSec = Number.isFinite(releaseMs)
+                ? Math.max(1, Math.ceil((releaseMs - now) / 1000))
+                : 60;
             const err = new Error(rateLimitExhaustedMessage(waitSec));
             err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
             throw err;
+        }
+        if (credentialed.length > 0) {
+            const authErr = new Error('[OpenCode Warning] DeepSeek credentials are unavailable (HTTP 401/403 observed). Run npm run auth-cli to renew or restore accounts.');
+            authErr.status = 503; authErr.type = 'auth_unavailable';
+            throw authErr;
         }
         const noAuth = new Error('[OpenCode Warning] No valid DeepSeek auth accounts available (none loaded, all quarantined, or unauthenticated). Run npm run auth-cli to renew or add accounts.');
         noAuth.status = 503; noAuth.type = 'no_auth';
@@ -1084,6 +1170,36 @@ function selectAccountForSession(session, sessionKey = '') {
     session.accountId = account.id;
     persistSessions();
     return account;
+}
+
+function poolExhaustionError(nowMs = Date.now()) {
+    const credentialed = accounts.filter(a => a && a.config && a.config.token && a.config.cookie);
+    const authValid = credentialed.filter(a => !a.authUnavailable);
+    const busyReady = authValid.filter(a => isAccountReady(a, nowMs) && !hasCapacity(a));
+    const probeActive = authValid.some(a => a.isProbeActive);
+    if (busyReady.length > 0 || probeActive) {
+        const waitSec = busyReady.length > 0
+            ? Math.min(...busyReady.map(a => saturatedWaitSec(a, nowMs)))
+            : 2;
+        const err = new Error(`[OpenCode Warning] All ready DeepSeek accounts are at capacity limit (${MAX_PER_ACCOUNT} per account). In OpenCode: wait ~${waitSec}s.`);
+        err.status = 503; err.retryAfter = waitSec; err.type = 'overloaded';
+        return err;
+    }
+    const releaseMs = earliestReleaseMs(nowMs);
+    if (Number.isFinite(releaseMs)) {
+        const waitSec = Math.max(1, Math.ceil((releaseMs - nowMs) / 1000));
+        const err = new Error(rateLimitExhaustedMessage(waitSec));
+        err.status = 429; err.retryAfter = waitSec; err.type = 'rate_limit';
+        return err;
+    }
+    if (credentialed.length > 0) {
+        const err = new Error('[OpenCode Warning] DeepSeek credentials are unavailable (HTTP 401/403 observed). Run npm run auth-cli to renew or restore accounts.');
+        err.status = 503; err.type = 'auth_unavailable';
+        return err;
+    }
+    const err = new Error('[OpenCode Warning] No valid DeepSeek auth accounts available. Run npm run auth-cli to renew or add accounts.');
+    err.status = 503; err.type = 'no_auth';
+    return err;
 }
 
 // Fresh-chat account choice. Default: score-min over the ready set (home
@@ -1396,12 +1512,17 @@ function resolvePacingAction({
 // Parse a Retry-After header value into a cooldown duration in ms, or null if
 // absent/unparseable. Supports both forms: delta-seconds (e.g. "120") and an
 // HTTP-date (e.g. "Wed, 21 Oct 2025 07:28:00 GMT"). Clamped to >= 1s.
+const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
 function parseRetryAfterMs(retryAfterRaw) {
     if (!retryAfterRaw) return null;
     const raw = String(retryAfterRaw).trim();
-    if (/^\d+$/.test(raw)) return Math.max(1000, Number(raw) * 1000);
+    if (/^\d+$/.test(raw)) {
+        const seconds = Number(raw);
+        if (!Number.isFinite(seconds)) return MAX_RETRY_AFTER_MS;
+        return Math.min(MAX_RETRY_AFTER_MS, Math.max(1000, seconds * 1000));
+    }
     const t = Date.parse(raw);
-    if (!Number.isNaN(t)) return Math.max(1000, t - Date.now());
+    if (!Number.isNaN(t)) return Math.min(MAX_RETRY_AFTER_MS, Math.max(1000, t - Date.now()));
     return null;
 }
 function markAccountFailure(account, status, reason = '', retryAfterRaw = null) {
@@ -1459,18 +1580,31 @@ function markAccountFailure(account, status, reason = '', retryAfterRaw = null) 
         console.log(`[account:${account.id}] cooldown for ${Math.round(ROUTING_ESCALATION_COOLDOWN_MS / 1000)}s after ${ROUTING_CONSECUTIVE_STRIKES} consecutive failures (last: ${reason || status})`);
     }
 }
-async function readDeepSeekJsonResponse(resp, label, account) {
+function sessionCreateFailureStatus(status) {
+    const code = Number(status) || 502;
+    return code >= 200 && code < 300 ? 502 : code;
+}
+
+async function readDeepSeekJsonResponse(resp, label, account, retryAfterRaw = null) {
     const text = await resp.text();
     let json = null;
     if (text) {
         try { json = JSON.parse(text); }
         catch (e) {
             markAccountFailure(account, resp.status, label);
-            throw new Error(`DeepSeek returned non-JSON ${label} response (HTTP ${resp.status}). Run npm run doctor. First chars: ${text.substring(0, 120)}`);
+            const err = new Error(`DeepSeek returned non-JSON ${label} response (HTTP ${resp.status}). Run npm run doctor.`);
+            err.status = sessionCreateFailureStatus(resp.status);
+            err.type = err.status === 502 ? 'upstream_invalid_response' : 'upstream_http_error';
+            err._accountMarked = true;
+            throw err;
         }
     }
-    if (!resp.ok) markAccountFailure(account, resp.status, label);
-    return { json, text };
+    let failureMarked = false;
+    if (!resp.ok) {
+        markAccountFailure(account, resp.status, label, retryAfterRaw);
+        failureMarked = true;
+    }
+    return { json, text, failureMarked };
 }
 if (require.main === module) {
     loadDeepSeekConfig({ fatal: false });
@@ -1596,6 +1730,12 @@ function resolveAgentId({ requestedSession, remoteAddr, authorization, principal
     const requested = bound ? sanitizeSessionId(requestedSession) : '';
     const base = requested || ipFallback;
     return bound ? `${bound}:${base}` : base;
+}
+
+function sessionKeysForCaller(remoteAddr, authorization, principal = principalForRequest(authorization)) {
+    const base = resolveAgentId({ requestedSession: '', remoteAddr, authorization, principal });
+    const prefix = principal ? `${principal}:` : `${base}:`;
+    return Array.from(sessions.keys()).filter(key => key === base || key.startsWith(prefix));
 }
 
 // Shared title-bucket check (C1 companion): only the title override in the
@@ -2108,7 +2248,7 @@ async function askDeepSeekStream(
     const modelCfg = resolveModelConfig(model);
     const session = getOrCreateAgentSession(agentId);
     const hadRemoteSession = Boolean(session.id);
-    const account = selectAccountForSession(session, agentId);
+    const account = selectAccountForSession(session, agentId, existingLease);
     let leaseAcquired = false;
     if (!existingLease || existingLease !== account) {
         acquireAccountLease(account);
@@ -2117,6 +2257,17 @@ async function askDeepSeekStream(
     const dsHeaders = account.headers;
     account.lastUsedAt = Date.now();
     const askTurnStartedAt = Date.now();
+    const remainingRequestMs = () => Math.max(0, REQUEST_DEADLINE_MS - (Date.now() - requestStartedAt));
+    const upstreamTimeoutMs = () => {
+        const remaining = remainingRequestMs();
+        if (remaining <= 0) {
+            const err = new Error('Request deadline reached before the next upstream call.');
+            err.status = 504;
+            err.type = 'request_timeout';
+            throw err;
+        }
+        return Math.max(1, Math.min(DS_FETCH_TIMEOUT_MS, remaining));
+    };
 
     // Ambient telemetry check (fire-and-forget, non-blocking)
     maybeTriggerAmbientTelemetry(account, askTurnStartedAt);
@@ -2191,7 +2342,7 @@ async function askDeepSeekStream(
             method: 'POST', headers: dsHeaders,
             body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
             signal: clientSignal
-        });
+        }, upstreamTimeoutMs());
     const chalText = await cr.text();
     if (!cr.ok) {
         const retryAfter = cr.headers?.get ? cr.headers.get('retry-after') : null;
@@ -2210,12 +2361,16 @@ async function askDeepSeekStream(
     }
     const challenge = chalJson?.data?.biz_data?.challenge;
     if (!challenge) {
-        markAccountFailure(account, cr.status, 'pow challenge missing');
-        quarantineAccount(account, 'missing pow challenge');
-        const err = new Error('[OpenCode Warning] DeepSeek PoW challenge missing. Account has been placed in quarantine. Run npm run auth-cli to renew or restore accounts.');
-        err.status = 403;
-        err.type = 'auth_quarantined';
-        err.isQuarantined = true;
+        // HTTP 200 error envelopes are not proof that a credential is dead.
+        // Never quarantine or unbind every sticky chat from one transient
+        // observation; the CLI owns explicit, double-checked quarantine.
+        // Count it as a soft failure so repeated misses cool the account
+        // via the normal escalation path — deliberately no quarantine call.
+        markAccountFailure(account, 502, 'pow challenge missing');
+        console.warn(`[account:${account.id}] PoW challenge missing from HTTP 200 response; preserving account and chat.`);
+        const err = new Error('DeepSeek returned an incomplete PoW challenge response. The account was preserved; retry shortly or run npm run doctor.');
+        err.status = 502;
+        err.type = 'pow_error';
         throw err;
     }
     // Quota clock starts here: the turn reached upstream (challenge issued),
@@ -2250,16 +2405,18 @@ async function askDeepSeekStream(
         const sr = await dsFetch('https://chat.deepseek.com/api/v0/chat_session/create', {
             method: 'POST', headers: dsHeaders, body: '{}',
             signal: clientSignal
-        });
-        const { json: sessionData, text: sessionText } = await readDeepSeekJsonResponse(sr, 'session create', account);
+        }, upstreamTimeoutMs());
+        const retryAfter = sr.headers?.get ? sr.headers.get('retry-after') : null;
+        const { json: sessionData, failureMarked } = await readDeepSeekJsonResponse(sr, 'session create', account, retryAfter);
         const createdSessionId = sessionData?.data?.biz_data?.chat_session?.id || sessionData?.data?.biz_data?.id;
         if (!sr.ok || !createdSessionId) {
-            const retryAfter = sr.headers?.get ? sr.headers.get('retry-after') : null;
-            markAccountFailure(account, sr.status, 'session create', retryAfter);
-            const err = new Error(`Could not create DeepSeek chat session (HTTP ${sr.status}). Auth may be expired/captcha-blocked. Run npm run doctor, then npm run auth. First chars: ${String(sessionText || '').substring(0, 120)}`);
-            err.status = sr.status;
+            if (!failureMarked) markAccountFailure(account, sr.status, 'session create invalid response', retryAfter);
+            const responseStatus = sessionCreateFailureStatus(sr.status);
+            const err = new Error(`Could not create DeepSeek chat session (HTTP ${sr.status}). Auth may be expired/captcha-blocked or the upstream response was invalid. Run npm run doctor, then npm run auth.`);
+            err.status = responseStatus;
             err.retryAfter = retryAfter;
             if (sr.status === 429) err.type = 'rate_limit_error';
+            else if (responseStatus === 502) err.type = 'upstream_invalid_response';
             throw err;
         }
         session.id = createdSessionId;
@@ -2268,9 +2425,9 @@ async function askDeepSeekStream(
         session.createdAt = Date.now();
         session.messageCount = 0;
         persistSessions();
-        console.log(`${agentTag} Created new session: ${session.id}`);
+        console.log(`${agentTag} Created new remote session`);
     } else {
-        console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
+        console.log(`${agentTag} Reusing remote session (msg#${session.messageCount})`);
     }
 
     const powB64 = Buffer.from(JSON.stringify({
@@ -2290,7 +2447,7 @@ async function askDeepSeekStream(
             action: null, preempt: false,
         }),
         signal: clientSignal
-    });
+    }, upstreamTimeoutMs());
 
     // If session expired, reset and retry once
     if (resp.status !== 200) {
@@ -2298,9 +2455,9 @@ async function askDeepSeekStream(
         const retryAfter = resp.headers.get('retry-after');
         markAccountFailure(account, resp.status, 'completion', retryAfter);
         const errText = await resp.text();
-        console.log(`${agentTag} Session error (${resp.status}): ${errText.substring(0, 100)}`);
+        console.log(`${agentTag} Upstream session error HTTP ${resp.status}; preserving local chat.`);
         if (resp.status === 400 || resp.status === 404 || resp.status === 500) {
-            console.log(`${agentTag} Session ${session.id} expired or invalidated upstream (${resp.status}); preserving session per invariant.`);
+            console.log(`${agentTag} Remote session may be expired or invalidated (${resp.status}); preserving session per invariant.`);
             throw createChatExpiredError(resp.status);
         }
         // The body was consumed for diagnostics, so returning this Response
@@ -2328,7 +2485,9 @@ async function askDeepSeekStream(
             releaseAccountLease(account);
             leaseAcquired = false;
         }
-        if (isTimeoutError(e) || e.name === 'AbortError' || /timeout|abort/i.test(e.message || '')) {
+        if (isClientCancellation(e, isClientGone, clientSignal)) {
+            // The downstream caller cancelled; the upstream account did not fail.
+        } else if (isTimeoutError(e) || e.name === 'AbortError' || /timeout|abort/i.test(e.message || '')) {
             markAccountFailure(account, 504, 'timeout / fetch abort');
             try { e._accountMarked = true; } catch (_) {}
         } else if (isNetworkError(e)) {
@@ -3632,19 +3791,70 @@ function normalizeResponsesInput(input) {
     return messages;
 }
 
+function invalidRequest(message) {
+    const err = new Error(message);
+    err.status = 400;
+    err.type = 'invalid_request';
+    return err;
+}
+
+function validateApiRequestShape(params, apiMode) {
+    const messageList = apiMode === 'responses'
+        ? (params.input === undefined ? [] : params.input)
+        : params.messages;
+    const allowedRoles = new Set(['system', 'user', 'assistant', 'tool']);
+    const validateMessage = (msg, label) => {
+        if (!msg || typeof msg !== 'object' || Array.isArray(msg)) throw invalidRequest(`${label} must contain only non-null objects`);
+        if (apiMode !== 'responses' && !allowedRoles.has(String(msg.role || ''))) throw invalidRequest(`${label} contains an unsupported role`);
+        const role = String(msg.role || (apiMode === 'responses' && msg.type === 'message' ? 'user' : ''));
+        const hasToolCalls = role === 'assistant'
+            && (Array.isArray(msg.tool_calls) || msg.function_call
+                || (Array.isArray(msg.content) && msg.content.some(part => part?.type === 'tool_use')));
+        const hasContent = Object.prototype.hasOwnProperty.call(msg, 'content') && msg.content !== null && msg.content !== undefined;
+        if (!hasToolCalls && !hasContent && apiMode !== 'responses') throw invalidRequest(`${label} must include role and content or tool calls`);
+        if (hasContent && typeof msg.content === 'string' && !msg.content.trim() && !hasToolCalls) throw invalidRequest(`${label} content must not be empty`);
+        if (Array.isArray(msg.content) && msg.content.length === 0 && !hasToolCalls) throw invalidRequest(`${label} content must not be empty`);
+    };
+
+    if (apiMode === 'responses' && typeof messageList === 'string') {
+        if (!messageList.trim()) throw invalidRequest('input must not be empty');
+    } else if (messageList !== undefined && !Array.isArray(messageList)) {
+        throw invalidRequest(apiMode === 'responses' ? 'input must be a string or array' : 'messages must be an array');
+    } else if (Array.isArray(messageList)) {
+        for (const msg of messageList) {
+            if (apiMode === 'responses') {
+                if (!msg || typeof msg !== 'object' || Array.isArray(msg)) throw invalidRequest('input must contain only non-null objects');
+                if (msg.type === 'message' || msg.role) validateMessage(msg, 'input');
+                else if (msg.type === 'function_call' && typeof msg.name === 'string' && msg.name.trim()) { /* valid */ }
+                else if (msg.type === 'function_call_output' && Object.prototype.hasOwnProperty.call(msg, 'output')) { /* valid */ }
+                else if (msg.type === 'input_text' && typeof msg.text === 'string' && msg.text.trim()) { /* valid */ }
+                else throw invalidRequest('input contains an unsupported or malformed item');
+            } else {
+                validateMessage(msg, 'messages');
+            }
+        }
+    }
+    if (params.tools !== undefined) {
+        if (!Array.isArray(params.tools)) throw invalidRequest('tools must be an array');
+        if (params.tools.length > 128) throw invalidRequest('tools may contain at most 128 definitions');
+        for (const tool of params.tools) {
+            if (!tool || typeof tool !== 'object' || Array.isArray(tool)) throw invalidRequest('each tool must be an object');
+            const valid = apiMode === 'openai'
+                ? tool.type === 'function' && tool.function && typeof tool.function === 'object' && typeof tool.function.name === 'string' && tool.function.name.trim()
+                : apiMode === 'anthropic'
+                    ? typeof tool.name === 'string' && tool.name.trim()
+                    : (typeof tool.name === 'string' && tool.name.trim())
+                        || (tool.type === 'function' && tool.function && typeof tool.function.name === 'string' && tool.function.name.trim());
+            if (!valid) throw invalidRequest('each tool must have a valid function name');
+        }
+    }
+}
+
 function normalizeApiParams(params, apiMode) {
     if (params === null || typeof params !== 'object' || Array.isArray(params)) {
-        const err = new Error('Request body must be a JSON object');
-        err.status = 400;
-        err.type = 'invalid_request';
-        throw err;
+        throw invalidRequest('Request body must be a JSON object');
     }
-    if (params.messages !== undefined && !Array.isArray(params.messages)) {
-        const err = new Error('messages must be an array');
-        err.status = 400;
-        err.type = 'invalid_request';
-        throw err;
-    }
+    validateApiRequestShape(params, apiMode);
     if (apiMode === 'anthropic') {
         const messages = [];
         if (params.system) messages.push({ role: 'system', content: normalizeMessageContent(params.system) });
@@ -4198,8 +4408,10 @@ function finishOpenAIStream(res, openaiResp, opts = {}) {
                 function: fn,
             };
         });
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: null, tool_calls: streamingToolCalls }, finish_reason: null }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+        if (res && !res.writableEnded && !res.destroyed) {
+            res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: null, tool_calls: streamingToolCalls }, finish_reason: null }] })}\n\n`);
+            res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+        }
     } else {
         for (let i = 0; i < (msg.content || '').length; i += 50) {
             if (!res || res.writableEnded || res.destroyed) break;
@@ -4291,6 +4503,24 @@ function stripShellReminder(promptText, reminder) {
     return text;
 }
 
+function boundHistoryText(value, maxChars) {
+    const text = String(value || '');
+    const max = Math.max(0, Number(maxChars) || 0);
+    if (text.length <= max) return text;
+    const marker = ' …[history truncated]';
+    if (max <= marker.length) return text.slice(0, max);
+    return text.slice(0, max - marker.length) + marker;
+}
+
+function boundHistoryTail(value, maxChars) {
+    const text = String(value || '');
+    const max = Math.max(0, Number(maxChars) || 0);
+    if (text.length <= max) return text;
+    const marker = ' …[earlier history truncated] ';
+    if (max <= marker.length) return text.slice(-max);
+    return marker + text.slice(-(max - marker.length));
+}
+
 function storeHistory(agentId, prompt, content, toolCall) {
     const session = getOrCreateAgentSession(agentId);
     let assistantResponse = content;
@@ -4316,12 +4546,16 @@ function storeHistory(agentId, prompt, content, toolCall) {
         }
         assistantResponse = envelopes.join('\n');
     }
-    // Save last 500 chars of the prompt for history context
-    const shortPrompt = prompt.length > 500 ? '...' + prompt.substring(prompt.length - 500) : prompt;
-    session.history.push({ user: shortPrompt, assistant: assistantResponse });
+    // Save last 500 chars of the prompt for history context. Bound the final
+    // entry too: one model/tool response can otherwise be many MiB and evade the
+    // history loop's `length > 1` condition entirely.
+    const shortPrompt = boundHistoryTail(prompt, 500);
+    const assistantBudget = Math.max(0, MAX_HISTORY_CHARS - shortPrompt.length);
+    const boundedAssistant = boundHistoryText(assistantResponse, assistantBudget);
+    session.history.push({ user: shortPrompt, assistant: boundedAssistant });
     while (session.history.length > MAX_HISTORY_LENGTH) session.history.shift();
     let historyChars = session.history.reduce((sum, e) => sum + e.user.length + e.assistant.length, 0);
-    while (historyChars > MAX_HISTORY_CHARS && session.history.length > 1) {
+    while (historyChars > MAX_HISTORY_CHARS && session.history.length > 0) {
         const removed = session.history.shift();
         historyChars -= removed.user.length + removed.assistant.length;
     }
@@ -4625,6 +4859,12 @@ function isTimeoutError(error) {
     return name === 'TimeoutError' || name === 'AbortError' || /(?:timed?\s*out|timeout)/i.test(message);
 }
 
+function isClientCancellation(error, isClientGone, clientSignal) {
+    const gone = typeof isClientGone === 'function' ? Boolean(isClientGone()) : Boolean(isClientGone);
+    return Boolean(gone || clientSignal?.aborted)
+        && (error?.name === 'AbortError' || /abort/i.test(String(error?.message || '')));
+}
+
 // Network-layer failures that are neither timeouts nor account faults:
 // DNS, reset, refused. Shares the timeout consecutive-failure budget so a dead
 // path backs off; excludes PoW solve failures and parse/programming errors
@@ -4790,7 +5030,17 @@ const server = http.createServer(async (req, res) => {
     setCorsResponseHeaders(res);
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    // Routing never depends on Host. A fixed trusted base prevents malformed
+    // Host headers from affecting URL parsing; malformed request targets are
+    // handled locally before authentication/routing.
+    let url;
+    try {
+        url = new URL(req.url, 'http://localhost');
+    } catch (error) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Malformed request target', type: 'invalid_request' } }));
+        return;
+    }
     const isPublicProbe = req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health' || url.pathname === '/readyz');
     if (!isPublicProbe && !isProxyAuthorized(req.headers.authorization)) {
         console.log(`[DS-API] 401 unauthorized ${req.method} ${url.pathname} from ${req.socket.remoteAddress}`);
@@ -4836,7 +5086,10 @@ const server = http.createServer(async (req, res) => {
     // Sessions status
     if (req.method === 'GET' && url.pathname === '/v1/sessions') {
         const agentList = [];
-        for (const [agentId, session] of sessions) {
+        const visibleKeys = sessionKeysForCaller(req.socket.remoteAddress || 'unknown', req.headers.authorization);
+        for (const agentId of visibleKeys) {
+            const session = sessions.get(agentId);
+            if (!session) continue;
             agentList.push({
                 agent: agentId,
                 session_id: session.id,
@@ -4852,22 +5105,45 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Reset session for a specific agent (or all if no agent specified)
+    // Reset session for a specific logical agent (or all in the caller's namespace).
     if (req.method === 'POST' && url.pathname === '/reset-session') {
-        const agentId = url.searchParams.get('agent') || 'default';
-        if (agentId === 'all') {
-            const count = sessions.size;
-            sessions.clear();
+        const requestedAgent = url.searchParams.get('agent') || 'default';
+        const principal = principalForRequest(req.headers.authorization);
+        const remoteAddr = req.socket.remoteAddress || 'unknown';
+        const callerBase = resolveAgentId({ requestedSession: '', remoteAddr, authorization: req.headers.authorization, principal });
+        let agentId = '';
+        if (principal) {
+            agentId = resolveAgentId({ requestedSession: requestedAgent, remoteAddr, authorization: req.headers.authorization, principal });
+        } else if (requestedAgent === 'default') {
+            agentId = callerBase;
+        } else if ((requestedAgent === callerBase || requestedAgent.startsWith(`${callerBase}:`)) && sessions.has(requestedAgent)) {
+            // Keyless clients cannot prove ownership of an arbitrary sanitized
+            // label, but may target an exact already-existing local/IP fingerprint.
+            agentId = requestedAgent;
+        }
+        if (requestedAgent === 'all') {
+            const keys = sessionKeysForCaller(remoteAddr, req.headers.authorization, principal);
+            if (keys.some(key => activeSessionTurns.has(key))) {
+                res.writeHead(409, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+                res.end(JSON.stringify({ error: { message: 'Cannot reset sessions while a turn is active.', type: 'session_busy' } }));
+                return;
+            }
+            for (const key of keys) sessions.delete(key);
             persistSessions();
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'all_sessions_cleared', count }));
+            res.end(JSON.stringify({ status: 'all_sessions_cleared', count: keys.length }));
+            return;
+        }
+        if (activeSessionTurns.has(agentId)) {
+            res.writeHead(409, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+            res.end(JSON.stringify({ error: { message: `Session ${requestedAgent} already has an active turn.`, type: 'session_busy' } }));
             return;
         }
         const session = sessions.get(agentId);
         if (!session) {
-            console.log(`[DS-API] 404 reset-miss: no session for agent ${agentId}`);
+            console.log(`[DS-API] 404 reset-miss: no session for agent ${logToken(requestedAgent)}`);
             res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: `No session for agent: ${agentId}` }));
+            res.end(JSON.stringify({ error: `No session for agent: ${requestedAgent}` }));
             return;
         }
         const historyCount = session.history.length;
@@ -4887,9 +5163,9 @@ const server = http.createServer(async (req, res) => {
         session.repairAt = 0;
         session.repairCount = 0;
         persistSessions();
-        console.log(`[DS-API] session_reset agent=${agentId} history_preserved=${historyCount}`);
+        console.log(`[DS-API] session_reset agent=${logToken(requestedAgent)} history_preserved=${historyCount}`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'session_reset', agent: agentId, history_preserved: historyCount, history: historyPreview }));
+        res.end(JSON.stringify({ status: 'session_reset', agent: requestedAgent, history_preserved: historyCount, history: historyPreview }));
         return;
     }
 
@@ -4993,6 +5269,8 @@ const server = http.createServer(async (req, res) => {
         const deadlineHit = () => Date.now() - requestStartedAt > REQUEST_DEADLINE_MS;
         let activeSession = null;
         let activeAgentId = null;
+        let activeTurnKey = null;
+        let activeTurnOwner = null;
         try {
             // Malformed bodies are a client fault, not a server fault: answer
             // 400 so integrators fix the payload instead of retry-storming a
@@ -5059,7 +5337,7 @@ const server = http.createServer(async (req, res) => {
             if (isTitleGenerationRequest(messages)) {
                 if (process.env.DEEPSEEK_LOCAL_TITLE !== '0') {
                     const title = generateLocalTitle(messages);
-                    console.log(`[DS-API] Handled title generation locally: "${title}"`);
+                    console.log('[DS-API] Handled title generation locally');
                     const responseObj = buildTextResponse(title, messages[0]?.content || '', requestedModel);
                     if (stream) {
                         if (apiMode === 'anthropic') {
@@ -5084,6 +5362,18 @@ const server = http.createServer(async (req, res) => {
                 agentId = (principal ? principal + ':' : '') + 'dev-agent:title';
             }
 
+            const turnOwner = {};
+            if (!acquireSessionTurn(agentId, turnOwner)) {
+                res.writeHead(409, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+                res.end(JSON.stringify({ error: {
+                    message: `Session ${agentId} already has an active turn. Retry after it completes.`,
+                    type: 'session_busy',
+                } }));
+                return;
+            }
+            activeTurnKey = agentId;
+            activeTurnOwner = turnOwner;
+
             // Delta mode: no explicit client session key (opencode sends none),
             // so derive a stable per-conversation chat id from the opener.
             // If routed to 'dev-agent:title' (DEEPSEEK_LOCAL_TITLE=0), skip per-conversation
@@ -5103,26 +5393,36 @@ const server = http.createServer(async (req, res) => {
                 // Hardening: adopt ONLY on an unambiguous single-candidate match. If multiple sessions
                 // share the same boundary (identical opener collision), do not guess — fork to a fresh chat.
                 if (!sessions.has(candidateId) && turnMessages.length > 1) {
-                    const matchingCandidates = [];
-                    for (const [existingId, existingSession] of sessions) {
-                        if (!existingId.startsWith(agentId + ':')) continue;
-                        if (!existingSession || !existingSession.id || !existingSession.deltaBoundary) continue;
-                        const sent = Number(existingSession.deltaMsgCount) || 0;
-                        if (sent > 0 && sent < turnMessages.length) {
-                            if (hashMessageEnvelope(turnMessages[sent - 1]) === existingSession.deltaBoundary) {
-                                matchingCandidates.push({ id: existingId, session: existingSession });
-                            }
+                    const adoption = findAdoptableSession(agentId, candidateId, turnMessages);
+                    if (adoption) {
+                        const { id: existingId, session: existingSession } = adoption;
+                        if (!rekeySessionTurn(agentId, candidateId, turnOwner)) {
+                            releaseSessionTurn(activeTurnKey, turnOwner);
+                            activeTurnKey = null;
+                            activeTurnOwner = null;
+                            res.writeHead(409, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+                            res.end(JSON.stringify({ error: { message: 'Session fingerprint is already active. Retry after the current turn completes.', type: 'session_busy' } }));
+                            return;
                         }
-                    }
-                    if (matchingCandidates.length === 1) {
-                        const { id: existingId, session: existingSession } = matchingCandidates[0];
+                        // Rekey the turn before moving the map entry. There is no
+                        // await between these operations.
+                        activeTurnKey = candidateId;
                         sessions.delete(existingId);
                         sessions.set(candidateId, existingSession);
-                        console.log(`[DS-API] Adopted active session from ${existingId} -> ${candidateId} (chat ${existingSession.id}, msg#${existingSession.messageCount})`);
+                        console.log(`[DS-API] Adopted idle session ${logToken(existingId)} -> ${logToken(candidateId)} (msg#${existingSession.messageCount})`);
                         persistSessions();
-                    } else if (matchingCandidates.length > 1) {
-                        console.log(`[DS-API] Ambiguous opener adoption for ${candidateId} (${matchingCandidates.length} candidates match boundary); forking to fresh chat.`);
                     }
+                }
+                if (activeTurnKey !== candidateId) {
+                    if (!rekeySessionTurn(agentId, candidateId, turnOwner)) {
+                        releaseSessionTurn(activeTurnKey, turnOwner);
+                        activeTurnKey = null;
+                        activeTurnOwner = null;
+                        res.writeHead(409, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+                        res.end(JSON.stringify({ error: { message: 'Session fingerprint is already active. Retry after the current turn completes.', type: 'session_busy' } }));
+                        return;
+                    }
+                    activeTurnKey = candidateId;
                 }
                 agentId = candidateId;
             }
@@ -5195,7 +5495,7 @@ const server = http.createServer(async (req, res) => {
                 const targetAccount = accounts.find(a => a && a.id === targetAccountId);
                 const targetUsed = targetAccount ? usedSince(targetAccount, QUOTA_WINDOW_MS, compactionNow) : 0;
                 const quotaDisplay = HOURLY_QUOTA > 0 ? `target used: ${targetUsed}/${HOURLY_QUOTA}/h` : `target used: ${targetUsed}/h (unmetered)`;
-                console.log(`${agentTag} Client compaction detected (old chat ${compactionReset.failedSessionId} had ${compactionReset.failedMessageCount} msgs); rotated account ${compactionReset.oldAccountId} -> ${compactionReset.newAccountId} (${quotaDisplay}); seeding fresh chat.`);
+                console.log(`${agentTag} Client compaction detected (old chat had ${compactionReset.failedMessageCount} msgs); rotated account ${compactionReset.oldAccountId} -> ${compactionReset.newAccountId} (${quotaDisplay}); seeding fresh chat.`);
             }
 
             // Delta mode: an established remote chat already holds the system
@@ -5355,7 +5655,7 @@ const server = http.createServer(async (req, res) => {
                 if (!recoveredInPlace) {
                     if ((!isRateLimitError(e) && !e?.isQuarantined) || e?.isPacingReject || rateLimitMigrated || clientGone || deadlineHit()) throw e;
                     const decision = resolveRateLimitMigration(session, accounts, rateLimitMigrated);
-                    if (!decision.migrateTo) throw e;
+                    if (!decision.migrateTo) throw poolExhaustionError();
                     if (activeAccountLease) {
                         releaseAccountLease(activeAccountLease);
                         activeAccountLease = null;
@@ -5375,7 +5675,7 @@ const server = http.createServer(async (req, res) => {
                         clientSignal: clientAbortController.signal,
                     });
                     activeAccountLease = initialCall.account;
-                    console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): ${e?.isQuarantined ? 'quarantined-fallback' : 'rate-limit'}`);
+                    console.log(`${agentTag} migrated account ${move.oldAccountId} -> ${move.newAccountId}: ${e?.isQuarantined ? 'quarantined-fallback' : 'rate-limit'}`);
                 }
             }
             let dsResp = initialCall.resp;
@@ -5458,6 +5758,7 @@ const server = http.createServer(async (req, res) => {
             // commit, so the next turn re-sends the last good parent instead
             // of pinning a poisoned node. parent_message_id branches upstream.
             let pendingMessageId = null;
+            let lastReadMessageId = null;
             async function readDeepSeekResponse(readable, opts = readOpts) {
                 const resResult = await consumeDeepSeekStream(readable, {
                     onReasoningDone: opts.onReasoningDone,
@@ -5466,13 +5767,11 @@ const server = http.createServer(async (req, res) => {
                 });
                 if (resResult.abandoned) return resResult;
 
-                // H1: ALWAYS track the delivering read's id (null when the
-                // read carried none). A conditional assignment would leave a
-                // STALE id from an earlier read in `pendingMessageId`, which
-                // the single commit below would then attach to the wrong
-                // content. Null-id turns commit nothing (§8 deferred commit).
-                pendingMessageId = resResult.messageId || null;
-                if (!pendingMessageId) {
+                // Track the latest read separately. `pendingMessageId` advances
+                // only when that read is accepted for delivery; a rejected
+                // continuation/repair must never replace the accepted cursor.
+                lastReadMessageId = resResult.messageId || null;
+                if (!lastReadMessageId) {
                     console.log(`${agentTag} WARNING: could not extract message_id`);
                 }
 
@@ -5497,21 +5796,19 @@ const server = http.createServer(async (req, res) => {
                 coolAccountForRateLimit(throttled, modelError);
                 const decision = resolveRateLimitMigration(session, accounts, rateLimitMigrated);
                 if (rateLimitMigrated || !decision.migrateTo) {
-                    // Shared earliest-release math (M2): quota/burst-spent peers
-                    // count, not just the throttled account's cooldown.
-                    const rel = earliestReleaseMs();
-                    const waitSec = Number.isFinite(rel)
-                        ? Math.max(1, Math.ceil((rel - Date.now()) / 1000))
-                        : 2;
-                    console.log(`${agentTag} rate-limit migration exhausted (${rateLimitMigrated ? 'already migrated this turn' : 'no other ready account'}); failing fast 429.`);
+                    const exhausted = poolExhaustionError();
+                    const waitSec = Math.max(1, Number(exhausted.retryAfter) || 2);
+                    console.log(`${agentTag} rate-limit migration exhausted (${rateLimitMigrated ? 'already migrated this turn' : 'no other ready account'}); failing fast ${exhausted.status}.`);
                     if (res.headersSent) {
-                        sendStreamError(res, apiMode, { message: rateLimitExhaustedMessage(waitSec), type: 'rate_limit_error' });
+                        sendStreamError(res, apiMode, { message: exhausted.message, type: exhausted.type });
                         return;
                     }
-                    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(waitSec) });
+                    const headers = { 'Content-Type': 'application/json' };
+                    if ((exhausted.status === 429 || exhausted.status === 503) && exhausted.retryAfter) headers['Retry-After'] = String(waitSec);
+                    res.writeHead(exhausted.status, headers);
                     res.end(JSON.stringify({ error: {
-                        message: rateLimitExhaustedMessage(waitSec),
-                        type: 'rate_limit_error',
+                        message: exhausted.message,
+                        type: exhausted.type,
                         agent: agentId,
                         failed_session_id: session.id,
                         message_count: session.messageCount,
@@ -5540,7 +5837,7 @@ const server = http.createServer(async (req, res) => {
                     clientSignal: clientAbortController.signal,
                 });
                 activeAccountLease = initialCall.account;
-                console.log(`${agentTag} migrated ${agentId} chat ${move.oldChatId} (acct:${move.oldAccountId}) -> ${session.id} (acct:${move.newAccountId}): rate-limit`);
+                console.log(`${agentTag} migrated account ${move.oldAccountId} -> ${move.newAccountId}: rate-limit`);
                 dsResp = initialCall.resp;
                 pumpBase = '';
                 thinkPump.reset(); // BEFORE the read: new remote chat; the dead attempt's prefix must not suppress the fresh attempt
@@ -5555,6 +5852,7 @@ const server = http.createServer(async (req, res) => {
                 finishReason = migratedState.finishReason;
                 modelError = migratedState.modelError;
             }
+            if (fullContent && fullContent.trim()) pendingMessageId = lastReadMessageId;
 
             // Empty/context-overflow recovery. Each retry gets a smaller prompt
             // and a fresh remote session; bounded attempts prevent retry storms.
@@ -5589,13 +5887,18 @@ const server = http.createServer(async (req, res) => {
                 thinkPump.reset();
                 res._reasoningEmitted = false;
                 res._reasoningLiveSent = '';
-                const { resp: retryResp } = await askDeepSeekStream(retryPrompt, agentId, requestedModel, retryPrompt, {
+                const { resp: retryResp, account: retryAccount } = await askDeepSeekStream(retryPrompt, agentId, requestedModel, retryPrompt, {
                     isClientGone: () => clientGone,
                     requestStartedAt,
                     isAgentLoop: true,
                     existingLease: activeAccountLease,
                     clientSignal: clientAbortController.signal,
                 });
+                const nextLease = applyLeaseRotation(activeAccountLease, retryAccount);
+                if (nextLease !== activeAccountLease) {
+                    console.log(`${agentTag} empty-retry rotated account -> ${nextLease.id}`);
+                    activeAccountLease = nextLease;
+                }
                 const retryResult = await readDeepSeekResponse(retryResp.body);
                 const retryState = normalizeRetryResponse(retryResult);
                 fullPrompt = retryPrompt;
@@ -5608,22 +5911,27 @@ const server = http.createServer(async (req, res) => {
                     fullContent = retryState.content;
                     reasoningContent = retryState.reasoningContent;
                     pumpBase = reasoningContent; // retry replaces: base tracks the new attempt
+                    pendingMessageId = retryResult.messageId || null;
                 }
             }
 
             if (!fullContent || fullContent.trim().length === 0) {
                 const timedOut = deadlineHit();
-                const exhaustion = resolveEmptyExhaustion({ session, modelError, timedOut, retryAttempt });
+                let exhaustion = resolveEmptyExhaustion({ session, modelError, timedOut, retryAttempt });
                 if (isRateLimitError(modelError)) {
                     const targetAccount = accounts.find(a => a.id === session.accountId) || initialCall?.account;
                     if (targetAccount) coolAccountForRateLimit(targetAccount, modelError);
+                    const poolError = poolExhaustionError();
+                    exhaustion = { ...exhaustion, status: poolError.status, type: poolError.type, message: poolError.message, retryAfter: poolError.retryAfter };
                 }
-                console.log(`${agentTag} ${exhaustion.type} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Preserving chat ${session.id}; giving up.`);
+                console.log(`${agentTag} ${exhaustion.type} after ${retryAttempt} retr${retryAttempt === 1 ? 'y' : 'ies'}. Preserving remote chat; giving up.`);
                 if (res.headersSent) {
                     sendStreamError(res, apiMode, { message: exhaustion.message, type: exhaustion.type });
                     return;
                 }
-                res.writeHead(exhaustion.status, { 'Content-Type': 'application/json' });
+                const headers = { 'Content-Type': 'application/json' };
+                if ((exhaustion.status === 429 || exhaustion.status === 503) && exhaustion.retryAfter) headers['Retry-After'] = String(Math.max(1, Math.ceil(Number(exhaustion.retryAfter))));
+                res.writeHead(exhaustion.status, headers);
                 res.end(JSON.stringify({
                     error: {
                         message: exhaustion.message,
@@ -5698,6 +6006,7 @@ const server = http.createServer(async (req, res) => {
                     fullContent += '\n' + contContent;
                     if (contReasoning) reasoningContent += (reasoningContent ? '\n' : '') + contReasoning;
                     pumpBase = reasoningContent; // continuation appends: base stays cumulative
+                    pendingMessageId = contResult.messageId || null;
                     finishReason = contResult.finishReason;
                     console.log(`${agentTag} Continuation added ${contContent.length} chars (total: ${fullContent.length})`);
                 } else {
@@ -5776,7 +6085,7 @@ const server = http.createServer(async (req, res) => {
                         activeAccountLease = rAccount2;
                     }
                     if (session.id !== retryChatId) {
-                        console.log(`${agentTag} Strict retry landed on a new chat ${session.id} (was ${retryChatId}); full tools+context were resent.`);
+                        console.log(`${agentTag} Strict retry changed remote chat scope; full tools+context were resent.`);
                     }
                     let retryResult2 = await readDeepSeekResponse(retryResp2.body);
                     let retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
@@ -5812,7 +6121,7 @@ const server = http.createServer(async (req, res) => {
                             activeAccountLease = rAccount3;
                         }
                         if (session.id !== retryChatId) {
-                            console.log(`${agentTag} Strict retry landed on a new chat ${session.id} (was ${retryChatId}); full tools+context were resent.`);
+                            console.log(`${agentTag} Strict retry changed remote chat scope; full tools+context were resent.`);
                         }
                         retryResult2 = await readDeepSeekResponse(retryResp3.body);
                         retryContent2 = retryResult2 && retryResult2.content ? sanitizeContent(retryResult2.content) : '';
@@ -5827,6 +6136,7 @@ const server = http.createServer(async (req, res) => {
                             fullContent = retryContent2;
                             reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
                             pumpBase = reasoningContent; // retry replaces: base tracks the new attempt
+                            pendingMessageId = retryResult2.messageId || null;
                             toolCall = retryTc;
                             clearRepairGuard(session, repairHash);
                         } else if (!retryTc && !looksLikeToolCallMarkup(retryContent2)) {
@@ -5834,6 +6144,7 @@ const server = http.createServer(async (req, res) => {
                             fullContent = retryContent2;
                             reasoningContent = retryResult2.reasoningContent ? sanitizeContent(retryResult2.reasoningContent) : '';
                             pumpBase = reasoningContent; // retry replaces: base tracks the new attempt
+                            pendingMessageId = retryResult2.messageId || null;
                             toolCall = null;
                             clearRepairGuard(session, repairHash);
                         } else {
@@ -5847,7 +6158,7 @@ const server = http.createServer(async (req, res) => {
 
             if (allowedToolNames.size > 0 && !toolCall && looksLikeToolCallMarkup(fullContent)) {
                 const exhaustion = resolveRepairExhaustion({ session });
-                console.log(`${agentTag} ${exhaustion.type}: preserving chat ${session.id} after failed repair attempts.`);
+                console.log(`${agentTag} ${exhaustion.type}: preserving remote chat after failed repair attempts.`);
                 if (clientGone) return;
                 if (res.headersSent) {
                     sendStreamError(res, apiMode, { message: exhaustion.message, type: exhaustion.type });
@@ -5944,7 +6255,8 @@ const server = http.createServer(async (req, res) => {
             }
         } catch (e) {
             console.log('[DS-API] Error:', (e && e.stack) || (e && e.message) || e);
-            if (activeSession && activeSession.accountId && isTimeoutError(e) && !e._accountMarked) {
+            if (!isClientCancellation(e, () => clientGone, clientAbortController.signal)
+                && activeSession && activeSession.accountId && isTimeoutError(e) && !e._accountMarked) {
                 const act = accounts.find(a => a.id === activeSession.accountId);
                 if (act) markAccountFailure(act, 504, 'stream read timeout');
             }
@@ -5988,6 +6300,11 @@ const server = http.createServer(async (req, res) => {
                 } : {}),
             } }));
         } finally {
+            if (activeTurnKey && activeTurnOwner) {
+                releaseSessionTurn(activeTurnKey, activeTurnOwner);
+                activeTurnKey = null;
+                activeTurnOwner = null;
+            }
             if (activeAccountLease) {
                 releaseAccountLease(activeAccountLease);
                 activeAccountLease = null;
@@ -6088,10 +6405,24 @@ async function main() {
     });
 }
 
+// Unexpected async failures can leave request/session state undefined. Persist
+// what is known, then exit non-zero so systemd can restart a clean process.
+// Testable core: persist/exit/log and the fatal flag are injectable so unit
+// tests never touch the real process object. Never throws by itself.
+function handleFatalRuntimeError(kind, error, deps = {}) {
+    const log = deps.log || console.error;
+    const fatal = deps.fatal !== undefined ? deps.fatal : FATAL_ON_UNHANDLED;
+    log(`[DS-API] FATAL ${kind}:`, error);
+    if (!fatal) return;
+    try { (deps.persist || persistSessionsNow)(); } catch (_) { }
+    (deps.exit || process.exit)(1);
+}
+
 if (require.main === module) {
-    // Don't let a stray rejection/throw take the whole proxy down silently.
-    process.on('unhandledRejection', (reason) => console.error('[DS-API] unhandledRejection:', reason));
-    process.on('uncaughtException', (err) => console.error('[DS-API] uncaughtException:', err));
+    // Thin handlers: flag 1 takes the fatal path above, 0 logs and keeps running.
+    const fatalRuntimeError = (kind, error) => handleFatalRuntimeError(kind, error);
+    process.on('unhandledRejection', (reason) => fatalRuntimeError('unhandledRejection', reason));
+    process.on('uncaughtException', (err) => fatalRuntimeError('uncaughtException', err));
     // Graceful shutdown: stop accepting, drain, then exit (force-exit after 10s).
     const shutdown = (sig) => {
         console.log(`[DS-API] ${sig} received — shutting down…`);
@@ -6132,8 +6463,10 @@ module.exports = {
         sanitizeSessionId,
         principalForRequest,
         resolveAgentId,
+        sessionKeysForCaller,
         isSharedTitleBucket,
         MAX_SESSIONS,
+        MAX_SESSION_STORE_BYTES,
         SESSION_ID_MAX_LENGTH,
         MAX_BODY_BYTES,
         MAX_INFLIGHT_BODY_BYTES,
@@ -6194,6 +6527,10 @@ module.exports = {
         normalizeRetryResponse,
         classifyRecoveryFailure,
         isTimeoutError,
+        isClientCancellation,
+        readDeepSeekJsonResponse,
+        sessionCreateFailureStatus,
+        poolExhaustionError,
         shouldResetOnEmptyRetry,
         shouldAutoContinue,
         formatMessages,
@@ -6219,9 +6556,12 @@ module.exports = {
         calculateRequiredDelay,
         resolvePacingAction,
         storeHistory,
+        boundHistoryText,
+        boundHistoryTail,
         serializeSession,
         persistSessions,
         persistSessionsNow,
+        handleFatalRuntimeError,
         restoreSessions,
         classifyRepairAttempt,
         recordRepairAttempt,
@@ -6235,6 +6575,11 @@ module.exports = {
         prepareSessionForPrompt,
         sweepIdleSessions,
         sessions,
+        activeSessionTurns,
+        acquireSessionTurn,
+        rekeySessionTurn,
+        releaseSessionTurn,
+        findAdoptableSession,
         accounts,
         selectAccountForSession,
         selectFreshAccount,
@@ -6248,6 +6593,7 @@ module.exports = {
         hasCapacity,
         acquireAccountLease,
         releaseAccountLease,
+        applyLeaseRotation,
         saturatedWaitSec,
         MAX_PER_ACCOUNT,
         setMaxPerAccount,

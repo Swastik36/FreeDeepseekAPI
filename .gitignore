@@ -34,4 +34,3 @@ data/accounts/*.bak
 .proxy-state.json
 .proxy-state.json.tmp
 *.proxy-state.json
-

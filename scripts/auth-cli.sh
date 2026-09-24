@@ -558,7 +558,7 @@ cmd_check() {
         esac
     done
     if [ -z "$_target" ] || [ "$_target" = "all" ]; then
-        _fail=0 _i=0 _n_verdict=0 _n_dead=0 _moved=0 _pending=""
+        _fail=0 _i=0 _n_verdict=0 _n_dead=0 _n_probefail=0 _moved=0 _pending=""
         for _f in "$AUTH_DIR"/*.json; do
             [ -e "$_f" ] || continue
             case $_f in *.bak|*.bak-*) continue;; esac
@@ -568,6 +568,9 @@ cmd_check() {
             if [ "$_pcode" -eq 2 ]; then
                 printf 'account_%d %s: PROBE-FAILED (unreadable?)\n' "$_i" "$_name"
                 _fail=1
+                # Tool failure, not a verdict: never counts toward the
+                # breaker quorum either way; reported in the summary below.
+                _n_probefail=$((_n_probefail + 1))
                 continue
             fi
             _n_verdict=$((_n_verdict + 1))
@@ -590,9 +593,14 @@ cmd_check() {
             fi
         done
         [ "$_i" -gt 0 ] || die "no accounts in $AUTH_DIR"
-        if [ "$_n_verdict" -gt 0 ] && [ "$_n_dead" -eq "$_n_verdict" ]; then
-            # Mass-quarantine circuit breaker: every probed account dead is
-            # evidence of an upstream incident, not N independent deaths.
+        if [ "$_n_probefail" -gt 0 ]; then
+            info "$_n_probefail probe-failure(s) excluded from quorum"
+        fi
+        if [ "$_n_verdict" -gt 1 ] && [ "$_n_dead" -eq "$_n_verdict" ]; then
+            # Mass-quarantine circuit breaker (quorum-gated: a lone dead
+            # account is actionable, not an incident): every probed account
+            # dead is evidence of an upstream incident, not N independent
+            # deaths.
             info "all accounts dead — suspected upstream incident; quarantined nothing"
             return 1
         fi

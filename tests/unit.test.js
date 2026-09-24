@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -190,6 +191,42 @@ test('doctor reports auth problems without requiring Chrome or network', () => {
   assert.match(res.stdout + res.stderr, /cookie missing/i);
 });
 
+test('doctor live PoW check uses a bounded, enforced abort signal', async () => {
+  const { liveCheck, POW_PROBE_TIMEOUT_MS } = require('../scripts/doctor.js');
+  let request = null;
+  const fetchImpl = async (url, options) => {
+    request = { url, options };
+    return {
+      status: 200,
+      text: async () => JSON.stringify({ code: 0, data: { challenge: 'test' } }),
+    };
+  };
+
+  assert.equal(POW_PROBE_TIMEOUT_MS, 30000);
+  const checks = await liveCheck(
+    { token: 'test-token', cookie: 'test-cookie' },
+    { fetchImpl },
+  );
+  assert.equal(checks.length, 1);
+  assert.equal(checks[0].ok, true);
+  assert.equal(request.url, 'https://chat.deepseek.com/api/v0/chat/create_pow_challenge');
+  assert.ok(request.options.signal instanceof AbortSignal);
+
+  const hangingFetch = async (_url, { signal }) => new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      reject(err);
+    }, { once: true });
+  });
+  const timedOut = await liveCheck(
+    { token: 'test-token', cookie: 'test-cookie' },
+    { fetchImpl: hangingFetch, timeoutMs: 5 },
+  );
+  assert.equal(timedOut[0].ok, false);
+  assert.match(timedOut[0].reason, /^network:AbortError$/);
+});
+
 test('chrome auth prints actionable OS instructions when Chrome is missing', () => {
   const dir = tmpdir();
   const fakeChrome = path.join(dir, 'missing-chrome');
@@ -355,6 +392,48 @@ test('loopback host detection covers supported local bind addresses', () => {
   assert.equal(serverInternals.isLoopbackHost('::ffff:127.0.0.1'), true);
   assert.equal(serverInternals.isLoopbackHost('localhost'), true);
   assert.equal(serverInternals.isLoopbackHost('0.0.0.0'), false);
+});
+
+test('malformed Host header cannot reject the request handler', async () => {
+  await withServer(port => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/health', method: 'GET', headers: { Host: 'invalid:99999' } }, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => {
+        try {
+          assert.equal(res.statusCode, 200);
+          assert.equal(JSON.parse(Buffer.concat(chunks).toString('utf8')).status, 'ok');
+          resolve();
+        } catch (error) { reject(error); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  }));
+});
+
+test('malformed absolute-form request target returns 400 and keeps serving', async () => {
+  await withServer(async port => {
+    const rawResponse = await new Promise((resolve, reject) => {
+      const socket = net.createConnection({ host: '127.0.0.1', port }, () => {
+        socket.write('GET http://[ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+      });
+      const chunks = [];
+      socket.on('data', chunk => chunks.push(chunk));
+      socket.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      socket.on('error', reject);
+    });
+    assert.match(rawResponse, /^HTTP\/1\.1 400 /);
+    const health = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/health', method: 'GET' }, res => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(health, 200);
+  });
 });
 
 test('browser origin guard allows local UIs and exact configured origins only', () => {
@@ -1142,6 +1221,32 @@ test('restoreSessions drops stale entries and tolerates missing/corrupt stores',
   }
 });
 
+test('restoreSessions enforces MAX_SESSIONS on corrupt/oversized stores', () => {
+  const T = serverInternals;
+  const dir = tmpdir();
+  const savedSessions = Array.from(T.sessions.entries());
+  try {
+    T.sessions.clear();
+    const hugeStore = path.join(dir, 'too-many-bytes.json');
+    fs.writeFileSync(hugeStore, '');
+    fs.truncateSync(hugeStore, T.MAX_SESSION_STORE_BYTES + 1);
+    assert.equal(T.restoreSessions(Date.now(), hugeStore), 0, 'oversized store is rejected before JSON.parse');
+
+    const store = path.join(dir, 'oversized.json');
+    const sessions = Array.from({ length: T.MAX_SESSIONS + 25 }, (_, index) => [
+      `cap-agent-${index}`,
+      { id: null, parentMessageId: null, messageCount: 0, accountId: 'a1', history: [], lastActivityAt: Date.now() },
+    ]);
+    fs.writeFileSync(store, JSON.stringify({ v: 1, savedAt: Date.now(), sessions }));
+    assert.equal(T.restoreSessions(Date.now(), store), T.MAX_SESSIONS);
+    assert.equal(T.sessions.size, T.MAX_SESSIONS);
+  } finally {
+    T.sessions.clear();
+    for (const [key, value] of savedSessions) T.sessions.set(key, value);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('repair guard: first attempt new, verbatim retry repeats, third caps', () => {
   const s = serverInternals.createSession();
   const now = Date.now();
@@ -1349,6 +1454,8 @@ test('parseRetryAfterMs handles seconds, dates, garbage', () => {
   assert.equal(serverInternals.parseRetryAfterMs('soon'), null);
   assert.equal(serverInternals.parseRetryAfterMs(''), null);
   assert.ok(serverInternals.parseRetryAfterMs(new Date(Date.now() + 60000).toUTCString()) > 1000);
+  assert.equal(serverInternals.parseRetryAfterMs('9'.repeat(400)), 24 * 60 * 60 * 1000);
+  assert.equal(serverInternals.parseRetryAfterMs(new Date(Date.now() - 60000).toUTCString()), 1000);
 });
 
 test('classifyRecoveryFailure sanitizes arbitrary upstream types', () => {
@@ -2160,10 +2267,30 @@ test('Fix 6: normalizeMessageContent never falls through to raw JSON for image/u
   assert.equal(unknown, '[Unsupported content part: video]');
 });
 
-test('Fix 7: normalizeApiParams rejects non-array messages with 400 invalid_request', () => {
+test('Fix 7: normalizeApiParams rejects malformed client shapes with 400 invalid_request', () => {
   assert.throws(
     () => serverInternals.normalizeApiParams({ messages: 'not-an-array' }, 'anthropic'),
     (err) => err.status === 400 && err.type === 'invalid_request' && /messages must be an array/.test(err.message)
+  );
+  assert.throws(
+    () => serverInternals.normalizeApiParams({ messages: [{}] }, 'openai'),
+    (err) => err.status === 400 && /unsupported role/.test(err.message)
+  );
+  assert.throws(
+    () => serverInternals.normalizeApiParams({ messages: [{ role: 'user', content: '' }] }, 'openai'),
+    (err) => err.status === 400 && /must not be empty/.test(err.message)
+  );
+  assert.throws(
+    () => serverInternals.normalizeApiParams({ messages: [{ role: 'user', content: 'hi' }], tools: {} }, 'openai'),
+    (err) => err.status === 400 && /tools must be an array/.test(err.message)
+  );
+  assert.throws(
+    () => serverInternals.normalizeApiParams({ messages: [{ role: 'user', content: 'hi' }], tools: [{ type: 'function', name: 'x' }] }, 'openai'),
+    (err) => err.status === 400 && /valid function name/.test(err.message)
+  );
+  assert.throws(
+    () => serverInternals.normalizeApiParams({ input: [{ type: 'message', role: 'user', content: 'hi' }], tools: [{}] }, 'responses'),
+    (err) => err.status === 400 && /valid function name/.test(err.message)
   );
   assert.doesNotThrow(() => serverInternals.normalizeApiParams({ messages: [{ role: 'user', content: 'hi' }] }, 'anthropic'));
   assert.doesNotThrow(() => serverInternals.normalizeApiParams({ messages: [] }, 'anthropic'));
@@ -2978,6 +3105,7 @@ test('retry toggle: rateLimitRetryDelayMs floors at 2s, honors Retry-After, caps
   assert.equal(d(-5), 2000);
   assert.equal(d(5), 5000);
   assert.equal(d(120), 10000);
+  assert.equal(d(new Date(Date.now() + 60000).toUTCString()), 10000, 'HTTP-date is capped like delta-seconds');
 });
 
 test('retry toggle: shouldRetryInPlace wires flag, rate-limit, state, backoff, readiness', () => {
@@ -3006,6 +3134,7 @@ test('retry toggle: shouldAttemptInPlaceRetry only for unknown/brief backoffs', 
   assert.equal(f(10), true, 'cap boundary inclusive');
   assert.equal(f(11), false, 'long backoff -> migration');
   assert.equal(f(600), false);
+  assert.equal(f(new Date(Date.now() + 60000).toUTCString()), false, 'HTTP-date must not become an optimistic 2s retry');
   assert.equal(f('garbage'), true, 'unparseable -> probe (delay floors)');
   assert.equal(f(-3), true, 'negative -> probe (delay floors)');
 });
@@ -3445,6 +3574,11 @@ test('capacity: sticky live chat fails fast 503 on saturated account, chat-less 
   );
   assert.equal(live.id, 'live-chat-cap', 'chat preserved');
   assert.equal(live.accountId, 'cap-sticky', 'sticky account unchanged');
+  assert.equal(
+    serverInternals.selectAccountForSession(live, 'same-turn', sticky),
+    sticky,
+    'the turn that owns the lease may continue through retry/continuation',
+  );
 
   // Chat-less session rotates freely away from saturated sticky to idle peer
   const chatless = serverInternals.createSession();
@@ -3750,6 +3884,47 @@ test('cli quarantine: circuit breaker moves nothing when every account is dead',
   assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), true);
   assert.equal(fs.existsSync(path.join(q.authDir, 'b.json')), true);
   assert.equal(q.qdir(), null, 'breaker moved nothing');
+});
+
+test('fix cli: check all with a single dead account quarantines it (no quorum for a breaker)', (t) => {
+  const q = qcliSetup(t);
+  q.write('solo.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  const res = q.run(['check', 'all']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1, 'exit 1 preserved on dead');
+  assert.match(out, /account_1 solo: DEAD http-401/);
+  assert.doesNotMatch(out, /all accounts dead/, 'single verdict cannot trip the incident breaker');
+  assert.match(out, /quarantined: solo \(http-401\)/, 'single dead account moves after double-tap');
+  assert.equal(fs.existsSync(path.join(q.authDir, 'solo.json')), false, 'moved out of live dir');
+  assert.ok(q.qdir(), 'quarantine dir created');
+});
+
+test('fix cli: probe-failure is not a verdict — dead peer still quarantines', (t) => {
+  const q = qcliSetup(t);
+  q.write('a.json', { token: 't', cookie: 'c', stub: 'dead401' });
+  fs.writeFileSync(path.join(q.authDir, 'b.json'), '{broken json');
+  const res = q.run(['check', 'all']);
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1);
+  assert.match(out, /account_1 a: DEAD http-401/);
+  assert.match(out, /account_2 b: PROBE-FAILED/);
+  assert.match(out, /1 probe-failure\(s\) excluded from quorum/);
+  assert.doesNotMatch(out, /all accounts dead/, 'tool failure must not complete an incident quorum');
+  assert.equal(fs.existsSync(path.join(q.authDir, 'a.json')), false, 'dead account still moves');
+  assert.equal(fs.existsSync(path.join(q.authDir, 'b.json')), true, 'unreadable file left for the operator');
+  assert.ok(q.qdir());
+});
+
+test('fix cli: check all double-tap spares fail-once-then-pass accounts without tripping the breaker', (t) => {
+  const q = qcliSetup(t);
+  q.write('f.json', { token: 't', cookie: 'c', stub: 'flaky' });
+  const res = q.run(['check', 'all'], { STUB_STATE: q.root });
+  const out = res.stdout + res.stderr;
+  assert.equal(res.status, 1, 'first verdict still DEAD, exit 1 preserved');
+  assert.match(out, /account_1 f: DEAD http-401/);
+  assert.doesNotMatch(out, /all accounts dead/, 'unconfirmed single verdict is not an incident');
+  assert.equal(fs.existsSync(path.join(q.authDir, 'f.json')), true, 'no move after single allowlisted verdict');
+  assert.equal(q.qdir(), null, 'no quarantine dir created');
 });
 
 test('cli quarantine: http-429 dead is never quarantine-worthy', (t) => {
@@ -4845,6 +5020,45 @@ test('C1 keyed HTTP namespaces the session under the principal', async () => {
   }
 });
 
+test('reset-session scopes keyless and keyed reset-all to the caller namespace', async () => {
+  const T = serverInternals;
+  const savedSessions = Array.from(T.sessions.entries());
+  const originalKey = process.env.PROXY_API_KEY;
+  delete process.env.PROXY_API_KEY;
+  try {
+    await withServer(async port => {
+      T.sessions.clear();
+      T.sessions.set('dev-agent', T.createSession());
+      T.sessions.set('dev-agent:fingerprint', T.createSession());
+      T.sessions.set('203.0.113.9:fingerprint', T.createSession());
+      let response = await post(port, '/reset-session?agent=all', {});
+      assert.equal(response.status, 200);
+      assert.equal(T.sessions.has('dev-agent'), false);
+      assert.equal(T.sessions.has('dev-agent:fingerprint'), false);
+      assert.equal(T.sessions.has('203.0.113.9:fingerprint'), true, 'keyless reset must not cross IP namespaces');
+
+      process.env.PROXY_API_KEY = 'reset-test-key';
+      try {
+        const principal = T.principalForRequest('Bearer reset-test-key');
+        T.sessions.set(`${principal}:alice`, T.createSession());
+        T.sessions.set('other-principal:alice', T.createSession());
+        response = await post(port, '/reset-session?agent=all', {}, { Authorization: 'Bearer reset-test-key' });
+        assert.equal(response.status, 200);
+        assert.equal(T.sessions.has(`${principal}:alice`), false);
+        assert.equal(T.sessions.has('other-principal:alice'), true);
+      } finally {
+        if (originalKey === undefined) delete process.env.PROXY_API_KEY;
+        else process.env.PROXY_API_KEY = originalKey;
+      }
+    });
+  } finally {
+    if (originalKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = originalKey;
+    T.sessions.clear();
+    for (const [key, value] of savedSessions) T.sessions.set(key, value);
+  }
+});
+
 test('C2b health hides private fields from anonymous probes unless opted in', () => {
   const T = serverInternals;
   assert.deepEqual(Object.keys(T.buildHealthPayload(undefined, '')).sort(), ['service', 'status', 'watermark']);
@@ -5400,6 +5614,8 @@ test('audit 1.2: setMaxPerAccount ignores invalid, NaN, and negative values, cla
     assert.equal(T.getMaxPerAccount(), prev);
     T.setMaxPerAccount(5);
     assert.equal(T.getMaxPerAccount(), 5);
+    T.setMaxPerAccount(1.9);
+    assert.equal(T.getMaxPerAccount(), 1, 'fractional limits floor to an integer');
     T.setMaxPerAccount(15);
     assert.equal(T.getMaxPerAccount(), 10);
     T.setMaxPerAccount(0);
@@ -5570,6 +5786,215 @@ test('audit 1.3: concurrent leases respect MAX_PER_ACCOUNT ceiling and fail-clos
   }
 });
 
+test('session turn ownership rejects overlap and can atomically rekey fingerprints', () => {
+  const T = serverInternals;
+  const ownerA = {};
+  const ownerB = {};
+  assert.equal(T.acquireSessionTurn('agent-base', ownerA), true);
+  assert.equal(T.acquireSessionTurn('agent-base', ownerB), false);
+  assert.equal(T.rekeySessionTurn('agent-base', 'agent-fp', ownerA), true);
+  assert.equal(T.activeSessionTurns.has('agent-base'), false);
+  assert.equal(T.rekeySessionTurn('agent-fp', 'agent-fp', ownerB), false);
+  T.releaseSessionTurn('agent-fp', ownerB);
+  assert.equal(T.activeSessionTurns.has('agent-fp'), true, 'wrong owner cannot release lock');
+  T.releaseSessionTurn('agent-fp', ownerA);
+  assert.equal(T.activeSessionTurns.has('agent-fp'), false);
+  assert.equal(T.acquireSessionTurn('agent-fp', ownerB), true);
+  T.releaseSessionTurn('agent-fp', ownerB);
+});
+
+test('opener adoption ignores a source session with an active turn owner', (t) => {
+  const T = serverInternals;
+  const sourceKey = 'dev-agent:source-fp';
+  const candidateKey = 'dev-agent:candidate-fp';
+  const messages = [{ role: 'user', content: 'opener' }, { role: 'user', content: 'next' }];
+  const source = T.createSession();
+  source.id = 'remote-chat';
+  source.deltaMsgCount = 1;
+  source.deltaBoundary = T.hashMessageEnvelope(messages[0]);
+  T.sessions.set(sourceKey, source);
+  t.after(() => {
+    T.releaseSessionTurn(sourceKey, source.activeOwner);
+    T.sessions.delete(sourceKey);
+    T.sessions.delete(candidateKey);
+  });
+
+  assert.equal(T.findAdoptableSession('dev-agent', candidateKey, messages)?.id, sourceKey);
+  const owner = {};
+  source.activeOwner = owner;
+  assert.equal(T.acquireSessionTurn(sourceKey, owner), true);
+  assert.equal(T.findAdoptableSession('dev-agent', candidateKey, messages), null);
+});
+
+test('HTTP same-session overlap returns 409 while the first upstream turn is active', async () => {
+  const T = serverInternals;
+  const originalAccounts = T.accounts.splice(0);
+  const originalFetch = global.fetch;
+  const savedSessions = Array.from(T.sessions.entries());
+  let releaseUpstream;
+  let notifyStarted;
+  const started = new Promise(resolve => { notifyStarted = resolve; });
+  T.accounts.push({
+    id: 'turn-lock-account', config: { token: 't', cookie: 'c', wasmUrl: 'https://example.invalid/pow.wasm' },
+    headers: {}, cooldownUntil: 0, failures: 0, consecutiveFailures: 0, consecutiveTimeouts: 0,
+    inflight: 0, requestTimes: [], lastDispatchedAt: 0, ewmaLatencyMs: 0,
+  });
+  global.fetch = async () => new Promise((resolve) => {
+    releaseUpstream = () => resolve({ ok: false, status: 503, headers: { get: () => null }, text: async () => '' });
+    notifyStarted();
+  });
+
+  try {
+    await withServer(async port => {
+      T.sessions.clear();
+      const first = post(port, '/v1/chat/completions', {
+        model: 'deepseek-chat', messages: [{ role: 'user', content: 'first' }], stream: false,
+      }, { 'x-agent-session': 'turn-lock-http' });
+      await started;
+      const second = await post(port, '/v1/chat/completions', {
+        model: 'deepseek-chat', messages: [{ role: 'user', content: 'second' }], stream: false,
+      }, { 'x-agent-session': 'turn-lock-http' });
+      assert.equal(second.status, 409);
+      assert.equal(JSON.parse(second.body).error.type, 'session_busy');
+      releaseUpstream();
+      const firstResponse = await first;
+      assert.equal(firstResponse.status, 503);
+    });
+  } finally {
+    global.fetch = originalFetch;
+    T.accounts.splice(0, T.accounts.length, ...originalAccounts);
+    T.sessions.clear();
+    for (const [key, value] of savedSessions) T.sessions.set(key, value);
+  }
+});
+
+test('client cancellation is distinguished from upstream timeout for account scoring', () => {
+  const T = serverInternals;
+  const controller = new AbortController();
+  controller.abort();
+  const aborted = new Error('aborted');
+  aborted.name = 'AbortError';
+  assert.equal(T.isClientCancellation(aborted, () => false, controller.signal), true);
+  assert.equal(T.isClientCancellation(aborted, () => true, null), true);
+  const upstreamTimeout = new Error('upstream timeout');
+  upstreamTimeout.name = 'TimeoutError';
+  assert.equal(T.isClientCancellation(upstreamTimeout, () => false, null), false);
+  assert.equal(T.isClientCancellation(new Error('ordinary failure'), () => true, null), false);
+});
+
+test('session-create HTTP failure marks the account exactly once', async () => {
+  const T = serverInternals;
+  const account = { failures: 0, consecutiveFailures: 0, consecutiveTimeouts: 0, cooldownUntil: 0 };
+  const result = await T.readDeepSeekJsonResponse({
+    ok: false,
+    status: 500,
+    text: async () => JSON.stringify({ error: 'upstream' }),
+  }, 'session create', account, '3');
+  assert.equal(result.failureMarked, true);
+  assert.equal(account.failures, 1);
+  assert.equal(account.consecutiveFailures, 1);
+  assert.equal(T.sessionCreateFailureStatus(200), 502);
+  assert.equal(T.sessionCreateFailureStatus(202), 502);
+  assert.equal(T.sessionCreateFailureStatus(204), 502);
+  assert.equal(T.sessionCreateFailureStatus(429), 429);
+  await assert.rejects(
+    T.readDeepSeekJsonResponse({ ok: true, status: 200, text: async () => 'not-json' }, 'session create', { failures: 0 }),
+    error => error.status === 502 && error.type === 'upstream_invalid_response',
+  );
+});
+
+test('pool exhaustion separates saturated, cooling, and auth-dead accounts', (t) => {
+  const T = serverInternals;
+  const originalAccounts = T.accounts.splice(0);
+  const originalMax = T.getMaxPerAccount();
+  t.after(() => {
+    T.accounts.splice(0, T.accounts.length, ...originalAccounts);
+    T.setMaxPerAccount(originalMax);
+  });
+
+  T.setMaxPerAccount(1);
+  const busy = { id: 'busy', config: { token: 't', cookie: 'c' }, cooldownUntil: 0, inflight: 1, requestTimes: [] };
+  T.accounts.push(busy);
+  let error = T.poolExhaustionError();
+  assert.equal(error.status, 503);
+  assert.equal(error.type, 'overloaded');
+  assert.ok(error.retryAfter >= 1 && error.retryAfter <= 10);
+  assert.equal(T.accountStatus(busy).ready, true, 'capacity is separate from semantic readiness');
+  busy.isProbeActive = true;
+  error = T.poolExhaustionError();
+  assert.equal(error.status, 503, 'temporary rate-limit probe is busy, not a long cooldown');
+  delete busy.isProbeActive;
+
+  T.accounts.splice(0, T.accounts.length,
+    { id: 'dead-auth', config: { token: 't', cookie: 'c' }, authUnavailable: true, cooldownUntil: 0, requestTimes: [] },
+    { id: 'cooling', config: { token: 't', cookie: 'c' }, cooldownUntil: Date.now() + 30000, requestTimes: [] },
+  );
+  error = T.poolExhaustionError();
+  assert.equal(error.status, 429, 'dead auth must not shorten the valid cooling account retry');
+  assert.ok(error.retryAfter >= 29);
+
+  T.accounts.splice(0, T.accounts.length,
+    { id: 'dead-auth', config: { token: 't', cookie: 'c' }, authUnavailable: true, cooldownUntil: 0, requestTimes: [] },
+  );
+  error = T.poolExhaustionError();
+  assert.equal(error.status, 503);
+  assert.equal(error.type, 'auth_unavailable');
+  assert.equal(T.accountStatus(T.accounts[0]).ready, false);
+});
+
+test('a single oversized history entry is bounded', (t) => {
+  const T = serverInternals;
+  const key = 'history-bound-test';
+  T.sessions.delete(key);
+  t.after(() => { T.sessions.delete(key); T.sessions.delete(`${key}-live`); });
+  T.storeHistory(`${key}-live`, 'START' + 'x'.repeat(1024 * 1024) + 'LATEST_SENTINEL', 'y'.repeat(1024 * 1024), null);
+  const liveEntry = T.sessions.get(`${key}-live`).history[0];
+  assert.ok(liveEntry.user.length + liveEntry.assistant.length <= 10000);
+  assert.match(liveEntry.user, /LATEST_SENTINEL$/);
+  assert.match(liveEntry.assistant, /history truncated/);
+  T.sessions.delete(`${key}-live`);
+
+  const serialized = T.serializeSession({ history: [{ user: 'u'.repeat(1024 * 1024), assistant: 'a'.repeat(1024 * 1024) }] });
+  assert.ok(serialized.history[0].user.length + serialized.history[0].assistant.length <= 10000);
+  assert.match(T.boundHistoryTail('old' + 'z'.repeat(1000) + 'TAIL', 64), /TAIL$/);
+});
+
+test('runtime missing-PoW response returns 502 without quarantining the account', async (t) => {
+  const T = serverInternals;
+  const originalAccounts = T.accounts.splice(0);
+  const originalFetch = global.fetch;
+  const key = 'missing-pow-runtime-test';
+  const account = {
+    id: 'missing-pow-account', config: { token: 't', cookie: 'c', wasmUrl: 'https://example.invalid/pow.wasm' },
+    headers: {}, cooldownUntil: 0, failures: 0, consecutiveFailures: 0, consecutiveTimeouts: 0,
+    inflight: 0, requestTimes: [], lastDispatchedAt: 0,
+  };
+  T.accounts.push(account);
+  T.sessions.set(key, T.createSession());
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ code: 40003, data: { biz_data: {} } }),
+  });
+  t.after(() => {
+    global.fetch = originalFetch;
+    T.accounts.splice(0, T.accounts.length, ...originalAccounts);
+    T.sessions.delete(key);
+  });
+
+  await assert.rejects(
+    T.askDeepSeekStream('hello', key, 'deepseek-chat', 'hello'),
+    error => error.status === 502 && error.type === 'pow_error',
+  );
+  assert.equal(T.accounts.includes(account), true);
+  assert.equal(account.quarantined, undefined);
+  assert.equal(account.authUnavailable, undefined);
+  assert.equal(account.inflight, 0);
+  assert.equal(account.failures, 1, 'missing PoW counts as a soft failure for cooling');
+  assert.equal(account.consecutiveFailures, 1);
+  assert.equal(account.cooldownUntil, 0, 'first observation preserves the account without sidelining');
+});
+
 test('qol 1 & 2: quarantineAccount removes account, moves file and backups, unbinds sessions', (t) => {
   const T = serverInternals;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ds-quarantine-test-'));
@@ -5684,7 +6109,7 @@ test('qol 3: OpenCode warning formatting across rateLimitExhaustedMessage and se
   );
 });
 
-test('qol 4: rotateAccountsOnRestart advances starting account and re-anchors sessions', (t) => {
+test('qol 4: rotateAccountsOnRestart changes new-chat order without invalidating restored sessions', (t) => {
   const T = serverInternals;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ds-rotation-test-'));
   const stateFile = path.join(tmpDir, '.proxy-state.json');
@@ -5704,21 +6129,29 @@ test('qol 4: rotateAccountsOnRestart advances starting account and re-anchors se
 
   const session = T.createSession();
   session.id = 'chat_prev';
+  session.parentMessageId = 'msg_parent';
   session.accountId = 'acct_a';
+  session.deltaMsgCount = 4;
+  session.deltaPrefixHash = 'prefix_hash';
   T.sessions.set('agent_opencode', session);
+  t.after(() => { T.sessions.delete('agent_opencode'); });
 
   // Restart 1: advances to acct_b
   const st1 = T.rotateAccountsOnRestart(stateFile);
   assert.equal(st1.restartCount, 1);
   assert.equal(T.accounts[0].id, 'acct_b');
-  assert.equal(session.accountId, 'acct_b', 're-anchored to new starting account');
-  assert.equal(session.id, null, 'chat id reset so opencode speaks fresh to new account');
+  assert.equal(session.accountId, 'acct_a', 'restored chat remains on its credential owner');
+  assert.equal(session.id, 'chat_prev', 'remote chat survives restart rotation');
+  assert.equal(session.parentMessageId, 'msg_parent');
+  assert.equal(session.deltaMsgCount, 4);
+  assert.equal(session.deltaPrefixHash, 'prefix_hash');
 
   // Restart 2: advances to acct_c
   const st2 = T.rotateAccountsOnRestart(stateFile);
   assert.equal(st2.restartCount, 2);
   assert.equal(T.accounts[0].id, 'acct_c');
-  assert.equal(session.accountId, 'acct_c');
+  assert.equal(session.accountId, 'acct_a');
+  assert.equal(session.id, 'chat_prev');
 
   // Restart 3: wraps back to acct_a
   const st3 = T.rotateAccountsOnRestart(stateFile);
@@ -5731,5 +6164,198 @@ test('qol 4: rotateAccountsOnRestart advances starting account and re-anchors se
   const rawState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
   assert.equal(rawState.restartCount, 3);
   assert.equal(rawState.lastAccountId, 'acct_a');
+});
+
+test('fix: finishOpenAIStream tool-call chunks never write to a dead socket', () => {
+  const T = serverInternals;
+  const toolResp = () => ({
+    id: 'ds-guard-1',
+    created: 123456,
+    model: 'deepseek-chat',
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  });
+  const liveChunks = [];
+  const liveRes = {
+    headersSent: true, writableEnded: false, destroyed: false,
+    writeHead: () => {}, write: (d) => { liveChunks.push(d); },
+    end: () => {},
+  };
+  T.finishOpenAIStream(liveRes, toolResp());
+  assert.ok(liveChunks.some(c => c.includes('"tool_calls"')), 'live socket still gets tool-call chunks');
+
+  for (const dead of [
+    { writableEnded: true, destroyed: false },
+    { writableEnded: false, destroyed: true },
+  ]) {
+    const writes = [];
+    const res = {
+      headersSent: true, writableEnded: dead.writableEnded, destroyed: dead.destroyed,
+      writeHead: () => {}, write: (d) => { writes.push(d); },
+      end: () => { throw new Error('end must not run on a dead socket'); },
+    };
+    assert.doesNotThrow(() => T.finishOpenAIStream(res, toolResp()));
+    assert.equal(writes.length, 0, `no writes when writableEnded=${dead.writableEnded} destroyed=${dead.destroyed}`);
+  }
+});
+
+test('fix: handleFatalRuntimeError honors the fatal flag via injected deps (never real exit)', () => {
+  const T = serverInternals;
+  const calls = [];
+  const deps = (fatal) => ({
+    fatal,
+    log: (...a) => { calls.push(['log', ...a]); },
+    persist: () => { calls.push(['persist']); },
+    exit: (code) => { calls.push(['exit', code]); },
+  });
+  T.handleFatalRuntimeError('unhandledRejection', new Error('boom'), deps(1));
+  assert.ok(calls.some((c) => c[0] === 'log'), 'always logs');
+  assert.ok(calls.some((c) => c[0] === 'persist'), 'fatal path persists');
+  assert.deepEqual(calls.filter((c) => c[0] === 'exit'), [['exit', 1]], 'fatal path exits non-zero');
+  calls.length = 0;
+  T.handleFatalRuntimeError('uncaughtException', new Error('boom'), deps(0));
+  assert.ok(calls.some((c) => c[0] === 'log'), 'log-only still logs');
+  assert.ok(!calls.some((c) => c[0] === 'persist'), 'log-only never persists');
+  assert.ok(!calls.some((c) => c[0] === 'exit'), 'log-only never exits');
+  calls.length = 0;
+  T.handleFatalRuntimeError('k', new Error('x'), { ...deps(1), persist: () => { throw new Error('disk gone'); } });
+  assert.deepEqual(calls.filter((c) => c[0] === 'exit'), [['exit', 1]], 'a throwing persist still exits');
+});
+
+test('fix: FATAL_ON_UNHANDLED knob defaults to 1 and rejects garbage via numEnv', () => {
+  const T = serverInternals;
+  const key = 'DEEPSEEK_FATAL_ON_UNHANDLED';
+  const saved = process.env[key];
+  try {
+    delete process.env[key];
+    assert.equal(T.numEnv(key, 1, 0, 1), 1, 'unset defaults to fatal');
+    process.env[key] = 'garbage';
+    assert.equal(T.numEnv(key, 1, 0, 1), 1, 'garbage falls back to fatal');
+    process.env[key] = '7';
+    assert.equal(T.numEnv(key, 1, 0, 1), 1, 'out-of-range falls back to fatal');
+    process.env[key] = '0';
+    assert.equal(T.numEnv(key, 1, 0, 1), 0, 'explicit 0 opts into log-only');
+  } finally {
+    if (saved === undefined) delete process.env[key];
+    else process.env[key] = saved;
+  }
+});
+
+test('fix: commitTurnState rejects without session/message, accepts and sequences turns', () => {
+  const T = serverInternals;
+  assert.equal(T.commitTurnState(null, 'm1', [], false), false, 'no session commits nothing');
+  assert.equal(T.commitTurnState(T.createSession(), null, [], false), false, 'no message id commits nothing');
+  assert.equal(T.commitTurnState(T.createSession(), undefined, [], false), false, 'undefined message id commits nothing');
+  const untouched = T.createSession();
+  assert.equal(T.commitTurnState(untouched, null, [], false), false);
+  assert.equal(untouched.parentMessageId, null, 'rejected commit mutates nothing');
+  assert.equal(untouched.messageCount, 0, 'rejected commit mutates nothing');
+  const s = T.createSession();
+  assert.equal(T.commitTurnState(s, 'm1', [], false), true);
+  assert.equal(s.parentMessageId, 'm1');
+  assert.equal(s.messageCount, 1);
+  assert.equal(T.commitTurnState(s, 'm2', [], false), true);
+  assert.equal(s.parentMessageId, 'm2', 'second turn advances the cursor');
+  assert.equal(s.messageCount, 2);
+});
+
+test('fix: readyz predicate pins ready/cooling/auth-unavailable via isAccountReady', () => {
+  const T = serverInternals;
+  const now = Date.now();
+  const mk = (over = {}) => ({ config: { token: 't', cookie: 'c' }, cooldownUntil: 0, requestTimes: [], ...over });
+  assert.equal(T.isAccountReady(mk(), now), true, 'credentialed, uncooled account is ready');
+  assert.equal(T.isAccountReady(mk({ cooldownUntil: now + 60000 }), now), false, 'cooling account is not ready');
+  assert.equal(T.isAccountReady(mk({ authUnavailable: true }), now), false, 'auth-unavailable (quarantine or plain auth expiry) account is not ready');
+  assert.equal(T.isAccountReady(mk({ isProbeActive: true }), now), false, 'account under an in-place probe is not ready');
+  assert.equal(T.isAccountReady(mk({ config: {} }), now), false, 'credential-less account is not ready');
+  assert.equal(T.buildHealthPayload().status, 'ok', '/health liveness contract holds');
+});
+
+test('fix: empty-retry lease swap accounting releases the old lease and adopts the rotated account', () => {
+  const T = serverInternals;
+  const oldAcct = { id: 'lease-old', inflight: 0 };
+  const newAcct = { id: 'lease-new', inflight: 0 };
+  T.acquireAccountLease(oldAcct);
+  T.acquireAccountLease(newAcct); // what askDeepSeekStream does on rotation
+  assert.equal(T.applyLeaseRotation(oldAcct, newAcct), newAcct);
+  assert.equal(oldAcct.inflight, 0, 'old lease released, no leak');
+  assert.equal(newAcct.inflight, 1, 'rotated lease adopted exactly once');
+  // Same-account retry: no release, no double-count.
+  T.acquireAccountLease(oldAcct);
+  assert.equal(T.applyLeaseRotation(oldAcct, oldAcct), oldAcct);
+  assert.equal(oldAcct.inflight, 1);
+  // Null rotation: lease untouched.
+  assert.equal(T.applyLeaseRotation(oldAcct, null), oldAcct);
+  assert.equal(oldAcct.inflight, 1);
+  // Null active lease with a rotated account: adopt without releasing.
+  const fresh = { id: 'lease-fresh', inflight: 1 };
+  assert.equal(T.applyLeaseRotation(null, fresh), fresh);
+  assert.equal(fresh.inflight, 1);
+  T.releaseAccountLease(oldAcct);
+  T.releaseAccountLease(newAcct);
+  assert.equal(oldAcct.inflight, 0);
+  assert.equal(newAcct.inflight, 0);
+  // Wiring (honest scope note): the empty-retry loop itself cannot be driven
+  // hermetically (inline in the request handler, needs upstream), so this
+  // pins that its call site captures the rotated account and routes the swap
+  // through the helper asserted above — reverting either half fails here.
+  const src = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+  assert.ok(src.includes('account: retryAccount'), 'call site captures the rotated account');
+  assert.ok(
+    src.includes('applyLeaseRotation(activeAccountLease, retryAccount)'),
+    'call site swaps through applyLeaseRotation'
+  );
+});
+
+test('fix: quarantineAccount refuses overwrite on collision (json + .bak)', (t) => {
+  const T = serverInternals;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ds-quarantine-collision-'));
+  t.after(() => {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  });
+
+  const accDir = path.join(tmpDir, 'accounts');
+  fs.mkdirSync(accDir, { recursive: true });
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const qDir = path.join(tmpDir, `accounts-quarantined-${todayStr}`);
+  fs.mkdirSync(qDir, { recursive: true });
+
+  // Pre-existing quarantined credential (e.g. a renewed duplicate quarantined first).
+  const existingJson = path.join(qDir, 'dup.json');
+  const existingBak = path.join(qDir, 'dup.json.bak');
+  fs.writeFileSync(existingJson, 'ORIGINAL-QUARANTINED');
+  fs.writeFileSync(existingBak, 'ORIGINAL-BAK');
+
+  const accFile = path.join(accDir, 'dup.json');
+  const bakFile = path.join(accDir, 'dup.json.bak');
+  fs.writeFileSync(accFile, JSON.stringify({ token: 'tok', cookie: 'cook' }), { mode: 0o600 });
+  fs.writeFileSync(bakFile, 'NEW-BAK', { mode: 0o600 });
+
+  const account = {
+    id: 'dup',
+    file: accFile,
+    config: { token: 'tok', cookie: 'cook' },
+    headers: {},
+  };
+  T.accounts.push(account);
+  t.after(() => {
+    const i = T.accounts.indexOf(account);
+    if (i !== -1) T.accounts.splice(i, 1);
+  });
+
+  T.quarantineAccount(account, 'collision test', tmpDir);
+
+  assert.equal(fs.existsSync(accFile), true, 'source json left in place on collision');
+  assert.equal(fs.readFileSync(existingJson, 'utf8'), 'ORIGINAL-QUARANTINED', 'existing quarantined file never overwritten');
+  assert.equal(fs.existsSync(bakFile), true, 'source bak left in place on collision');
+  assert.equal(fs.readFileSync(existingBak, 'utf8'), 'ORIGINAL-BAK', 'existing quarantined bak never overwritten');
+  assert.equal(T.accounts.includes(account), false, 'account still out of the pool');
+  assert.equal(account.quarantined, true);
 });
 

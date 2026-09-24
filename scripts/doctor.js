@@ -8,6 +8,7 @@ const DEFAULT_AUTH = process.env.DEEPSEEK_AUTH_PATH || path.join(ROOT, 'deepseek
 // Single source of truth for verdict meaning: doctor never reimplements
 // classification (no local regex mapping) — probe-account.js owns it.
 const { classifyPowResponse, isQuarantineWorthy } = require('./probe-account.js');
+const POW_PROBE_TIMEOUT_MS = 30000;
 
 function isTruthy(v) { return /^(1|true|yes|on)$/i.test(String(v || '')); }
 function argHas(args, ...names) { return args.some(a => names.includes(a)); }
@@ -38,7 +39,7 @@ function checkAuthFile(file) {
   }
   return { file, ok: issues.length === 0, issues, auth };
 }
-async function liveCheck(auth) {
+async function liveCheck(auth, { fetchImpl = globalThis.fetch, timeoutMs = POW_PROBE_TIMEOUT_MS } = {}) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 Chrome/149.0.0.0 Safari/537.36',
     'x-client-platform': 'web',
@@ -56,8 +57,9 @@ async function liveCheck(auth) {
   };
   const checks = [];
   try {
-    const r = await fetch('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
-      method: 'POST', headers, body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
+    const r = await fetchImpl('https://chat.deepseek.com/api/v0/chat/create_pow_challenge', {
+      method: 'POST', headers, body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
+      signal: AbortSignal.timeout(timeoutMs)
     });
     const text = await r.text();
     // Classify through the shared probe classifier: ALIVE requires an explicit
@@ -105,7 +107,7 @@ async function main(args = process.argv.slice(2)) {
       }
     }
   }
-  console.log('\nSession reuse: one x-agent-session/user => one DeepSeek chat until TTL/message limit/error reset.');
+  console.log('\nSession reuse: one resolved client key => one DeepSeek chat until explicit reset, client compaction, or rate-limit migration.');
   console.log('Reset: curl -X POST "http://localhost:9655/reset-session?agent=all"');
   console.log('VPS: import auth on server, then run NON_INTERACTIVE=1 npm start');
   return ok ? 0 : 2;
@@ -113,4 +115,4 @@ async function main(args = process.argv.slice(2)) {
 if (require.main === module) {
   main().then(code => process.exit(code)).catch(e => { console.error('[doctor] ERROR:', e.message); process.exit(1); });
 }
-module.exports = { checkAuthFile, authPaths };
+module.exports = { checkAuthFile, authPaths, liveCheck, POW_PROBE_TIMEOUT_MS };
