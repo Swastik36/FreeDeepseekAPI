@@ -2213,7 +2213,10 @@ async function consumeDeepSeekStream(readable, { onReasoningDone, onReasoningPro
     for await (const chunk of readable) {
         if (isClientGone && isClientGone()) {
             try {
-                if (typeof readable.cancel === 'function') readable.cancel();
+                // Await the cancel: for-await holds the stream lock, so an
+                // un-awaited cancel() rejects ("locked") as an unhandled
+                // rejection and kills the process via the fatal handler.
+                if (typeof readable.cancel === 'function') await readable.cancel();
                 else if (typeof readable.destroy === 'function') readable.destroy();
             } catch (e) { }
             return { content: '', reasoningContent: '', messageId: null, finishReason: null, modelError: null, abandoned: true };
@@ -5113,7 +5116,27 @@ const server = http.createServer(async (req, res) => {
         const callerBase = resolveAgentId({ requestedSession: '', remoteAddr, authorization: req.headers.authorization, principal });
         let agentId = '';
         if (principal) {
-            agentId = resolveAgentId({ requestedSession: requestedAgent, remoteAddr, authorization: req.headers.authorization, principal });
+            const keyPrefix = `${principal}:`;
+            if (requestedAgent !== 'default' && requestedAgent !== 'all'
+                && requestedAgent.startsWith(keyPrefix) && sessions.has(requestedAgent)) {
+                // Honor colon-namespaced internal keys verbatim: sanitize-first
+                // would mangle them (':' is not in the session-id charset).
+                agentId = requestedAgent;
+            } else if (requestedAgent === 'default') {
+                // The implicit keyed bucket (e.g. '<principal>:dev-agent'),
+                // not a literal '<principal>:default' session.
+                agentId = callerBase;
+            } else if (requestedAgent !== 'all' && requestedAgent.includes(':')) {
+                // A colon key that matched no live session must 404: falling
+                // through to sanitize-first would strip ':' and reset the
+                // caller's implicit bucket instead of the requested session.
+                console.log(`[DS-API] 404 reset-miss: no session for agent ${logToken(requestedAgent)}`);
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `No session for agent: ${requestedAgent}` }));
+                return;
+            } else {
+                agentId = resolveAgentId({ requestedSession: requestedAgent, remoteAddr, authorization: req.headers.authorization, principal });
+            }
         } else if (requestedAgent === 'default') {
             agentId = callerBase;
         } else if ((requestedAgent === callerBase || requestedAgent.startsWith(`${callerBase}:`)) && sessions.has(requestedAgent)) {

@@ -6359,3 +6359,116 @@ test('fix: quarantineAccount refuses overwrite on collision (json + .bak)', (t) 
   assert.equal(account.quarantined, true);
 });
 
+test('fix F-1: client-gone cancel on a for-await-locked stream abandons without unhandledRejection', async (t) => {
+  const T = serverInternals;
+  const unhandled = [];
+  const onUnhandled = (reason) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => { process.removeListener('unhandledRejection', onUnhandled); });
+  const stream = new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"hi"}\n')); },
+  });
+  const result = await T.consumeDeepSeekStream(stream, { isClientGone: () => true });
+  assert.equal(result.abandoned, true, 'client-gone turn abandons');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(unhandled.length, 0, `cancel rejection must be caught, got: ${unhandled.map(String).join('; ')}`);
+});
+
+test('fix F-4: keyed reset honors verbatim colon keys and agent=default hits the implicit bucket', async () => {
+  const T = serverInternals;
+  const savedSessions = Array.from(T.sessions.entries());
+  const originalKey = process.env.PROXY_API_KEY;
+  process.env.PROXY_API_KEY = 'f4-test-key';
+  try {
+    await withServer(async (port) => {
+      T.sessions.clear();
+      const principal = T.principalForRequest('Bearer f4-test-key');
+      assert.match(principal, /^[0-9a-f]{16}$/);
+      const implicit = `${principal}:dev-agent`;
+      const colonKey = `${principal}:opencode:abc123`;
+      const mkLive = () => {
+        const s = T.createSession();
+        s.id = 'chat_live';
+        s.messageCount = 3;
+        s.history = [{ user: 'u', assistant: 'a' }];
+        return s;
+      };
+      T.sessions.set(implicit, mkLive());
+      T.sessions.set(colonKey, mkLive());
+      const auth = { Authorization: 'Bearer f4-test-key' };
+      // 1. Reset by listed colon key works keyed (pre-fix 404: sanitize mangled ':').
+      let res = await post(port, `/reset-session?agent=${encodeURIComponent(colonKey)}`, {}, auth);
+      assert.equal(res.status, 200, res.body);
+      assert.equal(T.sessions.get(colonKey).id, null, 'colon session reset in place');
+      assert.equal(T.sessions.get(colonKey).messageCount, 0);
+      assert.equal(T.sessions.get(implicit).messageCount, 3, 'implicit bucket untouched');
+      // 2. agent=default hits the implicit keyed bucket (pre-fix 404 on '<principal>:default').
+      res = await post(port, '/reset-session?agent=default', {}, auth);
+      assert.equal(res.status, 200, res.body);
+      assert.equal(T.sessions.get(implicit).id, null, 'implicit bucket reset');
+      assert.equal(T.sessions.get(implicit).messageCount, 0);
+    });
+  } finally {
+    if (originalKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = originalKey;
+    T.sessions.clear();
+    for (const [key, value] of savedSessions) T.sessions.set(key, value);
+  }
+});
+
+test('fix F-4: keyless reset behavior unchanged (default still hits the IP bucket)', async () => {
+  const T = serverInternals;
+  const savedSessions = Array.from(T.sessions.entries());
+  const originalKey = process.env.PROXY_API_KEY;
+  delete process.env.PROXY_API_KEY;
+  try {
+    await withServer(async (port) => {
+      T.sessions.clear();
+      const s = T.createSession();
+      s.id = 'chat_live';
+      s.messageCount = 2;
+      s.history = [{ user: 'u', assistant: 'a' }];
+      T.sessions.set('dev-agent', s);
+      const res = await post(port, '/reset-session?agent=default', {});
+      assert.equal(res.status, 200, res.body);
+      assert.equal(T.sessions.get('dev-agent').messageCount, 0, 'keyless default still hits the IP bucket');
+    });
+  } finally {
+    if (originalKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = originalKey;
+    T.sessions.clear();
+    for (const [key, value] of savedSessions) T.sessions.set(key, value);
+  }
+});
+
+test('fix F-4: keyed reset of a nonexistent colon key 404s without touching the implicit bucket', async () => {
+  const T = serverInternals;
+  const savedSessions = Array.from(T.sessions.entries());
+  const originalKey = process.env.PROXY_API_KEY;
+  process.env.PROXY_API_KEY = 'f4-miss-key';
+  try {
+    await withServer(async (port) => {
+      T.sessions.clear();
+      const principal = T.principalForRequest('Bearer f4-miss-key');
+      const implicit = `${principal}:dev-agent`;
+      const s = T.createSession();
+      s.id = 'chat_live';
+      s.messageCount = 3;
+      s.history = [{ user: 'u', assistant: 'a' }];
+      T.sessions.set(implicit, s);
+      const auth = { Authorization: 'Bearer f4-miss-key' };
+      // Pre-fix this 404-miss fell through to sanitize-first, 200ed, and
+      // reset the implicit bucket instead of the requested session.
+      const res = await post(port, `/reset-session?agent=${encodeURIComponent(`${principal}:nope:missing`)}`, {}, auth);
+      assert.equal(res.status, 404, res.body);
+      assert.equal(T.sessions.get(implicit).messageCount, 3, 'implicit bucket untouched on miss');
+      assert.equal(T.sessions.get(implicit).id, 'chat_live');
+    });
+  } finally {
+    if (originalKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = originalKey;
+    T.sessions.clear();
+    for (const [key, value] of savedSessions) T.sessions.set(key, value);
+  }
+});
+
