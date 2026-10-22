@@ -46,6 +46,7 @@ async function liveCheck(auth, { fetchImpl = globalThis.fetch, timeoutMs = POW_P
     'x-client-version': '2.0.0',
     'x-client-locale': 'ru',
     'x-client-timezone-offset': '14400',
+    'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
     'x-app-version': '2.0.0',
     'Authorization': `Bearer ${auth.token || ''}`,
     'x-hif-dliq': auth.hif_dliq || '',

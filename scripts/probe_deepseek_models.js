@@ -10,6 +10,7 @@ const BASE_HEADERS = {
   "x-client-version": "2.0.0",
   "x-client-locale": "ru",
   "x-client-timezone-offset": "14400",
+  "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
   "x-app-version": "2.0.0",
   "Authorization": `Bearer ${DS_CONFIG.token}`,
   "x-hif-dliq": DS_CONFIG.hif_dliq || '',

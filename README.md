@@ -500,7 +500,8 @@ retry, migration, continuation), so a cap near 8 would throttle traffic the
 pacer itself considers normal.
 
 ```bash
-DEEPSEEK_BURST_PER_MINUTE=15 npm start  # default 15; 0 disables; max 1000
+DEEPSEEK_BURST_PER_MINUTE=0 npm start   # disable the cap entirely
+DEEPSEEK_BURST_PER_MINUTE=30 npm start  # raise it; default 15, max 1000
 ```
 
 Turn-aware pacing (anti-velocity — enforces a minimum gap between consecutive

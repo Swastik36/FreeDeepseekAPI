@@ -61,6 +61,11 @@ async function probeFile(file) {
       method: 'POST',
       headers: {
         'User-Agent': 'Mozilla/5.0',
+        // Same locale trio as the proxy and doctor: a probe that claims a
+        // partial fingerprint reports on a different client than we run.
+        'x-client-locale': 'ru',
+        'x-client-timezone-offset': '14400',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
         Authorization: `Bearer ${token}`,
         Cookie: cookie,
         'Content-Type': 'application/json',

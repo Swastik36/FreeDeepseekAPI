@@ -506,6 +506,10 @@ async function main() {
                 '--no-first-run',
                 '--no-default-browser-check',
                 '--disable-infobars',
+                // Match the Accept-Language the proxy sends. Without this the
+                // cookie is minted under the OS locale while every later API
+                // call claims ru-RU -- a fingerprint change, not a correction.
+                '--accept-lang=ru-RU,ru;q=0.9,en;q=0.8',
                 url,
             ],
             { stdio: 'ignore', detached: true },

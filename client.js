@@ -53,6 +53,7 @@ const BASE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
     'x-client-platform': 'web', 'x-client-version': '2.0.0',
     'x-client-locale': 'ru', 'x-client-timezone-offset': '14400', 'x-app-version': '2.0.0',
+    'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
     'Authorization': `Bearer ${CONFIG.token}`,
     'x-hif-dliq': CONFIG.hif_dliq, 'x-hif-leim': CONFIG.hif_leim,
     'Origin': 'https://chat.deepseek.com', 'Referer': 'https://chat.deepseek.com/',
