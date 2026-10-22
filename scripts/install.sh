@@ -30,6 +30,9 @@ DIR="${FREEDSEEK_DIR:-$HOME/.local/share/freedeepseek-api}"
 DO_SERVICE=1
 DO_AUTH=1
 
+die() { printf '%s\n' "install: $*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
 usage() {
     cat <<'USAGE'
 usage: install.sh [options]
@@ -46,9 +49,9 @@ USAGE
 
 while [ $# -gt 0 ]; do
     case $1 in
-        --repo) REPO_URL=$2; shift 2;;
-        --ref) REF=$2; shift 2;;
-        --dir) DIR=$2; shift 2;;
+        --repo) [ $# -ge 2 ] || die "--repo requires a value"; REPO_URL=$2; shift 2;;
+        --ref) [ $# -ge 2 ] || die "--ref requires a value"; REF=$2; shift 2;;
+        --dir) [ $# -ge 2 ] || die "--dir requires a value"; DIR=$2; shift 2;;
         --no-service) DO_SERVICE=0; shift;;
         --no-auth) DO_AUTH=0; shift;;
         -h|--help) usage; exit 0;;
@@ -56,8 +59,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-die() { printf '%s\n' "install: $*" >&2; exit 1; }
-info() { printf '%s\n' "$*"; }
+# The systemd unit below is an unquoted heredoc: it expands $ and backticks,
+# and systemd itself reads % as a specifier prefix. Reject an install path
+# that could corrupt or inject into the unit rather than silently mangling it.
+NL='
+'
+case $DIR in
+    *'`'*|*'$'*|*'%'*|*"$NL"*)
+        die "--dir must not contain backticks, \$, %, or newlines (systemd unit escaping): $DIR";;
+esac
+
 ask_yn() {
     # ask_yn <prompt> -> 0 for yes (default Y); reads /dev/tty for curl|sh
     printf '%s [Y/n]: ' "$1" >&2
@@ -99,6 +110,12 @@ UNIT_DIR="${FREEDSEEK_UNIT_DIR:-$HOME/.config/systemd/user}"
 UNIT_FILE="$UNIT_DIR/freedeepseek.service"
 if [ "$DO_SERVICE" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
     mkdir -p "$UNIT_DIR"
+    # Values land in an unquoted heredoc: % (a systemd specifier prefix) is
+    # doubled and $/backticks are escaped. --dir was already rejected above if
+    # it carried any of them.
+    escape_unit() { printf '%s' "$1" | sed -e 's/%/%%/g' -e 's/[$`]/\\&/g'; }
+    WORKDIR_UNIT=$(escape_unit "$DIR")
+    NODE_BIN_UNIT=$(escape_unit "$NODE_BIN")
     cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=FreeDeepseekAPI proxy (DeepSeek Web -> OpenAI-compatible on 127.0.0.1:9655)
@@ -107,12 +124,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$DIR
+WorkingDirectory=$WORKDIR_UNIT
 Environment=NON_INTERACTIVE=1
 Environment=PORT=9655
 Environment=HOST=127.0.0.1
 Environment=DEEPSEEK_DELTA_PROMPT=1
-ExecStart="$NODE_BIN" "$DIR/server.js"
+ExecStart="$NODE_BIN_UNIT" "$WORKDIR_UNIT/server.js"
 Restart=always
 RestartSec=3
 

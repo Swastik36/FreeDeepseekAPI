@@ -116,9 +116,44 @@ NEW=$(git rev-parse HEAD)
 info "Code: $(git rev-parse --short "$OLD") -> $(git rev-parse --short "$NEW")"
 
 TEST_LOG=$(mktemp "${TMPDIR:-/tmp}/freedeepseek-update-test.XXXXXX") || die "cannot create test log"
-if ! npm test >"$TEST_LOG" 2>&1; then
+# FREEDSEEK_TEST_CMD is a test hook: tests/update.test.js runs this script
+# against tiny fixtures that have no real sources, so they substitute a
+# command instead of the shipped chain below.
+# The project has zero npm dependencies, so run the package.json test chain
+# with node directly: `npm` is not a declared prerequisite (install.sh checks
+# only git + node), and some minimal installs have node without npm.
+run_tests() {
+    node --check server.js \
+        && node --check lib/pow.js \
+        && node --check scripts/auth.js \
+        && node --check scripts/auth_import.js \
+        && node --check scripts/doctor.js \
+        && node --check scripts/deepseek_chrome_auth.js \
+        && node --check scripts/probe-account.js \
+        && node --check scripts/probe_deepseek_models.js \
+        && node --check client.js \
+        && node --check scripts/live_agentic_smoke_tests.mjs \
+        && node --test tests/unit.test.js \
+        && node --test tests/anti-suspension.test.js \
+        && node --test tests/update.test.js \
+        && node --test tests/install.test.js
+}
+TEST_RC=0
+if [ -n "${FREEDSEEK_TEST_CMD:-}" ]; then
+    sh -c "$FREEDSEEK_TEST_CMD" >"$TEST_LOG" 2>&1 || TEST_RC=$?
+else
+    run_tests >"$TEST_LOG" 2>&1 || TEST_RC=$?
+fi
+if [ "$TEST_RC" -eq 127 ]; then
     KEEP_LOG=1
-    info "npm test FAILED on new code; last 30 lines (full log: $TEST_LOG):"
+    info "test command not found (exit 127) — node is missing or not on PATH; NOT marking $NEW as bad."
+    info "Full log: $TEST_LOG"
+    git reset --hard "$OLD" >/dev/null
+    die "cannot run the test suite (node missing); rolled back to $(git rev-parse --short "$OLD"). Service untouched."
+fi
+if [ "$TEST_RC" -ne 0 ]; then
+    KEEP_LOG=1
+    info "Tests FAILED on new code; last 30 lines (full log: $TEST_LOG):"
     tail -n 30 "$TEST_LOG" >&2 2>/dev/null || true
     git reset --hard "$OLD" >/dev/null
     write_failed_marker "$NEW"

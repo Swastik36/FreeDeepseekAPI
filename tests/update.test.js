@@ -38,6 +38,9 @@ function envFor(dir, extra = {}) {
         XDG_RUNTIME_DIR: path.join(dir, 'runtime'),
         XDG_STATE_HOME: path.join(dir, 'state'),
         FREEDSEEK_NO_RESTART: '1',
+        // Fixtures carry no real sources, so stand in for the shipped node
+        // test chain (update.sh no longer shells out to npm).
+        FREEDSEEK_TEST_CMD: 'exit 0',
         ...extra,
     };
 }
@@ -112,7 +115,7 @@ test('updater: failing tests print the tail, roll back, and write a marker', () 
         pushAhead(dir, { 'v2.txt': 'v2' }, 'echo UPDATE_FAIL_MARKER; exit 1');
         let caught = null;
         try {
-            runUpdate(clone, dir);
+            runUpdate(clone, dir, { FREEDSEEK_TEST_CMD: 'echo UPDATE_FAIL_MARKER; exit 1' });
             assert.fail('expected rollback');
         } catch (e) {
             caught = e;

@@ -343,7 +343,7 @@ FreeDeepseekAPI does not create a new DeepSeek chat for every HTTP request witho
 
 - one `x-agent-session`, `session`, or `user` → one DeepSeek chat session;
 - if the session id already exists — the proxy reuses it and continues the chain via `parent_message_id`;
-- only an explicit `/new` or reset endpoint clears a live chat; client compaction and a rate-limit migration are the two sanctioned reset paths;
+- a live chat is cleared only when the client sends a chat message whose content is exactly `/new` (the `/new` command in the OpenCode client is a client-side shortcut that sends this message — it is not a proxy route) or calls the proxy's `POST /reset-session` endpoint; client compaction and a rate-limit migration are the two sanctioned reset paths;
 - overlapping turns for the same resolved session are rejected with `409 session_busy` rather than racing the parent cursor;
 - local history is kept as a bounded recovery summary for sanctioned fresh-chat paths;
 - long agent requests are capped by `DEEPSEEK_MAX_PROMPT_CHARS` before sending (default 80,000 chars): the task start, fresh tool results, and the tool adapter are preserved;

@@ -748,10 +748,11 @@ const MAX_EMPTY_RETRIES = Number.isFinite(configuredEmptyRetries)
     ? Math.max(0, Math.min(10, Math.floor(configuredEmptyRetries)))
     : 2;
 const MIN_UPSTREAM_PROMPT_CHARS = 16000;
-const configuredPromptChars = Number(process.env.DEEPSEEK_MAX_PROMPT_CHARS);
-const MAX_UPSTREAM_PROMPT_CHARS = Number.isFinite(configuredPromptChars)
-    ? Math.max(MIN_UPSTREAM_PROMPT_CHARS, Math.floor(configuredPromptChars))
-    : 80000;
+// numEnv validates, floors and warns on garbage; the floor at
+// MIN_UPSTREAM_PROMPT_CHARS then keeps a too-small value from starving the
+// prompt (numEnv's own min is the documented knob floor).
+const MAX_UPSTREAM_PROMPT_CHARS = Math.max(MIN_UPSTREAM_PROMPT_CHARS,
+    Math.floor(numEnv('DEEPSEEK_MAX_PROMPT_CHARS', 80000, 1000)));
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -2064,8 +2065,13 @@ function createUpstreamHttpError(status, body = '', retryAfter = null) {
     return error;
 }
 
+// `/new` is NOT a proxy route: the proxy treats a chat message whose content
+// is exactly `/new` as a reset command (handled in the request handler), and
+// the OpenCode client's `/new` is a client-side shortcut that sends it. Plain
+// HTTP clients can instead call POST /reset-session. Name both so neither
+// audience is told to use something it cannot.
 function createChatExpiredError(status) {
-    const err = new Error(`DeepSeek chat session expired or invalidated upstream (HTTP ${status}). Type /new to start a fresh chat.`);
+    const err = new Error(`DeepSeek chat session expired or invalidated upstream (HTTP ${status}). Send "/new" as the next message or POST /reset-session?agent=<id> to start a fresh chat.`);
     err.type = 'chat_expired';
     err.status = Number(status) || 500;
     return err;
@@ -5228,21 +5234,32 @@ const server = http.createServer(async (req, res) => {
         if (inflightBodyBytes < 0) inflightBodyBytes = 0;
     };
     // Cap replies (§6): single `responded` flag guards every reply site (not
-    // res.headersSent alone — racy vs `close` ordering). res.end FIRST, then
-    // req.destroy() ONLY in the end callback (callback form — a sync destroy
-    // can truncate the flush). One parameterized writer keeps the 413 and the
-    // global-budget 503 byte-identical over refactors; only status/headers/
-    // log line/payload differ per call site.
+    // res.headersSent alone — racy vs `close` ordering). res.end() is the whole
+    // reply: destroying `req` from its end callback could truncate the flush on
+    // a slow client. The `data` handler below keeps draining the upload and
+    // returns early once `responded` is set, so the socket still closes on its
+    // own. One parameterized writer keeps the 413 and the global-budget 503
+    // byte-identical over refactors; only status/headers/log line/payload
+    // differ per call site.
     const replyCap = (status, headers, logMsg, errType, errMsg) => {
         if (responded) return;
         responded = true;
+        // Release this request's byte charge at once. The client may still be
+        // mid-upload and (without the old req.destroy()) may never finish it,
+        // so waiting for `close` could pin the global budget indefinitely.
+        // settleBody is idempotent, so the later `close`/`end` hooks no-op.
+        settleBody();
         console.log(logMsg);
         try {
-            res.writeHead(status, headers);
-            res.end(JSON.stringify({ error: { message: errMsg, type: errType } }),
-                () => { try { req.destroy(); } catch (e) { /* already gone */ } });
+            // `Connection: close` is the truncation-safe half of the old
+            // req.destroy(): the client may still be uploading an 11MB body,
+            // and Node will not read a keep-alive request to completion after
+            // we answered early. Closing after this response lets `close` fire
+            // (releasing the body charge) without racing the flush.
+            res.writeHead(status, { ...headers, Connection: 'close' });
+            res.end(JSON.stringify({ error: { message: errMsg, type: errType } }));
         } catch (e) {
-            try { req.destroy(); } catch (_) { /* already gone */ }
+            try { res.destroy(); } catch (_) { /* already gone */ }
         }
     };
     const replyBodyTooLarge = () => replyCap(413, { 'Content-Type': 'application/json' },
@@ -6395,9 +6412,16 @@ async function showStartupMenu() {
 
 async function main() {
     printBanner();
-    requireProxyApiKey(getProxyKey(), isTruthy(process.env.REQUIRE_PROXY_API_KEY));
-    if (!isLoopbackHost(HOST) && !getProxyKey()) {
-        console.warn(`[DS-API] WARNING: HOST=${HOST} exposes the proxy without authentication. Set PROXY_API_KEY or bind to 127.0.0.1.`);
+    const proxyKey = getProxyKey();
+    requireProxyApiKey(proxyKey, isTruthy(process.env.REQUIRE_PROXY_API_KEY));
+    if (!isLoopbackHost(HOST) && !proxyKey) {
+        // Fail closed: a non-loopback bind with no key is an open relay for the
+        // whole network. Operators who really want that must say so explicitly.
+        if (!isTruthy(process.env.ALLOW_INSECURE_REMOTE)) {
+            console.error(`[DS-API] FATAL: HOST=${HOST} is not a loopback address but no proxy API key is configured. Set PROXY_API_KEY (or PROXY_API_KEY_FILE), bind HOST=127.0.0.1, or set ALLOW_INSECURE_REMOTE=1 to run unauthenticated anyway.`);
+            process.exit(1);
+        }
+        console.warn(`[DS-API] WARNING: HOST=${HOST} exposes the proxy without authentication (ALLOW_INSECURE_REMOTE=1). Set PROXY_API_KEY or bind to 127.0.0.1.`);
     }
     const shouldStart = await showStartupMenu();
     if (!shouldStart) process.exit(0);
@@ -6435,7 +6459,15 @@ async function main() {
 function handleFatalRuntimeError(kind, error, deps = {}) {
     const log = deps.log || console.error;
     const fatal = deps.fatal !== undefined ? deps.fatal : FATAL_ON_UNHANDLED;
-    log(`[DS-API] FATAL ${kind}:`, error);
+    // Unhandled rejections are often arbitrary values (fetch errors carry
+    // headers/cookies). Log a redacted, truncated message only; unexpected
+    // exceptions keep the full error/stack for debugging.
+    if (kind === 'unhandledRejection') {
+        const raw = (error && typeof error === 'object' && 'message' in error) ? String(error.message || error) : String(error);
+        log(`[DS-API] FATAL ${kind}: ${toClientErrorMessage(raw.substring(0, 300))}`);
+    } else {
+        log(`[DS-API] FATAL ${kind}:`, error);
+    }
     if (!fatal) return;
     try { (deps.persist || persistSessionsNow)(); } catch (_) { }
     (deps.exit || process.exit)(1);

@@ -56,6 +56,19 @@ function post(port, urlPath, body, headers = {}) {
     req.end(data);
   });
 }
+function get(port, urlPath, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: urlPath, method: 'GET',
+      headers: { ...authHeaders(), ...headers } },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+    req.on('error', reject);
+    req.end();
+  });
+}
 // Trickled body: headers + partial chunk arrive first; beforeEnd() runs (e.g.
 // raising in-flight pressure) before the body completes — exercises the
 // body-end backpressure re-check deterministically.
@@ -2347,7 +2360,9 @@ test('upstream 400/404/500 expiry throws chat_expired directing to /new and pres
     const err = serverInternals.createChatExpiredError(status);
     assert.equal(err.status, status);
     assert.equal(err.type, 'chat_expired');
-    assert.match(err.message, /Type \/new to start a fresh chat/);
+    // M4 rewording: name both the message command and the HTTP endpoint.
+    assert.match(err.message, /Send "\/new" as the next message/);
+    assert.match(err.message, /POST \/reset-session\?agent=<id>/);
   }
   // Session is preserved; no reset or recreate called
   assert.equal(session.id, 'chat-upstream-expired-3');
@@ -6463,6 +6478,111 @@ test('fix F-4: keyed reset of a nonexistent colon key 404s without touching the 
       assert.equal(res.status, 404, res.body);
       assert.equal(T.sessions.get(implicit).messageCount, 3, 'implicit bucket untouched on miss');
       assert.equal(T.sessions.get(implicit).id, 'chat_live');
+    });
+  } finally {
+    if (originalKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = originalKey;
+    T.sessions.clear();
+    for (const [key, value] of savedSessions) T.sessions.set(key, value);
+  }
+});
+
+// ── L2: end-to-end HTTP surface (auth, routing, cap shape, apiMode) ──
+// Real handler on an ephemeral loopback port; upstream stays disabled (no
+// accounts loaded), so every assertion below is reachable without network.
+test('L2 e2e: proxy auth gate answers 401 with a Bearer challenge', async () => {
+  const originalKey = process.env.PROXY_API_KEY;
+  process.env.PROXY_API_KEY = 'l2-e2e-key';
+  try {
+    await withServer(async (port) => {
+      // Empty Authorization overrides the header authHeaders() would add.
+      const missing = await post(port, '/v1/chat/completions',
+        { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] },
+        { Authorization: '' });
+      assert.equal(missing.status, 401);
+      assert.equal(missing.headers['www-authenticate'], 'Bearer');
+      const body = JSON.parse(missing.body);
+      assert.equal(body.error.type, 'authentication_error');
+      // Health probes stay public even with a key configured.
+      const health = await get(port, '/health', { Authorization: '' });
+      assert.equal(health.status, 200);
+    });
+  } finally {
+    if (originalKey === undefined) delete process.env.PROXY_API_KEY;
+    else process.env.PROXY_API_KEY = originalKey;
+  }
+});
+
+test('L2 e2e: unknown path answers 404 Not found', async () => {
+  await withServer(async (port) => {
+    const res = await post(port, '/v1/not-a-real-endpoint', { messages: [] });
+    assert.equal(res.status, 404);
+    assert.equal(res.body, 'Not found');
+  });
+});
+
+test('L2 e2e: global in-flight body cap answers the canonical overloaded 503', async () => {
+  const T = serverInternals;
+  // replyCap is closure-scoped per request, so it has no __test export; the
+  // reachable global-budget gate exercises the same writer (status, headers,
+  // JSON envelope) that the 413 path uses.
+  await withServer(async (port) => {
+    const saved = T.MAX_INFLIGHT_BODY_BYTES;
+    T.setInflightBodyBytes(saved - 8);
+    try {
+      const res = await post(port, '/v1/chat/completions',
+        { model: 'deepseek-chat', messages: [{ role: 'user', content: 'x'.repeat(64) }] });
+      assert.equal(res.status, 503);
+      assert.equal(res.headers['retry-after'], '2');
+      assert.match(res.headers['content-type'] || '', /application\/json/);
+      const body = JSON.parse(res.body);
+      assert.equal(body.error.type, 'overloaded');
+      assert.match(body.error.message, /global upload budget/);
+      // M1: the reply must be complete — the old req.destroy() could truncate it.
+      assert.ok(res.body.trim().endsWith('}'), 'cap reply is not truncated');
+    } finally {
+      T.setInflightBodyBytes(0);
+    }
+  });
+});
+
+test('L2 e2e: each endpoint selects its own apiMode response shape', async () => {
+  // The `/new` command is answered locally (no upstream turn), and the local
+  // answer is built by the apiMode-specific serializer — a hermetic proof that
+  // /v1/chat/completions, /v1/messages and /v1/responses route to openai,
+  // anthropic and responses respectively.
+  const T = serverInternals;
+  const originalKey = process.env.PROXY_API_KEY;
+  delete process.env.PROXY_API_KEY;
+  const savedSessions = [...T.sessions.entries()];
+  try {
+    await withServer(async (port) => {
+      const openai = await post(port, '/v1/chat/completions', {
+        model: 'deepseek-chat', stream: false,
+        messages: [{ role: 'user', content: '/new' }],
+      }, { 'x-agent-session': 'l2-mode-openai' });
+      assert.equal(openai.status, 200, openai.body);
+      const openaiBody = JSON.parse(openai.body);
+      assert.equal(openaiBody.object, 'chat.completion');
+      assert.equal(openaiBody.choices[0].message.role, 'assistant');
+
+      const anthropic = await post(port, '/v1/messages', {
+        model: 'deepseek-chat', max_tokens: 16,
+        messages: [{ role: 'user', content: '/new' }],
+      }, { 'x-agent-session': 'l2-mode-anthropic' });
+      assert.equal(anthropic.status, 200, anthropic.body);
+      const anthropicBody = JSON.parse(anthropic.body);
+      assert.equal(anthropicBody.type, 'message');
+      assert.match(anthropicBody.id, /^msg_/);
+      assert.equal(anthropicBody.content[0].type, 'text');
+
+      const responses = await post(port, '/v1/responses', {
+        model: 'deepseek-chat', input: '/new',
+      }, { 'x-agent-session': 'l2-mode-responses' });
+      assert.equal(responses.status, 200, responses.body);
+      const responsesBody = JSON.parse(responses.body);
+      assert.equal(responsesBody.object, 'response');
+      assert.equal(responsesBody.output[0].type, 'message');
     });
   } finally {
     if (originalKey === undefined) delete process.env.PROXY_API_KEY;

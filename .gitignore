@@ -1,4 +1,6 @@
 node_modules/
+# Local tool scratch state (agent/buffer work dirs) — never commit.
+.freebuff/
 .env
 *.log
 auth.json
