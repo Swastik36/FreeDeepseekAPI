@@ -13,7 +13,6 @@ data/accounts/*.json
 .chrome-for-testing-profile-deepseek/
 .chrome-for-testing-profile-deepseek.stale-*/
 *.session.json
-/tmp/deepseek_response_*
 .DS_Store
 *.pdf
 # Live session map (chat ids, restored on restart) — never commit.

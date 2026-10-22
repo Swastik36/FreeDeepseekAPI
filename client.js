@@ -41,7 +41,10 @@ try {
             CONFIG.wasmUrl = CONFIG.wasmUrl || auth.wasmUrl;
         }
     }
-} catch (e) {}
+} catch (e) {
+    // A corrupt/incomplete auth file must not silently look like "no auth".
+    console.error(`[!] Could not load local auth file: ${e.message}`);
+}
 
 if (!CONFIG.token) {
     console.error('Error: DeepSeek auth is not set. Run `npm run auth`, or provide DEEPSEEK_TOKEN/DEEPSEEK_COOKIE via env.');
@@ -68,15 +71,27 @@ async function askDeepSeek(prompt, onChunk) {
         method: 'POST', headers: BASE_HEADERS,
         body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
     });
+    if (!chalResp.ok) {
+        throw new Error(`create_pow_challenge HTTP ${chalResp.status}: ${(await chalResp.text()).slice(0, 300)}`);
+    }
     const chalData = await chalResp.json();
-    const challenge = chalData.data.biz_data.challenge;
+    const challenge = chalData?.data?.biz_data?.challenge;
+    if (!challenge) {
+        throw new Error(`create_pow_challenge returned no challenge: ${JSON.stringify(chalData).slice(0, 300)}`);
+    }
     const answer = await solvePOW(challenge, CONFIG.wasmUrl);
 
     const sessResp = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
         method: 'POST', headers: BASE_HEADERS, body: '{}'
     });
+    if (!sessResp.ok) {
+        throw new Error(`chat_session/create HTTP ${sessResp.status}: ${(await sessResp.text()).slice(0, 300)}`);
+    }
     const sessData = await sessResp.json();
-    const sessionId = sessData.data.biz_data.chat_session?.id || sessData.data.biz_data.id;
+    const sessionId = sessData?.data?.biz_data?.chat_session?.id || sessData?.data?.biz_data?.id;
+    if (!sessionId) {
+        throw new Error(`chat_session/create returned no session id: ${JSON.stringify(sessData).slice(0, 300)}`);
+    }
 
     const powResp = {
         algorithm: challenge.algorithm, challenge: challenge.challenge,
@@ -97,6 +112,10 @@ async function askDeepSeek(prompt, onChunk) {
             action: null, preempt: false,
         })
     });
+
+    if (!compResp.ok) {
+        throw new Error(`chat/completion HTTP ${compResp.status}: ${(await compResp.text()).slice(0, 300)}`);
+    }
 
     const reader = compResp.body.getReader();
     const decoder = new TextDecoder();
