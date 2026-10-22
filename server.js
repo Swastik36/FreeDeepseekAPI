@@ -117,9 +117,9 @@ const PROXY_CORS_ORIGINS = new Set(String(process.env.PROXY_CORS_ORIGINS || '')
     .filter(Boolean));
 function formatWatermark(prefix = 'ForgetMeAI') { return `${prefix}: ${FORGETMEAI_WATERMARK}`; }
 function printBanner() {
-    console.log(`
-███████ ██████  ███████ ███████ ██████  ███████ ███████ ███████ ██   ██
-██      ██   ██ ██      ██      ██   ██ ██      ██      ██      ██  ██
+    console.log(`                                                         █   █
+███████ ██████  ███████ ███████ ██████  ███████ ███████ ███████ ██   ██  ███ ███
+██      ██   ██ ██      ██      ██   ██ ██      ██      ██      ██  ██    █   █
 █████   ██████  █████   █████   ██   ██ █████   █████   █████   █████
 ██      ██   ██ ██      ██      ██   ██ ██      ██      ██      ██  ██
 ██      ██   ██ ███████ ███████ ██████  ███████ ███████ ███████ ██   ██
