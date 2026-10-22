@@ -5777,6 +5777,29 @@ test('buildBaseHeaders pins the ru locale trio the fingerprint claims', () => {
   assert.equal(h['Accept-Language'], 'ru-RU,ru;q=0.9,en;q=0.8');
 });
 
+test('every toolchain script claims the same UA + locale fingerprint as the proxy', () => {
+  // The proxy has a pinned contract; the CLI tools talk to the same upstream
+  // with the same cookie, so a different UA or a missing header makes them a
+  // different client. Static check: these files build headers as literals.
+  const expectedUA = serverInternals.buildBaseHeaders({})['User-Agent'];
+  const files = [
+    'client.js',
+    'scripts/doctor.js',
+    'scripts/probe-account.js',
+    'scripts/probe_deepseek_models.js',
+  ];
+  for (const rel of files) {
+    const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+    assert.ok(src.includes(expectedUA), `${rel} must send the proxy User-Agent`);
+    assert.ok(src.includes('ru-RU,ru;q=0.9,en;q=0.8'), `${rel} must send the proxy Accept-Language`);
+    assert.ok(/x-client-locale['"]?:\s*['"]ru['"]/.test(src), `${rel} must send x-client-locale: ru`);
+    assert.ok(src.includes('14400'), `${rel} must send x-client-timezone-offset: 14400`);
+  }
+  // The auth browser mints the cookie, so it must claim the same language.
+  const authSrc = fs.readFileSync(path.join(ROOT, 'scripts/deepseek_chrome_auth.js'), 'utf8');
+  assert.ok(authSrc.includes('--accept-lang=ru-RU,ru;q=0.9,en;q=0.8'), 'auth launcher must pass --accept-lang');
+});
+
 test('classifyBizCode maps muted and device-risk envelopes, ignores healthy ones', () => {
   const T = serverInternals;
   assert.equal(T.classifyBizCode(null), null);

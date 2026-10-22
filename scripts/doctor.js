@@ -41,7 +41,7 @@ function checkAuthFile(file) {
 }
 async function liveCheck(auth, { fetchImpl = globalThis.fetch, timeoutMs = POW_PROBE_TIMEOUT_MS } = {}) {
   const headers = {
-    'User-Agent': 'Mozilla/5.0 Chrome/149.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
     'x-client-platform': 'web',
     'x-client-version': '2.0.0',
     'x-client-locale': 'ru',
