@@ -567,19 +567,25 @@ test('M-C: isRetryAccountEligible scopes in-place retry to account quota and bur
     // Missing token/cookie -> not eligible
     assert.equal(serverInternals.isRetryAccountEligible({ id: 'no-creds', config: {} }, now), false);
 
-    // Burst cap check: set burst limit to 2
+    // A6: a spent burst ring must NOT deny the in-place retry. The retry
+    // recovers a turn the gate already admitted (its first dispatch is in the
+    // ring); blocking it just turns a recoverable turn into a 429 and invites
+    // a client retry that spends more slots. New admissions stay capped —
+    // isAccountReady() still includes withinBurst().
     serverInternals.setBurstPerMinute(2);
     try {
         const burstSpentAccount = {
             id: 'acct-burst',
             config: validConfig,
-            cooldownUntil: now + 5000,
+            cooldownUntil: 0, // isolate burst: nothing else may make this unready
             requestTimes: [now - 1000, now - 2000],
         };
-        assert.equal(serverInternals.withinBurst(burstSpentAccount, now), false);
-        assert.equal(serverInternals.isRetryAccountEligible(burstSpentAccount, now), false);
+        assert.equal(serverInternals.withinBurst(burstSpentAccount, now), false, 'ring is spent');
+        assert.equal(serverInternals.isRetryAccountEligible(burstSpentAccount, now), true,
+            'A6: a spent ring must not block recovery of an already-admitted turn');
+        assert.equal(serverInternals.isAccountReady(burstSpentAccount, now), false,
+            'new admissions are still capped by the burst gate');
 
-        // shouldRetryInPlace with accountReady: false skips retry
         const retryCheck = serverInternals.shouldRetryInPlace({
             flagOn: true,
             rateLimit: true,
@@ -590,9 +596,9 @@ test('M-C: isRetryAccountEligible scopes in-place retry to account quota and bur
             anyReady: true,
             accountReady: serverInternals.isRetryAccountEligible(burstSpentAccount, now),
         });
-        assert.equal(retryCheck, false, 'burst-blocked account skips in-place retry');
+        assert.equal(retryCheck, true, 'burst-over account may still recover in place');
     } finally {
-        serverInternals.setBurstPerMinute(0); // restore default
+        serverInternals.setBurstPerMinute(serverInternals.defaultBurstPerMinute); // restore module-load default, whatever it is
     }
 });
 
@@ -868,6 +874,61 @@ test('M-B: shipped pacing defaults are pinned and human turns bypass pacing gate
     assert.ok(elapsed < 500, `Human turn must not sleep (elapsed: ${elapsed}ms)`);
     // Reservation stamp was NOT claimed (lastDispatchedAt remained unchanged by gate)
     assert.equal(mockAccount.lastDispatchedAt, prevDispatchedAt, 'Gate must not stamp reservation on human bypass');
+});
+
+test('envelope gate: muted 200 JSON throws before the health reset; healthy SSE still clears it', () => {
+    const { execFileSync } = require('node:child_process');
+    const childCode = [
+        "const assert = require('node:assert/strict');",
+        "const pow = require('./lib/pow');",
+        // server.js destructures solvePOW at load, so replace it before requiring it.
+        "pow.solvePOW = async () => 12345;",
+        "const I = require('./server.js').__test;",
+        "const acct = { id: 'env-acct', file: 'x.json', config: { token: 't', cookie: 'c' },",
+        "  headers: { Authorization: 'Bearer t' }, cooldownUntil: 0, failures: 3,",
+        "  consecutiveFailures: 2, consecutive403: 1, last403At: Date.now() - 1000,",
+        "  inflight: 0, requestTimes: [], lastDispatchedAt: 0 };",
+        "I.accounts.length = 0; I.accounts.push(acct);",
+        "const jsonResp = (obj) => ({ ok: true, status: 200,",
+        "  headers: { get: (h) => String(h).toLowerCase() === 'content-type' ? 'application/json' : null },",
+        "  text: async () => JSON.stringify(obj), json: async () => obj });",
+        "const sseResp = () => { const { Readable } = require('node:stream'); return { ok: true, status: 200,",
+        "  headers: { get: (h) => String(h).toLowerCase() === 'content-type' ? 'text/event-stream' : null },",
+        "  body: Readable.from([Buffer.from('data: {}\\n\\n')]), text: async () => '' }; };",
+        "let mode = 'json';",
+        "global.fetch = async (url) => {",
+        "  const u = String(url || '');",
+        "  if (u.includes('create_pow_challenge')) return jsonResp({ data: { biz_data: { challenge: {",
+        "    challenge: 'c', salt: 's', expire_at: 1, difficulty: 1, algorithm: 'x', signature: 'y' } } } });",
+        "  if (u.includes('chat_session/create')) return jsonResp({ data: { biz_data: { chat_session: { id: 'sess-1' } } } });",
+        "  if (u.includes('/chat/completion')) return mode === 'json'",
+        "    ? jsonResp({ data: { biz_code: 14, biz_msg: 'user is muted' } }) : sseResp();",
+        "  return { ok: true, status: 200, headers: { get: () => null }, text: async () => '', json: async () => ({}) };",
+        "};",
+        "(async () => {",
+        "  let mutedErr = null;",
+        "  try { await I.askDeepSeekStream('p', 'agent-env-1', 'deepseek-chat', 'p', { isClientGone: () => false }); }",
+        "  catch (e) { mutedErr = e; }",
+        "  assert.ok(mutedErr, 'a muted envelope must throw');",
+        "  assert.equal(mutedErr.status, 429, 'mute surfaces 429 so migration can fire');",
+        "  assert.equal(mutedErr.type, 'account_muted');",
+        // markAccountFailure increments failures; the success block would zero it.
+        "  assert.equal(acct.failures, 4, 'health reset must NOT run on the gate throw');",
+        "  assert.equal(acct.consecutive403, 1, 'health reset must NOT clear the 403 strikes');",
+        "  assert.ok(acct.cooldownUntil > Date.now(), 'the mute cools the account');",
+        "  acct.cooldownUntil = 0; mode = 'sse';",
+        "  await I.askDeepSeekStream('p2', 'agent-env-1', 'deepseek-chat', 'p2', { isClientGone: () => false });",
+        "  assert.equal(acct.failures, 0, 'a healthy SSE 200 still runs the health reset');",
+        "  assert.equal(acct.consecutive403, 0);",
+        "  assert.equal(acct.cooldownUntil, 0);",
+        "})().catch((e) => { console.error(e); process.exit(1); });",
+    ].join('\n');
+    execFileSync(process.execPath, ['-e', childCode], {
+        cwd: REPO_ROOT,
+        timeout: 15000,
+        env: makeCleanEnv(),
+        stdio: 'pipe',
+    });
 });
 
 test('L-D: calculateRequiredDelay clamps jitter to jitterMs when rand returns 1', () => {

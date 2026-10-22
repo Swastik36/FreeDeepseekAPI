@@ -488,11 +488,19 @@ ones, all-spent answers 429 with `Retry-After`):
 DEEPSEEK_HOURLY_QUOTA=60 npm start  # 0 disables; sliding 1h window per account
 ```
 
-Burst cap (anti-velocity — most turns per sliding 60s window; rejects fast
-429 without touching scorer state; off until measured):
+Burst cap (anti-velocity — most PoW-gated completion dispatches per sliding
+60s window per account; rejects fast 429 without touching scorer state). The
+ring is stamped only after the PoW challenge succeeds, so this bounds
+completion attempts, not total upstream request velocity:
+`create_pow_challenge` and `chat_session/create` requests are **not** counted.
+On by default at 15. The number follows the pacer: a 6s gap + 0-2s jitter is
+~7.5-10 upstream dispatch attempts/min at the floor, so 15 leaves ~1.5-2x
+headroom over that floor. One user turn can spend 2-3 ring slots (in-place
+retry, migration, continuation), so a cap near 8 would throttle traffic the
+pacer itself considers normal.
 
 ```bash
-DEEPSEEK_BURST_PER_MINUTE=0 npm start  # 0 disables; candidate 10 post-measurement
+DEEPSEEK_BURST_PER_MINUTE=15 npm start  # default 15; 0 disables; max 1000
 ```
 
 Turn-aware pacing (anti-velocity — enforces a minimum gap between consecutive

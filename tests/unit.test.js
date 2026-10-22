@@ -3303,15 +3303,17 @@ test('hourly quota: sticky live chat fails fast on spent account, chat-less rota
   assert.equal(serverInternals.selectAccountForSession(chatless).id, 'q-sticky-fresh');
 });
 
-test('burst cap: window counts, explicit limit gates, default off is inert', () => {
-  // NOTE: BURST_PER_MINUTE defaults 0 (off until measured) — these tests pass
-  // explicit limits, mirroring how the select path will call once enabled.
+test('burst cap: window counts, default gate active, explicit limits, 0 disables', () => {
+  // NOTE: BURST_PER_MINUTE defaults 15 (gate is ON by default) — an explicit
+  // limit is passed where the test needs a different number, and 0 proves the
+  // documented off switch still works.
   const now = Date.now();
   const acct = { requestTimes: [] };
   assert.equal(serverInternals.burstUsedThisMinute(acct, now), 0);
-  assert.equal(serverInternals.withinBurst(acct, now), true, 'default off ignores even floods');
+  assert.equal(serverInternals.withinBurst(acct, now), true, 'empty window is ready');
   for (let i = 0; i < 100; i++) serverInternals.recordUpstreamTurn(acct, now);
-  assert.equal(serverInternals.withinBurst(acct, now), true, 'still inert when off');
+  assert.equal(serverInternals.withinBurst(acct, now), false, 'default (15) cuts a 100-turn flood');
+  assert.equal(serverInternals.withinBurst(acct, now, 0), true, 'explicit 0 disables the gate');
   assert.equal(serverInternals.burstUsedThisMinute(acct, now), 100);
   assert.equal(serverInternals.withinBurst(acct, now, 10), false, '100 >= explicit 10');
   const fresh = { requestTimes: [] };
@@ -5726,6 +5728,120 @@ test('audit 3.1 & 3.4: markAccountFailure separates HTTP 401/403 auth errors fro
   T.markAccountFailure(acct, 429, 'rate limit hit');
   assert.equal(acct.authUnavailable, false, '429 must not flag authUnavailable');
   assert.ok(acct.cooldownUntil > Date.now(), '429 must set cooldown');
+});
+
+test('403 is a soft first strike: cooldown, then authUnavailable on the second', () => {
+  const T = serverInternals;
+  // Real credentials so the readiness check below fails for the cooldown and
+  // not merely for a hand-built object missing config.token/cookie.
+  const acct = { id: 'acct_403', config: { token: 't', cookie: 'c' }, cooldownUntil: 0, failures: 0, requestTimes: [] };
+
+  T.markAccountFailure(acct, 403, 'waf hiccup');
+  assert.equal(acct.authUnavailable, undefined, 'first 403 must not sideline the credential');
+  assert.ok(acct.cooldownUntil > Date.now(), 'first 403 gets a temporary cooldown');
+  assert.equal(acct.consecutive403, 1, 'first 403 records the strike');
+  assert.equal(T.isAccountReady(acct), false, 'cooling account is not ready');
+
+  acct.cooldownUntil = 0;
+  T.markAccountFailure(acct, 403, 'waf hiccup again');
+  assert.equal(acct.consecutive403, 2, 'second 403 increments the strike');
+  assert.equal(acct.authUnavailable, true, 'repeat 403 flags authUnavailable');
+  assert.equal(acct.cooldownUntil, 0, 'repeat 403 clears the cooldown');
+});
+
+test('403 strikes expire: only 403s inside the window escalate', () => {
+  const T = serverInternals;
+  const now = Date.now();
+
+  // (a) Two 403s 20 minutes apart are separate blips, not a strike sequence.
+  const far = { id: 'acct_403_far', cooldownUntil: 0, failures: 0, consecutive403: 1, last403At: now - 20 * 60 * 1000 };
+  T.markAccountFailure(far, 403, 'waf hiccup later');
+  assert.equal(far.authUnavailable, undefined, 'a 403 20 min after the last one must not quarantine');
+  assert.equal(far.consecutive403, 1, 'the stale strike is reset, so this is strike one');
+  assert.ok(far.cooldownUntil > Date.now(), 'a fresh first strike still cools the account');
+
+  // (b) Two 403s one minute apart do escalate.
+  const near = { id: 'acct_403_near', cooldownUntil: 0, failures: 0, consecutive403: 1, last403At: now - 60 * 1000 };
+  T.markAccountFailure(near, 403, 'waf hiccup soon');
+  assert.equal(near.consecutive403, 2, 'a 403 one minute later continues the sequence');
+  assert.equal(near.authUnavailable, true, 'two 403s inside the window flag authUnavailable');
+  assert.equal(near.cooldownUntil, 0, 'quarantine clears the cooldown');
+});
+
+test('buildBaseHeaders pins the ru locale trio the fingerprint claims', () => {
+  // Fingerprint contract: locale, timezone and language must agree with each
+  // other. 14400s is UTC+4 (Samara), not Moscow's UTC+3 / 10800.
+  const h = serverInternals.buildBaseHeaders({});
+  assert.equal(h['x-client-locale'], 'ru');
+  assert.equal(h['x-client-timezone-offset'], '14400');
+  assert.equal(h['Accept-Language'], 'ru-RU,ru;q=0.9,en;q=0.8');
+});
+
+test('classifyBizCode maps muted and device-risk envelopes, ignores healthy ones', () => {
+  const T = serverInternals;
+  assert.equal(T.classifyBizCode(null), null);
+  assert.equal(T.classifyBizCode({}), null);
+  assert.equal(T.classifyBizCode({ data: { biz_code: 0 } }), null, 'zero is not a verdict');
+  assert.equal(T.classifyBizCode({ data: { biz_code: '0' } }), null, 'string zero is not a verdict');
+
+  const muted = T.classifyBizCode({ data: { biz_code: 14, biz_msg: 'muted' } });
+  assert.equal(muted.kind, 'muted');
+  assert.equal(muted.code, 14);
+  assert.equal(muted.message, 'muted');
+  assert.equal(T.classifyBizCode({ data: { biz_code: '5' } }).kind, 'muted', 'string code 5 is muted');
+  assert.equal(T.classifyBizCode({ biz_code: 11 }).kind, 'device_risk', 'top-level code 11 is device risk');
+  assert.equal(T.classifyBizCode({ data: { biz_code: 40003 } }).kind, 'other', 'unknown codes stay other');
+});
+
+test('rejectJsonEnvelopeResponse: JSON envelopes throw, SSE and header-less mocks pass through', async () => {
+  const T = serverInternals;
+  const mkResp = (ctype, body) => ({
+    headers: { get: (h) => (String(h).toLowerCase() === 'content-type' ? ctype : null) },
+    text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+  });
+
+  // SSE passes straight through and never consumes the body.
+  let consumed = false;
+  await T.rejectJsonEnvelopeResponse({
+    headers: { get: () => 'text/event-stream' },
+    text: async () => { consumed = true; return ''; },
+  }, { id: 'sse-acct' }, 'tag');
+  assert.equal(consumed, false, 'SSE body must not be consumed by the gate');
+
+  // Header-less transport (existing test mocks) also passes through.
+  await T.rejectJsonEnvelopeResponse({ text: async () => '' }, { id: 'no-header-acct' }, 'tag');
+
+  // Muted envelope: typed account_muted + soft cooldown, credential preserved.
+  // A mute is a time-based block, so it surfaces 429 (not 502) — otherwise
+  // isRateLimitError() misses it and a multi-account pool fails instead of rotating.
+  const muted = { id: 'muted-acct', cooldownUntil: 0, failures: 0, consecutiveFailures: 0 };
+  await assert.rejects(
+    T.rejectJsonEnvelopeResponse(mkResp('application/json; charset=utf-8', { data: { biz_code: 14, biz_msg: 'muted' } }), muted, 'tag'),
+    (e) => e.status === 429 && e.type === 'account_muted' && e.retryAfter > 0,
+  );
+  assert.equal(muted.authUnavailable, undefined, 'a mute is not credential-level');
+  assert.ok(muted.cooldownUntil > Date.now(), 'a mute applies a cooldown');
+
+  // Unknown/nonzero biz codes are soft too, but keep a distinct type.
+  const weird = { id: 'weird-acct', cooldownUntil: 0, failures: 0, consecutiveFailures: 0 };
+  await assert.rejects(
+    T.rejectJsonEnvelopeResponse(mkResp('application/json', { data: { biz_code: 40003, biz_msg: 'odd' } }), weird, 'tag'),
+    (e) => e.status === 429 && e.type === 'upstream_biz_error',
+  );
+
+  // Device-risk envelope: credential-level, authUnavailable set.
+  const risky = { id: 'risk-acct', cooldownUntil: 0, failures: 0, consecutiveFailures: 0 };
+  await assert.rejects(
+    T.rejectJsonEnvelopeResponse(mkResp('application/json', { biz_code: 11 }), risky, 'tag'),
+    (e) => e.status === 502 && e.type === 'device_verification_required',
+  );
+  assert.equal(risky.authUnavailable, true, 'device risk sidelines the credential');
+
+  // 200 JSON that is not a known envelope cannot be a stream either.
+  await assert.rejects(
+    T.rejectJsonEnvelopeResponse(mkResp('application/json', { hello: 'world' }), { id: 'shape-acct' }, 'tag'),
+    (e) => e.status === 502 && e.type === 'upstream_invalid_response',
+  );
 });
 
 test('audit 3.2: selectCompactionTargetAccount excludes saturated peer accounts', () => {

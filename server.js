@@ -364,6 +364,9 @@ const DS_CONFIG_PATH = process.env.DEEPSEEK_AUTH_PATH || path.join(__dirname, 'd
 const DEFAULT_ACCOUNT_COOLDOWN_MS = numEnv('DEEPSEEK_ACCOUNT_COOLDOWN_MS', 10 * 60 * 1000, 1000);
 const MAX_ACCOUNT_COOLDOWN_MS = 30 * 60 * 1000; // upper clamp: a malicious or
 // absurd Retry-After must never brick an account for years (8b).
+// A repeat 403 only strikes out when the previous 403 is still inside this
+// window; an older one starts a fresh sequence instead of continuing.
+const CONSECUTIVE_403_WINDOW_MS = 15 * 60 * 1000;
 // Hypersensitive smart-routing tuning (2026-09-16). All load-time env knobs:
 // - FAILURE/TIMEOUT_WEIGHT: scorer penalty per effective failure / consecutive
 //   timeout (timeouts still weigh 3x plain failures, as before).
@@ -390,9 +393,86 @@ const ROUTING_HOT_WINDOW_MS = numEnv('DEEPSEEK_ROUTING_HOT_WINDOW_MS', 60 * 1000
 // 429 with Retry-After. 0 disables.
 const HOURLY_QUOTA = numEnv('DEEPSEEK_HOURLY_QUOTA', 60, 0, 100000);
 const QUOTA_WINDOW_MS = 3600000;
-// Burst cap (pacing 4a): max turns per sliding 60s window per account.
-// Default 0 = off until Sep-19 traffic measures a real number (candidate 10).
-let BURST_PER_MINUTE = numEnv('DEEPSEEK_BURST_PER_MINUTE', 0, 0, 1000);
+// Burst cap (pacing 4a): max PoW-gated completion dispatches per sliding 60s
+// window per account. The ring is stamped only after the PoW challenge
+// succeeds, so this bounds completion attempts — create_pow_challenge and
+// chat_session/create requests are NOT counted, and this is not a bound on
+// total upstream request velocity.
+// Default 15 (was 0 = inert). Per-minute burstiness is the most-reported ban
+// trigger, so shipping the gate disabled was worse than a conservative value.
+// 15 is set from the pacer, not from taste: a 6s gap + 0-2s jitter is ~7.5-10
+// upstream dispatch attempts/min at the *floor* of the gap, and a single user
+// turn can spend 2-3 ring slots (in-place retry, migration, continuation)
+// because recordUpstreamTurn runs per upstream attempt. A cap of 8 would have
+// throttled traffic the pacer itself considers normal; 15 leaves ~1.5-2x
+// headroom over that floor while still cutting a genuine flood.
+const DEFAULT_BURST_PER_MINUTE = numEnv('DEEPSEEK_BURST_PER_MINUTE', 15, 0, 1000);
+let BURST_PER_MINUTE = DEFAULT_BURST_PER_MINUTE;
+// DeepSeek can answer HTTP 200 with a JSON error envelope instead of the SSE
+// stream when an account is muted (biz_code 14, also seen as 5) or needs device
+// re-verification (biz_code 11 RISK_DEVICE_DETECTED). Status codes cannot see
+// those, so a muted account looks healthy and keeps spending quota against a
+// silent block. Pure mapper, exported for tests; null when not a verdict.
+function classifyBizCode(json) {
+    if (!json || typeof json !== 'object') return null;
+    const inner = json.data && typeof json.data === 'object' ? json.data : json;
+    const raw = inner.biz_code !== undefined ? inner.biz_code : json.biz_code;
+    if (raw === undefined || raw === null || raw === 0 || raw === '0') return null;
+    const code = Number(raw);
+    const msg = String(inner.biz_msg || json.msg || json.message || '');
+    if (code === 14 || code === 5) return { code, kind: 'muted', message: msg || 'account muted upstream' };
+    if (code === 11) return { code, kind: 'device_risk', message: msg || 'device verification required upstream' };
+    return { code, kind: 'other', message: msg || `biz_code ${code}` };
+}
+// Envelope gate (async; throws when the response is a JSON envelope):
+// a muted / re-verification-blocked account can answer HTTP 200 with JSON
+// instead of the SSE stream, so status alone cannot see the block and the
+// account keeps spending quota against a silent one. Only an explicit JSON
+// content-type is inspected — SSE and header-less mocks stay untouched.
+// New hot-path guard called from askDeepSeekStream (not extracted from
+// existing logic): it is the first classifier of a 200 completion body.
+async function rejectJsonEnvelopeResponse(resp, account, agentTag) {
+    const ctype = (resp.headers && typeof resp.headers.get === 'function'
+        ? resp.headers.get('content-type') : '') || '';
+    if (!/application\/json/i.test(ctype)) return;
+    const envelopeRaw = await resp.text();
+    let envelope = null;
+    try { envelope = JSON.parse(envelopeRaw); } catch (_) { /* not JSON after all */ }
+    const verdict = classifyBizCode(envelope);
+    if (!verdict) {
+        // 200 JSON that is not a known envelope still cannot be a stream;
+        // fail loudly instead of handing an empty body to the parser.
+        console.warn(`${agentTag} HTTP 200 application/json that is not a known error envelope; treating as upstream invalid response (first 120 chars): ${String(envelopeRaw || '').substring(0, 120)}`);
+        const shapeErr = new Error('DeepSeek returned a non-stream JSON response to a streaming completion request.');
+        shapeErr.status = 502;
+        shapeErr.type = 'upstream_invalid_response';
+        throw shapeErr;
+    }
+    console.log(`${agentTag} HTTP 200 error envelope instead of stream (biz_code ${verdict.code}, ${verdict.kind}): ${verdict.message}`);
+    if (verdict.kind === 'device_risk') {
+        // Re-verification is credential-level: stop selecting this account
+        // until the operator re-runs auth (same posture as a 401).
+        account.authUnavailable = true;
+        account.cooldownUntil = 0;
+    } else {
+        // Muted (and unknown codes) are soft, time-based blocks: cool the
+        // account through the normal rate-limit path rather than parking it.
+        markAccountFailure(account, 429, `${verdict.kind} envelope (biz_code ${verdict.code})`);
+    }
+    const envelopeErr = new Error(`DeepSeek returned a JSON error envelope instead of a stream (biz_code ${verdict.code}: ${verdict.message}).`);
+    if (verdict.kind === 'device_risk') {
+        // Credential-level: must NOT migrate to another account.
+        envelopeErr.status = 502;
+        envelopeErr.type = 'device_verification_required';
+    } else {
+        // Soft, time-based mute: surface 429 so isRateLimitError() sees it and a
+        // multi-account pool rotates instead of failing the turn as a 502.
+        envelopeErr.status = 429;
+        envelopeErr.retryAfter = Math.max(1, Math.round((account.cooldownUntil - Date.now()) / 1000));
+        envelopeErr.type = verdict.kind === 'other' ? 'upstream_biz_error' : 'account_muted';
+    }
+    throw envelopeErr;
+}
 // Test hook (mirrors setExtraToolTags): swaps the burst limit for wiring
 // tests. Validated like the env parse; restored by callers via t.after.
 function setBurstPerMinute(n) {
@@ -577,10 +657,17 @@ function isAccountReady(a, nowMs = Date.now()) {
         && (a.cooldownUntil || 0) <= nowMs && withinQuota(a, nowMs) && withinBurst(a, nowMs));
 }
 // Testable eligibility check for in-place rate-limit retry:
-// Account must possess credentials, and must NOT be blocked by hourly quota or burst cap.
+// Account must possess credentials and must NOT be blocked by the hourly quota.
+// Burst is deliberately NOT checked (A6): the retry recovers a turn the burst
+// gate already admitted, and its first dispatch is already in the ring.
+// Blocking the retry cannot reduce upstream traffic — it only converts a
+// recoverable turn into a client-visible 429, and the client's own retry would
+// spend MORE slots (new turn -> new PoW dispatch). New turns stay capped by
+// stickyBurstReject at selection time, so the steady-state velocity budget is
+// unchanged.
 // Note: cooldownUntil is explicitly NOT checked here because inPlaceRateLimitRetry lifts cooldown once.
 function isRetryAccountEligible(a, nowMs = Date.now()) {
-    return !!(a && a.config && a.config.token && a.config.cookie && !a.authUnavailable && withinQuota(a, nowMs) && withinBurst(a, nowMs));
+    return !!(a && a.config && a.config.token && a.config.cookie && !a.authUnavailable && withinQuota(a, nowMs));
 }
 // Readiness pre-filter shared by the retry gate: true when at least one
 // account passes the shared predicate. Exported for tests.
@@ -756,9 +843,14 @@ const MAX_UPSTREAM_PROMPT_CHARS = Math.max(MIN_UPSTREAM_PROMPT_CHARS,
 function buildBaseHeaders(config = DS_CONFIG) {
     return {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        // Match the ru locale/timezone the rest of this fingerprint already
+        // claims — an en-US value beside x-client-locale: ru is a mismatch.
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         "x-client-platform": "web",
         "x-client-version": "2.0.0",
         "x-client-locale": "ru",
+        // 14400 s = UTC+4 (Samara), deliberately NOT Moscow's UTC+3 / 10800:
+        // this fingerprint has always claimed UTC+4, do not "fix" it.
         "x-client-timezone-offset": "14400",
         "x-app-version": "2.0.0",
         "Authorization": `Bearer ${config.token || ''}`,
@@ -1552,11 +1644,35 @@ function markAccountFailure(account, status, reason = '', retryAfterRaw = null) 
         return;
     }
     account.consecutiveTimeouts = 0;
-    if (status === 401 || status === 403) {
+    // A 401 is a real credential verdict. A 403 is not: WAFs and transient
+    // risk checks return it too, and permanently flagging on the first one
+    // cost a healthy credential until restart. First 403 -> ordinary cooldown
+    // and a re-probe; a repeat 403 -> quarantine.
+    if (status === 401) {
         account.authUnavailable = true;
         account.cooldownUntil = 0;
         account.consecutiveFailures = 0;
-        console.log(`[account:${account.id}] Auth expired/failed during ${reason || 'request'} (HTTP ${status}). Flagged as authUnavailable.`);
+        account.consecutive403 = 0;
+        console.log(`[account:${account.id}] Auth expired/failed during ${reason || 'request'} (HTTP 401). Flagged as authUnavailable.`);
+        return;
+    }
+    if (status === 403) {
+        // Only 403s close together form a strike sequence: a WAF blip now and
+        // another one 20+ minutes later must not add up to a false quarantine.
+        if (account.last403At && now - account.last403At > CONSECUTIVE_403_WINDOW_MS) {
+            account.consecutive403 = 0;
+        }
+        account.consecutive403 = (account.consecutive403 || 0) + 1;
+        account.last403At = now;
+        account.consecutiveFailures = 0;
+        if (account.consecutive403 >= 2) {
+            account.authUnavailable = true;
+            account.cooldownUntil = 0;
+            console.log(`[account:${account.id}] Repeated HTTP 403 during ${reason || 'request'} (x${account.consecutive403}). Flagged as authUnavailable — re-run npm run auth if it persists.`);
+            return;
+        }
+        account.cooldownUntil = now + DEFAULT_ACCOUNT_COOLDOWN_MS;
+        console.log(`[account:${account.id}] cooldown for ${Math.round(DEFAULT_ACCOUNT_COOLDOWN_MS / 1000)}s after HTTP 403 during ${reason || 'request'} (first strike; re-probe, not quarantined)`);
         return;
     }
     if (Number(status) === 429) {
@@ -2475,6 +2591,12 @@ async function askDeepSeekStream(
         throw createUpstreamHttpError(resp.status, errText, retryAfter);
     }
 
+    // Envelope gate: a muted / re-verification-blocked account can answer
+    // HTTP 200 with JSON instead of the SSE stream. See
+    // rejectJsonEnvelopeResponse — it throws on any JSON body and leaves SSE
+    // (and header-less mocks) untouched.
+    await rejectJsonEnvelopeResponse(resp, account, agentTag);
+
     // Upstream answered 200: the account is healthy. Clear any cooldown and
     // reset the consecutive-failure counter (8b) — stale backoff must not
     // outlive the outage, and `failures` becomes consecutive (meaningful for
@@ -2483,6 +2605,11 @@ async function askDeepSeekStream(
     account.failures = 0;
     account.consecutiveFailures = 0;
     account.consecutiveTimeouts = 0;
+    // A proven-good turn must also clear the 403 strike counter, otherwise two
+    // transient WAF 403s hours apart would accumulate into a false
+    // authUnavailable flag on a demonstrably healthy credential.
+    account.consecutive403 = 0;
+    account.last403At = 0;
     account.lastSuccessAt = Date.now();
     // Latency EWMA (display-only, never scored): alpha 0.3 reacts within ~3
     // turns while staying readable. Failures never touch it.
@@ -6498,6 +6625,8 @@ module.exports = {
         isDeepSeekModelErrorEvent,
         createUpstreamHttpError,
         createChatExpiredError,
+        classifyBizCode,
+        rejectJsonEnvelopeResponse,
         rebuildFragmentText,
         applyResponsePatchOperations,
         compactToolSchema,
@@ -6546,6 +6675,7 @@ module.exports = {
         parseToolTagList,
         setExtraToolTags,
         setBurstPerMinute,
+        defaultBurstPerMinute: DEFAULT_BURST_PER_MINUTE,
         computeRingCap,
         parseToolTagEnv,
         rateLimitRetryDelayMs,
